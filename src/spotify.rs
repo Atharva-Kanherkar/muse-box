@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration as StdDuration,
 };
 
 use base64::{Engine as _, engine::general_purpose};
@@ -16,8 +17,19 @@ use crate::error::AppError;
 
 const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const SPOTIFY_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
+const SPOTIFY_API_BASE_URL: &str = "https://api.spotify.com/v1";
 const SPOTIFY_SCOPES: &str = "user-read-playback-state user-modify-playback-state";
 const REFRESH_WINDOW_SECONDS: i64 = 60;
+/// Whole-request budget for every Spotify call. reqwest sets no timeout by
+/// default, and an accepted-but-silent connection would otherwise hang the poll
+/// loop forever: no response, no error, no backoff, and no log line.
+pub(crate) const HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+/// Connect budget, kept well under [`HTTP_TIMEOUT`] so a dead peer is reported
+/// as a connect failure rather than eating the whole request budget.
+pub(crate) const HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+/// Ceiling on an honored `Retry-After`. The header is upstream input, and a
+/// garbled value would otherwise park polling effectively forever.
+pub(crate) const MAX_RATE_LIMIT_BACKOFF: StdDuration = StdDuration::from_secs(300);
 /// How long an unconsumed OAuth state stays valid. Long enough to log in and
 /// approve, short enough that abandoned flows do not accumulate.
 const STATE_TTL_SECONDS: i64 = 600;
@@ -37,6 +49,7 @@ pub struct SpotifyConfig {
 struct SpotifyEndpoints {
     authorize_url: String,
     token_url: String,
+    api_base_url: String,
 }
 
 impl Default for SpotifyEndpoints {
@@ -44,6 +57,7 @@ impl Default for SpotifyEndpoints {
         Self {
             authorize_url: SPOTIFY_AUTHORIZE_URL.to_string(),
             token_url: SPOTIFY_TOKEN_URL.to_string(),
+            api_base_url: SPOTIFY_API_BASE_URL.to_string(),
         }
     }
 }
@@ -72,6 +86,95 @@ struct TokenResponse {
     refresh_token: Option<String>,
 }
 
+/// Playback fields needed to decide whether clients need a new render document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaybackObservation {
+    pub observed_at: DateTime<Utc>,
+    pub track_id: Option<String>,
+    pub track: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub art_url: Option<String>,
+    pub is_playing: bool,
+    pub progress_ms: u64,
+    pub duration_ms: u64,
+}
+
+impl PlaybackObservation {
+    pub fn idle(observed_at: DateTime<Utc>) -> Self {
+        Self {
+            observed_at,
+            track_id: None,
+            track: None,
+            artist: None,
+            album: None,
+            art_url: None,
+            is_playing: false,
+            progress_ms: 0,
+            duration_ms: 0,
+        }
+    }
+}
+
+/// Error categories used by the poll loop to select its next delay.
+#[derive(Debug, thiserror::Error)]
+pub enum PlaybackFetchError {
+    #[error("Spotify rate limited playback polling for {0:?}")]
+    RateLimited(StdDuration),
+    #[error("transient Spotify playback error: {0}")]
+    Transient(String),
+    #[error(transparent)]
+    Spotify(#[from] AppError),
+}
+
+#[derive(Debug, Deserialize)]
+struct CurrentlyPlayingResponse {
+    item: Option<SpotifyTrack>,
+    is_playing: bool,
+    progress_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifyTrack {
+    id: String,
+    name: String,
+    duration_ms: u64,
+    artists: Vec<SpotifyArtist>,
+    album: SpotifyAlbum,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifyArtist {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifyAlbum {
+    name: String,
+    images: Vec<SpotifyImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifyImage {
+    url: String,
+}
+
+/// Build an HTTP client that cannot hang indefinitely.
+///
+/// `build` only fails when the TLS backend cannot be initialized, so the
+/// fallback is unreachable in practice; it exists because a panic here would
+/// take down the process and strict Clippy forbids `unwrap` in production code.
+pub(crate) fn http_client() -> Client {
+    Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .build()
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "falling back to an HTTP client without timeouts");
+            Client::new()
+        })
+}
+
 impl SpotifyClient {
     pub fn new(config: SpotifyConfig) -> Self {
         Self::with_endpoints(config, SpotifyEndpoints::default())
@@ -79,7 +182,7 @@ impl SpotifyClient {
 
     fn with_endpoints(config: SpotifyConfig, endpoints: SpotifyEndpoints) -> Self {
         Self {
-            http: Client::new(),
+            http: http_client(),
             config,
             endpoints,
             pending_states: Arc::new(Mutex::new(HashMap::new())),
@@ -99,8 +202,30 @@ impl SpotifyClient {
             SpotifyEndpoints {
                 authorize_url,
                 token_url,
+                api_base_url: SPOTIFY_API_BASE_URL.to_string(),
             },
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_api_url(config: SpotifyConfig, api_base_url: String) -> Self {
+        Self::with_endpoints(
+            config,
+            SpotifyEndpoints {
+                authorize_url: SPOTIFY_AUTHORIZE_URL.to_string(),
+                token_url: SPOTIFY_TOKEN_URL.to_string(),
+                api_base_url,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn authorize_for_test(&self) {
+        *self.token.write().await = Some(StoredToken {
+            access_token: "test-access-token".to_string(),
+            refresh_token: "test-refresh-token".to_string(),
+            expires_at: Utc::now() + Duration::hours(1),
+        });
     }
 
     pub async fn authorization_url(&self) -> Result<String, AppError> {
@@ -206,6 +331,73 @@ impl SpotifyClient {
             .as_ref()
             .map(|token| token.access_token.clone())
             .ok_or_else(|| AppError::Spotify("Spotify authorization is required".to_string()))
+    }
+
+    pub async fn currently_playing(&self) -> Result<PlaybackObservation, PlaybackFetchError> {
+        let access_token = self.access_token().await?;
+        let url = format!(
+            "{}/me/player/currently-playing",
+            self.endpoints.api_base_url.trim_end_matches('/')
+        );
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|error| PlaybackFetchError::Transient(error.to_string()))?;
+        let status = response.status();
+        let observed_at = Utc::now();
+
+        if status == reqwest::StatusCode::NO_CONTENT {
+            return Ok(PlaybackObservation::idle(observed_at));
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map_or(StdDuration::from_secs(5), StdDuration::from_secs)
+                .clamp(StdDuration::from_secs(5), MAX_RATE_LIMIT_BACKOFF);
+            return Err(PlaybackFetchError::RateLimited(retry_after));
+        }
+        if status.is_server_error() {
+            return Err(PlaybackFetchError::Transient(format!(
+                "Spotify currently-playing returned {status}"
+            )));
+        }
+        if !status.is_success() {
+            return Err(PlaybackFetchError::Spotify(AppError::Spotify(format!(
+                "currently-playing returned {status}"
+            ))));
+        }
+
+        let payload = response
+            .json::<CurrentlyPlayingResponse>()
+            .await
+            .map_err(|error| PlaybackFetchError::Transient(error.to_string()))?;
+        let Some(track) = payload.item else {
+            return Ok(PlaybackObservation::idle(observed_at));
+        };
+        Ok(PlaybackObservation {
+            observed_at,
+            track_id: Some(track.id),
+            track: Some(track.name),
+            artist: Some(
+                track
+                    .artists
+                    .into_iter()
+                    .map(|artist| artist.name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            album: Some(track.album.name),
+            art_url: track.album.images.into_iter().next().map(|image| image.url),
+            is_playing: payload.is_playing,
+            progress_ms: payload.progress_ms.unwrap_or_default(),
+            duration_ms: track.duration_ms,
+        })
     }
 
     async fn consume_state(&self, state: &str) -> bool {
@@ -329,6 +521,7 @@ fn spotify_request_error(error: reqwest::Error) -> AppError {
 mod tests {
     use std::{
         collections::HashMap,
+        collections::VecDeque,
         os::unix::fs::PermissionsExt,
         sync::{
             Arc,
@@ -336,7 +529,13 @@ mod tests {
         },
     };
 
-    use axum::{Json, Router, extract::Form, routing::post};
+    use axum::{
+        Json, Router,
+        extract::Form,
+        http::{StatusCode, header},
+        response::{IntoResponse, Response},
+        routing::{get, post},
+    };
     use serde_json::json;
 
     use super::*;
@@ -529,6 +728,135 @@ mod tests {
             *observed_grants.lock().await,
             vec!["authorization_code", "refresh_token"]
         );
+    }
+
+    #[tokio::test]
+    async fn currently_playing_maps_track_and_idle_responses() {
+        let playback_url = spawn_playback_server(vec![
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "is_playing": true,
+                    "progress_ms": 12345,
+                    "item": {
+                        "id": "track-id",
+                        "name": "Track Name",
+                        "duration_ms": 234567,
+                        "artists": [{"name": "First"}, {"name": "Second"}],
+                        "album": {
+                            "name": "Album Name",
+                            "images": [{"url": "http://art.test/cover.png"}]
+                        }
+                    }
+                })),
+            )
+                .into_response(),
+            StatusCode::NO_CONTENT.into_response(),
+        ])
+        .await;
+        let client =
+            SpotifyClient::with_test_api_url(test_config(PathBuf::from("unused")), playback_url);
+        client.authorize_for_test().await;
+
+        let playing = client.currently_playing().await.expect("playing response");
+        assert_eq!(playing.track_id.as_deref(), Some("track-id"));
+        assert_eq!(playing.artist.as_deref(), Some("First, Second"));
+        assert_eq!(playing.album.as_deref(), Some("Album Name"));
+        assert_eq!(
+            playing.art_url.as_deref(),
+            Some("http://art.test/cover.png")
+        );
+        assert!(playing.is_playing);
+        assert_eq!(playing.progress_ms, 12_345);
+        assert_eq!(playing.duration_ms, 234_567);
+
+        let idle = client.currently_playing().await.expect("idle response");
+        assert_eq!(idle, PlaybackObservation::idle(idle.observed_at));
+    }
+
+    #[tokio::test]
+    async fn currently_playing_classifies_rate_limits_and_server_errors() {
+        let playback_url = spawn_playback_server(vec![
+            (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "7")]).into_response(),
+            StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            StatusCode::UNAUTHORIZED.into_response(),
+        ])
+        .await;
+        let client =
+            SpotifyClient::with_test_api_url(test_config(PathBuf::from("unused")), playback_url);
+        client.authorize_for_test().await;
+
+        assert!(matches!(
+            client.currently_playing().await,
+            Err(PlaybackFetchError::RateLimited(delay)) if delay == StdDuration::from_secs(7)
+        ));
+        assert!(matches!(
+            client.currently_playing().await,
+            Err(PlaybackFetchError::Transient(_))
+        ));
+        assert!(matches!(
+            client.currently_playing().await,
+            Err(PlaybackFetchError::Spotify(AppError::Spotify(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_floored_and_capped() {
+        let playback_url = spawn_playback_server(vec![
+            (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "1")]).into_response(),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "999999999")],
+            )
+                .into_response(),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "not-a-number")],
+            )
+                .into_response(),
+        ])
+        .await;
+        let client =
+            SpotifyClient::with_test_api_url(test_config(PathBuf::from("unused")), playback_url);
+        client.authorize_for_test().await;
+
+        // Floored to 5s, capped at the ceiling so a garbled header cannot park
+        // polling forever, and a non-numeric header falls back to the default.
+        for expected in [
+            StdDuration::from_secs(5),
+            MAX_RATE_LIMIT_BACKOFF,
+            StdDuration::from_secs(5),
+        ] {
+            assert!(matches!(
+                client.currently_playing().await,
+                Err(PlaybackFetchError::RateLimited(delay)) if delay == expected
+            ));
+        }
+    }
+
+    async fn spawn_playback_server(responses: Vec<Response>) -> String {
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let app = Router::new().route(
+            "/v1/me/player/currently-playing",
+            get(move || {
+                let responses = responses.clone();
+                async move {
+                    responses
+                        .lock()
+                        .await
+                        .pop_front()
+                        .unwrap_or_else(|| StatusCode::NO_CONTENT.into_response())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind playback server");
+        let address = listener.local_addr().expect("playback server address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("playback server");
+        });
+        format!("http://{address}/v1")
     }
 
     async fn spawn_token_server(

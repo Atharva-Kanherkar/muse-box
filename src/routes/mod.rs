@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+mod state;
+
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::{Query, Request, State},
+    extract::{FromRef, Query, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -10,26 +12,38 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use crate::{error::AppError, spotify::SpotifyClient};
+use crate::{error::AppError, spotify::SpotifyClient, state::StateHub};
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     spotify: SpotifyClient,
     device_api_token: String,
+    state_hub: Arc<StateHub>,
 }
 
-pub fn router(spotify: SpotifyClient, device_api_token: String) -> Router {
+impl FromRef<AppState> for Arc<StateHub> {
+    fn from_ref(state: &AppState) -> Self {
+        state.state_hub.clone()
+    }
+}
+
+pub fn router(
+    spotify: SpotifyClient,
+    device_api_token: String,
+    state_hub: Arc<StateHub>,
+) -> Router {
     let state = AppState {
         spotify,
         device_api_token: device_api_token.clone(),
+        state_hub,
     };
-    let protected =
-        Router::new()
-            .route("/health", get(health))
-            .route_layer(middleware::from_fn_with_state(
-                device_api_token,
-                require_bearer,
-            ));
+    let protected = Router::new()
+        .route("/health", get(health))
+        .route("/state", get(state::get_state))
+        .route_layer(middleware::from_fn_with_state(
+            device_api_token,
+            require_bearer,
+        ));
 
     Router::new()
         .route("/auth/spotify", get(start_spotify_auth))
@@ -148,12 +162,13 @@ mod tests {
         })
     }
 
+    fn test_router(spotify: SpotifyClient, token: &str) -> Router {
+        router(spotify, token.to_string(), Arc::new(StateHub::new()))
+    }
+
     #[tokio::test]
     async fn bearer_middleware_rejects_missing_and_wrong_tokens() {
-        let app = router(
-            test_spotify(PathBuf::from("unused")),
-            "right-token".to_string(),
-        );
+        let app = test_router(test_spotify(PathBuf::from("unused")), "right-token");
 
         for authorization in [None, Some("Bearer wrong-token")] {
             let mut request = Request::builder().uri("/health");
@@ -198,10 +213,7 @@ mod tests {
         assert!(!constant_time_eq(b"short", b"shorter"));
 
         // A lowercase scheme from a hand-rolled device client must be accepted.
-        let app = router(
-            test_spotify(PathBuf::from("unused")),
-            "right-token".to_string(),
-        );
+        let app = test_router(test_spotify(PathBuf::from("unused")), "right-token");
         let response = app
             .oneshot(
                 Request::builder()
@@ -229,7 +241,7 @@ mod tests {
             "https://accounts.spotify.com/authorize".to_string(),
             token_url,
         );
-        let app = router(spotify, "device-token".to_string());
+        let app = test_router(spotify, "device-token");
 
         for uri in [
             "/auth/spotify/callback?code=code",
@@ -270,7 +282,7 @@ mod tests {
             "https://accounts.spotify.com/authorize".to_string(),
             token_url,
         );
-        let app = router(spotify, "device-token".to_string());
+        let app = test_router(spotify, "device-token");
         let start = app
             .clone()
             .oneshot(

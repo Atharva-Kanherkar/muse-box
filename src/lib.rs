@@ -10,3 +10,4 @@ pub mod image;
 pub mod render;
 pub mod routes;
 pub mod spotify;
+pub mod state;
