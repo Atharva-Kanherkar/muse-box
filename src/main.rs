@@ -1,11 +1,9 @@
-pub mod config;
-pub mod error;
-mod routes;
-pub mod spotify;
-
 use anyhow::Context;
-use config::Config;
-use spotify::{SpotifyClient, SpotifyConfig};
+use muse_box::{
+    config::Config,
+    routes,
+    spotify::{SpotifyClient, SpotifyConfig},
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -1,0 +1,11 @@
+//! muse-box backend: fat backend, dumb clients.
+//!
+//! The public API is two endpoints (`GET /state` SSE, `POST /voice`) that
+//! speak the versioned [`render::RenderDoc`]. Everything else is
+//! implementation detail. See README.md and AGENTS.md for the contract.
+
+pub mod config;
+pub mod error;
+pub mod render;
+pub mod routes;
+pub mod spotify;
