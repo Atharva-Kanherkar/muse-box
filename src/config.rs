@@ -17,6 +17,10 @@ pub struct Config {
     /// UTC minute boundaries; only the rendered `HH:MM` is localized, which
     /// keeps idle goldens deterministic.
     pub idle_display_offset: FixedOffset,
+    /// Browser origins allowed to call the API. Empty means any origin, which
+    /// is safe here because auth is a bearer token rather than a cookie, so
+    /// there is no ambient credential for another site to ride on.
+    pub cors_allowed_origins: Vec<String>,
 }
 
 impl Config {
@@ -43,6 +47,13 @@ impl Config {
             device_api_token: std::env::var("DEVICE_API_TOKEN")
                 .unwrap_or_else(|_| "dev-token-change-me".to_string()),
             idle_display_offset: idle_display_offset()?,
+            cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|origin| !origin.is_empty())
+                .map(str::to_string)
+                .collect(),
         })
     }
 

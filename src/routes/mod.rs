@@ -6,12 +6,13 @@ use std::{collections::HashMap, sync::Arc};
 use axum::{
     Json, Router,
     extract::{FromRef, Query, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{error::AppError, spotify::SpotifyClient, state::StateHub};
 
@@ -60,8 +61,31 @@ pub fn router(
     Router::new()
         .route("/auth/spotify", get(start_spotify_auth))
         .route("/auth/spotify/callback", get(spotify_callback))
+        // Unauthenticated liveness probe. `/health` stays bearer-protected as
+        // its own issue locked it, but a platform health check cannot send a
+        // token, and pointing one at `/health` fails every deploy with 401.
+        .route("/healthz", get(healthz))
         .merge(protected)
         .with_state(state)
+}
+
+/// Browser preflight support. Without this every cross-origin `fetch` from a
+/// web frontend fails before it is sent, because the `Authorization` header
+/// makes each request preflighted.
+pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    let origins = if allowed_origins.is_empty() {
+        AllowOrigin::any()
+    } else {
+        AllowOrigin::list(
+            allowed_origins
+                .iter()
+                .filter_map(|origin| HeaderValue::from_str(origin).ok()),
+        )
+    };
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
 async fn start_spotify_auth(State(state): State<AppState>) -> Result<Response, AppError> {
@@ -92,6 +116,10 @@ async fn spotify_callback(
 }
 
 async fn health() -> Json<Value> {
+    Json(json!({ "status": "ok" }))
+}
+
+async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
@@ -181,6 +209,98 @@ mod tests {
             Arc::new(StateHub::new()),
             Arc::new(voice::FailingVoiceModel),
         )
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allows_authorized_cross_origin_calls() {
+        // A browser sends OPTIONS before any request carrying Authorization.
+        // Without the layer this 405s and the real request is never sent.
+        let app = test_router(test_spotify(PathBuf::from("unused")), "right-token")
+            .layer(cors_layer(&[]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/state")
+                    .header(header::ORIGIN, "http://localhost:5173")
+                    .header("access-control-request-method", "GET")
+                    .header("access-control-request-headers", "authorization")
+                    .body(Body::empty())
+                    .expect("preflight"),
+            )
+            .await
+            .expect("response");
+
+        assert!(response.status().is_success(), "{:?}", response.status());
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+        let allowed = headers
+            .get("access-control-allow-headers")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(allowed.contains("authorization"), "{allowed}");
+    }
+
+    #[tokio::test]
+    async fn cors_restricts_to_configured_origins_when_set() {
+        let app = test_router(test_spotify(PathBuf::from("unused")), "right-token")
+            .layer(cors_layer(&["https://box.example".to_string()]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/state")
+                    .header(header::ORIGIN, "https://evil.example")
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .expect("preflight"),
+            )
+            .await
+            .expect("response");
+        // An origin outside the list gets no allow-origin header, so the
+        // browser blocks the response.
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none(),
+            "unlisted origin must not be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_needs_no_token_but_health_still_does() {
+        let app = test_router(test_spotify(PathBuf::from("unused")), "right-token");
+
+        let open = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(open.status(), StatusCode::OK);
+
+        // The bearer-protected probe is unchanged, as its own contract locked it.
+        let closed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(closed.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

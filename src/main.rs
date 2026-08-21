@@ -63,7 +63,8 @@ async fn main() -> anyhow::Result<()> {
     ));
     let _idle_task = tokio::spawn(run_idle_scheduler(state_hub.clone(), idle_shutdown_rx));
 
-    let app = routes::router(spotify, config.device_api_token, state_hub, realtime);
+    let app = routes::router(spotify, config.device_api_token, state_hub, realtime)
+        .layer(routes::cors_layer(&config.cors_allowed_origins));
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("failed to bind server to {bind_addr}"))?;
