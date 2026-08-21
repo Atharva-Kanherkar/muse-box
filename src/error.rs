@@ -17,6 +17,10 @@ pub enum AppError {
     Unauthorized,
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("unsupported media type: {0}")]
+    UnsupportedMediaType(String),
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
 }
 
 impl IntoResponse for AppError {
@@ -33,6 +37,10 @@ impl IntoResponse for AppError {
             }
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            AppError::UnsupportedMediaType(msg) => {
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg.clone())
+            }
+            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.clone()),
         };
 
         let body = Json(json!({ "error": message }));

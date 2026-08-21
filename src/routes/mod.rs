@@ -1,4 +1,5 @@
 mod state;
+pub mod voice;
 
 use std::{collections::HashMap, sync::Arc};
 
