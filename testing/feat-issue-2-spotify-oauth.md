@@ -8,8 +8,15 @@
 - The token store path comes from `TOKEN_STORE_PATH` and defaults to `./data/spotify_token.json`.
 - A stored refresh token is loaded and refreshed during startup so Spotify API calls do not require another browser authorization.
 - An access token that expires within 60 seconds is refreshed before use; refresh failures return `AppError::Spotify`.
-- Protected non-auth routes require `Authorization: Bearer <DEVICE_API_TOKEN>` and return the standard `{ "error": "..." }` JSON shape on failure.
+- Protected non-auth routes require `Authorization: Bearer <DEVICE_API_TOKEN>` and return the standard `{ "error": "..." }` JSON shape on failure. The auth scheme is matched case-insensitively (RFC 7235) and the credential is compared in constant time.
 - Production code introduced by this change contains no `unwrap`, `expect`, or `panic!`.
+
+### Failure-mode behavior (added during review of PR #8)
+
+- Startup never aborts because of Spotify authorization: a missing, unparsable, or unrefreshable token store logs a warning and the server still binds, so `/auth/spotify` stays reachable for re-authorization.
+- Logging defaults to `info` when `RUST_LOG` is unset, so startup lines are visible on Railway without extra configuration.
+- The token store is replaced atomically (temp file, fsync, rename) so an interrupted write cannot destroy the stored refresh token, and the committed file is `0600` even when it replaces a looser one.
+- Unconsumed OAuth states expire after 10 minutes and are capped at 64, so the unauthenticated `/auth/spotify` route cannot grow memory without bound.
 
 ## Unit Tests
 
@@ -17,6 +24,9 @@
 - `spotify::tests::refresh_decision_uses_sixty_second_window` — tokens expiring within 60 seconds refresh; longer-lived tokens do not.
 - `spotify::tests::token_store_round_trip_uses_private_permissions` — persisted token data reloads unchanged and has mode `0600` on Unix.
 - `routes::tests::bearer_middleware_rejects_missing_and_wrong_tokens` — missing and incorrect bearer credentials return `401`; the correct credential reaches the handler.
+- `spotify::tests::pending_states_are_capped_and_expired_states_rejected` — the pending-state set stays at its cap under repeated authorization starts, and a state older than the TTL is refused.
+- `spotify::tests::persist_token_replaces_atomically_and_leaves_no_temp_file` — replacing an existing `0644` store yields `0600`, reloads unchanged, and leaves no `.tmp` sibling.
+- `routes::tests::bearer_scheme_is_case_insensitive_and_credential_must_match_exactly` — `bearer`/`BEARER` are accepted, other schemes are not, and the comparison rejects wrong-length and wrong-byte credentials.
 
 ## Integration / Functional Tests
 
