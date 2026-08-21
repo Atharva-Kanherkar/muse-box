@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use chrono::{FixedOffset, Offset, Utc};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -12,6 +13,10 @@ pub struct Config {
     pub openai_api_key: String,
     pub openai_realtime_model: String,
     pub device_api_token: String,
+    /// Offset applied to the idle clock's displayed digits. Scheduling stays on
+    /// UTC minute boundaries; only the rendered `HH:MM` is localized, which
+    /// keeps idle goldens deterministic.
+    pub idle_display_offset: FixedOffset,
 }
 
 impl Config {
@@ -37,10 +42,31 @@ impl Config {
                 .unwrap_or_else(|_| "gpt-realtime-mini".to_string()),
             device_api_token: std::env::var("DEVICE_API_TOKEN")
                 .unwrap_or_else(|_| "dev-token-change-me".to_string()),
+            idle_display_offset: idle_display_offset()?,
         })
     }
 
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+}
+
+/// Parse `IDLE_UTC_OFFSET_MINUTES`, defaulting to UTC. Bounds match the real
+/// range of civil offsets, so a typo fails at startup instead of quietly
+/// rendering a clock hours off.
+fn idle_display_offset() -> Result<FixedOffset> {
+    let Ok(raw) = std::env::var("IDLE_UTC_OFFSET_MINUTES") else {
+        return Ok(Utc.fix());
+    };
+    let minutes: i32 = raw
+        .trim()
+        .parse()
+        .with_context(|| format!("IDLE_UTC_OFFSET_MINUTES must be a whole number: {raw}"))?;
+    if !(-840..=840).contains(&minutes) {
+        return Err(anyhow!(
+            "IDLE_UTC_OFFSET_MINUTES must be between -840 and 840: {minutes}"
+        ));
+    }
+    FixedOffset::east_opt(minutes * 60)
+        .ok_or_else(|| anyhow!("IDLE_UTC_OFFSET_MINUTES is out of range: {minutes}"))
 }
