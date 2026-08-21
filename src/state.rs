@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -10,7 +11,7 @@ use std::{
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 
 use crate::{
     error::AppError,
@@ -26,6 +27,9 @@ const SEEK_THRESHOLD_MS: u64 = 2_000;
 const BROADCAST_CAPACITY: usize = 32;
 const MAX_RENDER_VARIANTS: usize = 32;
 const DEFAULT_PALETTE: [&str; 2] = ["#1a1a1a", "#e0e0e0"];
+const NORMAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const MIN_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RenderParams {
@@ -117,6 +121,10 @@ impl StateHub {
 
     pub fn subscribe(&self) -> broadcast::Receiver<u64> {
         self.changes.subscribe()
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.changes.receiver_count()
     }
 
     pub async fn current_document(&self, params: RenderParams) -> Result<Arc<RenderDoc>, AppError> {
@@ -280,6 +288,52 @@ impl RenderCache {
     }
 }
 
+/// Run the one shared Spotify polling task until shutdown is requested.
+pub async fn run_poll_loop<Fetch, FetchFuture>(
+    hub: Arc<StateHub>,
+    mut fetch: Fetch,
+    mut shutdown: watch::Receiver<bool>,
+) where
+    Fetch: FnMut() -> FetchFuture,
+    FetchFuture: Future<Output = Result<PlaybackObservation, crate::spotify::PlaybackFetchError>>,
+{
+    let mut error_backoff = MIN_ERROR_BACKOFF;
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let delay = match fetch().await {
+            Ok(observation) => {
+                if let Err(error) = hub.publish_if_meaningful(observation).await {
+                    tracing::warn!(%error, "failed to publish Spotify playback state");
+                }
+                error_backoff = MIN_ERROR_BACKOFF;
+                NORMAL_POLL_INTERVAL
+            }
+            Err(crate::spotify::PlaybackFetchError::RateLimited(retry_after)) => {
+                let delay = retry_after.max(MIN_ERROR_BACKOFF);
+                tracing::warn!(?delay, "Spotify playback polling rate limited");
+                delay
+            }
+            Err(error) => {
+                let delay = error_backoff;
+                error_backoff = error_backoff.saturating_mul(2).min(MAX_ERROR_BACKOFF);
+                tracing::warn!(%error, ?delay, "Spotify playback poll failed; backing off");
+                delay
+            }
+        };
+
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 pub fn is_meaningful_change(
     published: &PlaybackObservation,
     observed: &PlaybackObservation,
@@ -353,6 +407,7 @@ fn default_palette() -> [String; 2] {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         io::Cursor,
         sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     };
@@ -517,6 +572,61 @@ mod tests {
         let first_doc = hub.current_document(RenderParams::default()).await.unwrap();
         let second_doc = hub.current_document(RenderParams::default()).await.unwrap();
         assert!(Arc::ptr_eq(&first_doc, &second_doc));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_loop_survives_errors_and_respects_retry_after() {
+        let hub = Arc::new(StateHub::new());
+        let results = Arc::new(Mutex::new(VecDeque::from([
+            Err(crate::spotify::PlaybackFetchError::RateLimited(
+                std::time::Duration::from_secs(7),
+            )),
+            Err(crate::spotify::PlaybackFetchError::Transient(
+                "temporary".to_string(),
+            )),
+            Ok(PlaybackObservation::idle(Utc::now())),
+        ])));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_poll_loop(
+            hub,
+            {
+                let results = results.clone();
+                let calls = calls.clone();
+                move || {
+                    let results = results.clone();
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        results
+                            .lock()
+                            .await
+                            .pop_front()
+                            .unwrap_or_else(|| Ok(PlaybackObservation::idle(Utc::now())))
+                    }
+                }
+            },
+            shutdown_rx,
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+
+        tokio::time::advance(std::time::Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
+
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap();
     }
 
     fn observation(

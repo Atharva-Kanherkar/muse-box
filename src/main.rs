@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use anyhow::Context;
 use muse_box::{
     config::Config,
     routes,
     spotify::{SpotifyClient, SpotifyConfig},
+    state::{StateHub, run_poll_loop},
 };
 
 #[tokio::main]
@@ -40,7 +43,20 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
-    let app = routes::router(spotify, config.device_api_token);
+    let state_hub = Arc::new(StateHub::new());
+    let (_poll_shutdown, poll_shutdown_rx) = tokio::sync::watch::channel(false);
+    let poll_spotify = spotify.clone();
+    let poll_hub = state_hub.clone();
+    let _poll_task = tokio::spawn(run_poll_loop(
+        poll_hub,
+        move || {
+            let spotify = poll_spotify.clone();
+            async move { spotify.currently_playing().await }
+        },
+        poll_shutdown_rx,
+    ));
+
+    let app = routes::router(spotify, config.device_api_token, state_hub);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("failed to bind server to {bind_addr}"))?;
