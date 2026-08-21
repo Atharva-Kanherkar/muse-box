@@ -1,8 +1,198 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
-use crate::error::AppError;
+use axum::{
+    Json,
+    body::to_bytes,
+    extract::{Query, Request, State},
+    http::header,
+};
+use chrono::Utc;
+use tokio::sync::Mutex;
+
+use crate::{
+    error::AppError,
+    realtime::{PlaybackContext, RealtimeManager, ToolCall, VoiceIntent},
+    render::{PlaybackState, RenderDoc, VoiceLogEntry},
+    spotify::{PlaybackFetchError, PlaybackObservation, SpotifyClient},
+    state::{RenderParams, StateHub},
+};
 
 const MAX_AUDIO_SECONDS: u64 = 30;
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+pub type VoiceFuture<'a> = Pin<Box<dyn Future<Output = Result<VoiceIntent, AppError>> + Send + 'a>>;
+
+pub trait VoiceModel: Send + Sync {
+    fn command<'a>(
+        &'a self,
+        samples: &'a [i16],
+        rate: u32,
+        context: PlaybackContext,
+    ) -> VoiceFuture<'a>;
+}
+
+#[cfg(test)]
+pub(crate) struct FailingVoiceModel;
+
+#[cfg(test)]
+impl VoiceModel for FailingVoiceModel {
+    fn command<'a>(
+        &'a self,
+        _samples: &'a [i16],
+        _rate: u32,
+        _context: PlaybackContext,
+    ) -> VoiceFuture<'a> {
+        Box::pin(async {
+            Err(AppError::Voice(
+                "voice model is not configured for this test".to_string(),
+            ))
+        })
+    }
+}
+
+impl VoiceModel for RealtimeManager {
+    fn command<'a>(
+        &'a self,
+        samples: &'a [i16],
+        rate: u32,
+        context: PlaybackContext,
+    ) -> VoiceFuture<'a> {
+        Box::pin(async move { RealtimeManager::command(self, samples, rate, context).await })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct VoiceState {
+    pub(crate) spotify: SpotifyClient,
+    pub(crate) model: Arc<dyn VoiceModel>,
+    pub(crate) hub: Arc<StateHub>,
+    pub(crate) guard: Arc<Mutex<()>>,
+}
+
+pub(crate) async fn post_voice(
+    State(state): State<VoiceState>,
+    Query(query): Query<HashMap<String, String>>,
+    request: Request,
+) -> Result<Json<RenderDoc>, AppError> {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = to_bytes(request.into_body(), MAX_BODY_BYTES)
+        .await
+        .map_err(|_| {
+            AppError::PayloadTooLarge("voice upload exceeds the 10 MiB limit".to_string())
+        })?;
+    let audio = decode_audio(&content_type, &query, &body)?;
+
+    let _guard = state.guard.lock().await;
+    state.hub.publish_thinking().await;
+    let observation = state.hub.published_observation().await;
+    let context = PlaybackContext {
+        track: observation.track.clone(),
+        artist: observation.artist.clone(),
+        state: playback_state(&observation),
+    };
+    let intent = match state
+        .model
+        .command(&audio.samples, audio.rate, context)
+        .await
+    {
+        Ok(intent) => intent,
+        Err(error) => {
+            recover_document(&state.hub).await;
+            return Err(error);
+        }
+    };
+    let action = match dispatch_tool(&state.spotify, &intent.tool).await {
+        Ok(action) => action,
+        Err(error) => {
+            recover_document(&state.hub).await;
+            return Err(error);
+        }
+    };
+    state
+        .hub
+        .append_voice_log(VoiceLogEntry {
+            transcript: intent.transcript,
+            action,
+            timestamp: Utc::now(),
+        })
+        .await;
+    let fresh = match state.spotify.currently_playing().await {
+        Ok(observation) => observation,
+        Err(error) => {
+            recover_document(&state.hub).await;
+            return Err(playback_error(error));
+        }
+    };
+    if let Err(error) = state.hub.force_publish(fresh).await {
+        recover_document(&state.hub).await;
+        return Err(error);
+    }
+    let document = state.hub.current_document(RenderParams::default()).await?;
+    Ok(Json(document.as_ref().clone()))
+}
+
+async fn dispatch_tool(spotify: &SpotifyClient, tool: &ToolCall) -> Result<String, AppError> {
+    match tool {
+        ToolCall::Play => {
+            spotify.resume_playback().await?;
+            Ok("spotify:play".to_string())
+        }
+        ToolCall::Pause => {
+            spotify.pause_playback().await?;
+            Ok("spotify:pause".to_string())
+        }
+        ToolCall::Next => {
+            spotify.skip_next().await?;
+            Ok("spotify:next".to_string())
+        }
+        ToolCall::Previous => {
+            spotify.skip_previous().await?;
+            Ok("spotify:previous".to_string())
+        }
+        ToolCall::SearchAndPlay { query } => {
+            let track_id = spotify.search_top_track(query).await?;
+            spotify.play_track(&track_id).await?;
+            Ok(format!("spotify:play:track:{track_id}"))
+        }
+        ToolCall::QueueSearch { query } => {
+            let track_id = spotify.search_top_track(query).await?;
+            spotify.queue_track(&track_id).await?;
+            Ok(format!("queue:search:{query}"))
+        }
+        ToolCall::SetVolume { percent } => {
+            spotify.set_volume(*percent).await?;
+            Ok(format!("spotify:volume:{percent}"))
+        }
+        ToolCall::NowPlaying => Ok("query:now_playing".to_string()),
+    }
+}
+
+async fn recover_document(hub: &StateHub) {
+    let observation = hub.published_observation().await;
+    if let Err(error) = hub.force_publish(observation).await {
+        tracing::error!(%error, "failed to publish voice recovery document");
+    }
+}
+
+fn playback_state(observation: &PlaybackObservation) -> PlaybackState {
+    match (&observation.track_id, observation.is_playing) {
+        (None, _) => PlaybackState::Idle,
+        (Some(_), true) => PlaybackState::Playing,
+        (Some(_), false) => PlaybackState::Paused,
+    }
+}
+
+fn playback_error(error: PlaybackFetchError) -> AppError {
+    match error {
+        PlaybackFetchError::Spotify(error) => error,
+        other => AppError::Spotify(other.to_string()),
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct AudioInput {
@@ -178,7 +368,105 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, AppError> {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, sync::Arc};
+
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    use crate::{
+        routes,
+        spotify::{SpotifyClient, SpotifyConfig},
+        state::StateHub,
+    };
+
     use super::*;
+
+    #[tokio::test]
+    async fn route_rejects_auth_content_type_params_and_body_size_matrix() {
+        let app = routes::router(
+            SpotifyClient::new(SpotifyConfig {
+                client_id: "client".to_string(),
+                client_secret: "secret".to_string(),
+                redirect_uri: "http://localhost/callback".to_string(),
+                token_store_path: PathBuf::from("unused"),
+            }),
+            "device-token".to_string(),
+            Arc::new(StateHub::new()),
+            Arc::new(FailingVoiceModel),
+        );
+        let cases = [
+            (
+                Request::builder()
+                    .method("POST")
+                    .uri("/voice?rate=16000&bits=16&ch=1")
+                    .header(header::CONTENT_TYPE, "audio/pcm")
+                    .body(Body::from(vec![0, 0]))
+                    .expect("missing-auth request"),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Request::builder()
+                    .method("POST")
+                    .uri("/voice")
+                    .header(header::AUTHORIZATION, "Bearer device-token")
+                    .header(header::CONTENT_TYPE, "audio/pcm")
+                    .body(Body::from(vec![0, 0]))
+                    .expect("missing-params request"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Request::builder()
+                    .method("POST")
+                    .uri("/voice")
+                    .header(header::AUTHORIZATION, "Bearer device-token")
+                    .header(header::CONTENT_TYPE, "audio/webm")
+                    .body(Body::from(vec![0, 0]))
+                    .expect("unsupported request"),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                Request::builder()
+                    .method("POST")
+                    .uri("/voice?rate=16000&bits=16&ch=1")
+                    .header(header::AUTHORIZATION, "Bearer device-token")
+                    .header(header::CONTENT_TYPE, "audio/pcm")
+                    .body(Body::from(vec![0; MAX_BODY_BYTES + 1]))
+                    .expect("oversized request"),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ];
+
+        for (request, expected) in cases {
+            let response = app.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), expected);
+            let body = to_bytes(response.into_body(), 1024)
+                .await
+                .expect("error body");
+            let json: Value = serde_json::from_slice(&body).expect("JSON error");
+            assert!(json["error"].is_string());
+            assert_eq!(json.as_object().map(serde_json::Map::len), Some(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn now_playing_is_a_non_mutating_query_action() {
+        let spotify = SpotifyClient::new(SpotifyConfig {
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            redirect_uri: "http://localhost/callback".to_string(),
+            token_store_path: PathBuf::from("unused"),
+        });
+        assert_eq!(
+            dispatch_tool(&spotify, &ToolCall::NowPlaying)
+                .await
+                .expect("query action"),
+            "query:now_playing"
+        );
+    }
 
     #[test]
     fn wav_pcm16_mono_preserves_samples() {
