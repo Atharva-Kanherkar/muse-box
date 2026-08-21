@@ -5,6 +5,7 @@ use chrono::{DateTime, Duration, Utc};
 use rand::{RngCore, rngs::OsRng};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::error::AppError;
@@ -75,6 +76,21 @@ impl SpotifyClient {
             token: Arc::new(RwLock::new(None)),
             refresh_guard: Arc::new(Mutex::new(())),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_endpoints(
+        config: SpotifyConfig,
+        authorize_url: String,
+        token_url: String,
+    ) -> Self {
+        Self::with_endpoints(
+            config,
+            SpotifyEndpoints {
+                authorize_url,
+                token_url,
+            },
+        )
     }
 
     pub async fn authorization_url(&self) -> Result<String, AppError> {
@@ -226,9 +242,16 @@ async fn persist_token(path: &PathBuf, token: &StoredToken) -> Result<(), AppErr
     let bytes = serde_json::to_vec_pretty(token).map_err(|error| {
         AppError::Spotify(format!("failed to serialize Spotify token: {error}"))
     })?;
-    tokio::fs::write(path, bytes)
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
         .await
-        .map_err(|error| AppError::Spotify(format!("failed to write token store: {error}")))?;
+        .map_err(|error| AppError::Spotify(format!("failed to open token store: {error}")))?;
 
     #[cfg(unix)]
     {
@@ -240,6 +263,13 @@ async fn persist_token(path: &PathBuf, token: &StoredToken) -> Result<(), AppErr
             })?;
     }
 
+    file.write_all(&bytes)
+        .await
+        .map_err(|error| AppError::Spotify(format!("failed to write token store: {error}")))?;
+    file.sync_all()
+        .await
+        .map_err(|error| AppError::Spotify(format!("failed to sync token store: {error}")))?;
+
     Ok(())
 }
 
@@ -249,7 +279,17 @@ fn spotify_request_error(error: reqwest::Error) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        collections::HashMap,
+        os::unix::fs::PermissionsExt,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use axum::{Json, Router, extract::Form, routing::post};
+    use serde_json::json;
 
     use super::*;
 
@@ -339,5 +379,93 @@ mod tests {
             .decode(state)
             .expect("base64url state");
         assert!(decoded.len() >= 16);
+    }
+
+    #[tokio::test]
+    async fn callback_exchange_persists_and_refreshes_token() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_grants = Arc::new(Mutex::new(Vec::new()));
+        let token_url = spawn_token_server(calls.clone(), observed_grants.clone()).await;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("spotify.json");
+        let config = test_config(path.clone());
+        let client = SpotifyClient::with_test_endpoints(
+            config.clone(),
+            "https://accounts.spotify.com/authorize".to_string(),
+            token_url.clone(),
+        );
+        let authorization_url = client.authorization_url().await.expect("authorization URL");
+        let state = Url::parse(&authorization_url)
+            .expect("valid authorization URL")
+            .query_pairs()
+            .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+            .expect("state query parameter");
+
+        client
+            .exchange_authorization_code("authorization-code", &state)
+            .await
+            .expect("exchange authorization code");
+        assert!(path.exists());
+
+        let restarted = SpotifyClient::with_test_endpoints(
+            config,
+            "https://accounts.spotify.com/authorize".to_string(),
+            token_url,
+        );
+        assert!(
+            restarted
+                .initialize_from_store()
+                .await
+                .expect("load and refresh stored token")
+        );
+        assert_eq!(
+            restarted.access_token().await.expect("access token"),
+            "refreshed-access"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *observed_grants.lock().await,
+            vec!["authorization_code", "refresh_token"]
+        );
+    }
+
+    async fn spawn_token_server(
+        calls: Arc<AtomicUsize>,
+        observed_grants: Arc<Mutex<Vec<String>>>,
+    ) -> String {
+        let app = Router::new().route(
+            "/token",
+            post(move |Form(form): Form<HashMap<String, String>>| {
+                let calls = calls.clone();
+                let observed_grants = observed_grants.clone();
+                async move {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    observed_grants
+                        .lock()
+                        .await
+                        .push(form.get("grant_type").cloned().unwrap_or_default());
+                    if call == 0 {
+                        Json(json!({
+                            "access_token": "initial-access",
+                            "refresh_token": "persisted-refresh",
+                            "expires_in": 30
+                        }))
+                    } else {
+                        Json(json!({
+                            "access_token": "refreshed-access",
+                            "expires_in": 3600
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock token server");
+        let address = listener.local_addr().expect("mock server address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock token server");
+        });
+        format!("http://{address}/token")
     }
 }

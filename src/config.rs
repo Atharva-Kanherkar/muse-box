@@ -33,7 +33,8 @@ impl Config {
                 .unwrap_or_else(|_| PathBuf::from("./data/spotify_token.json")),
             openai_api_key: std::env::var("OPENAI_API_KEY")
                 .context("OPENAI_API_KEY is required")?,
-            openai_model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+            openai_model: std::env::var("OPENAI_MODEL")
+                .unwrap_or_else(|_| "gpt-4o-mini".to_string()),
             device_api_token: std::env::var("DEVICE_API_TOKEN")
                 .unwrap_or_else(|_| "dev-token-change-me".to_string()),
         })

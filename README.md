@@ -356,6 +356,7 @@ See `.env.example` for the full list. Required for first boot:
 - `SPOTIFY_CLIENT_ID`
 - `SPOTIFY_CLIENT_SECRET`
 - `SPOTIFY_REDIRECT_URI`
+- `TOKEN_STORE_PATH` — persisted Spotify token file; defaults to `./data/spotify_token.json`. Mount its parent directory as a Railway volume so authorization survives redeploys.
 - `OPENAI_API_KEY`
 - `DEVICE_API_TOKEN`
 
