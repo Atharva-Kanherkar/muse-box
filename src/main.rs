@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
-    let state_hub = Arc::new(StateHub::new());
+    let state_hub = Arc::new(StateHub::new().with_display_offset(config.idle_display_offset));
     let (_background_shutdown, poll_shutdown_rx) = tokio::sync::watch::channel(false);
     let idle_shutdown_rx = poll_shutdown_rx.clone();
     let poll_spotify = spotify.clone();

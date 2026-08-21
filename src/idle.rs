@@ -1,7 +1,7 @@
 //! Deterministic idle-mode clock rendering.
 
 use ::image::{Rgb, RgbImage};
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, FixedOffset, Timelike, Utc};
 
 use crate::{image, render::Art, state::RenderParams};
 
@@ -31,11 +31,23 @@ struct ClockLayout {
     gap: u32,
 }
 
-/// Render a packed, device-sized idle clock for the UTC minute containing `at`.
-pub fn render(at: DateTime<Utc>, params: RenderParams) -> Art {
+/// Render a packed, device-sized idle clock for the minute containing `at`.
+///
+/// The pattern field keys off the absolute UTC minute so it evolves with real
+/// time, while the digits are rendered in `offset` so the clock reads correctly
+/// on a shelf. Passing a fixed `offset` keeps the output byte-deterministic.
+pub fn render(at: DateTime<Utc>, offset: FixedOffset, params: RenderParams) -> Art {
     let mut frame = pattern_field(at, params.width, params.height);
-    draw_clock(&mut frame, at);
+    let (hour, minute) = displayed_hm(at, offset);
+    draw_clock(&mut frame, hour, minute);
     image::dither(&frame, params.dither)
+}
+
+/// Wall-clock hour and minute shown for `at` in `offset`, wrapping across
+/// midnight in both directions.
+fn displayed_hm(at: DateTime<Utc>, offset: FixedOffset) -> (u32, u32) {
+    let local = at.with_timezone(&offset);
+    (local.hour(), local.minute())
 }
 
 fn pattern_field(at: DateTime<Utc>, width: u32, height: u32) -> RgbImage {
@@ -51,14 +63,13 @@ fn pattern_field(at: DateTime<Utc>, width: u32, height: u32) -> RgbImage {
     })
 }
 
-fn draw_clock(frame: &mut RgbImage, at: DateTime<Utc>) {
-    let layout = clock_layout(frame.width(), frame.height());
-    let digits = [
-        at.hour() / 10,
-        at.hour() % 10,
-        at.minute() / 10,
-        at.minute() % 10,
-    ];
+fn draw_clock(frame: &mut RgbImage, hour: u32, minute: u32) {
+    // No layout fits: leave the pattern field alone rather than drawing a
+    // clipped one-pixel smear.
+    let Some(layout) = clock_layout(frame.width(), frame.height()) else {
+        return;
+    };
+    let digits = [hour / 10, hour % 10, minute / 10, minute % 10];
     let mut x = layout.x;
     for (index, digit) in digits.into_iter().enumerate() {
         if index == 2 {
@@ -70,7 +81,9 @@ fn draw_clock(frame: &mut RgbImage, at: DateTime<Utc>) {
     }
 }
 
-fn clock_layout(width: u32, height: u32) -> ClockLayout {
+/// Largest clock layout that fits, or `None` when the frame is too small for
+/// one. Callers must not draw a clock in that case.
+fn clock_layout(width: u32, height: u32) -> Option<ClockLayout> {
     let margin = (width.min(height) / 32).max(2);
     let max_height = height.saturating_sub(margin * 2).max(1);
     let mut digit_height = (max_height * 3 / 4).max(1);
@@ -79,15 +92,18 @@ fn clock_layout(width: u32, height: u32) -> ClockLayout {
         let digit_width = (digit_height * 2 / 5).max(thickness * 2);
         let gap = (thickness / 2).max(2);
         let total_width = digit_width * 4 + thickness + gap * 6;
-        if total_width <= width.saturating_sub(margin * 2) || digit_height == 1 {
-            return ClockLayout {
+        if total_width <= width.saturating_sub(margin * 2) {
+            return Some(ClockLayout {
                 x: width.saturating_sub(total_width) / 2,
                 y: height.saturating_sub(digit_height) / 2,
                 digit_width,
                 digit_height,
                 thickness,
                 gap,
-            };
+            });
+        }
+        if digit_height == 1 {
+            return None;
         }
         digit_height -= 1;
     }
@@ -152,7 +168,7 @@ fn fill_rect(frame: &mut RgbImage, (x, y, width, height): (u32, u32, u32, u32)) 
 #[cfg(test)]
 mod tests {
     use base64::{Engine as _, engine::general_purpose};
-    use chrono::TimeZone;
+    use chrono::{Offset, TimeZone};
 
     use super::*;
     use crate::render::DitherMode;
@@ -165,9 +181,10 @@ mod tests {
             height: 400,
             dither: DitherMode::Bayer,
         };
-        let art = render(at, params);
+        let art = render(at, utc(), params);
         assert_eq!(packed_hash(&art), 8_132_122_953_464_961_965);
-        assert!(clock_layout(params.width, params.height).digit_height * 5 >= params.height * 2);
+        let layout = clock_layout(params.width, params.height).expect("layout fits");
+        assert!(layout.digit_height * 5 >= params.height * 2);
     }
 
     #[test]
@@ -178,9 +195,10 @@ mod tests {
             height: 128,
             dither: DitherMode::Atkinson,
         };
-        let art = render(at, params);
+        let art = render(at, utc(), params);
         assert_eq!(packed_hash(&art), 18_235_879_371_226_139_755);
-        assert!(clock_layout(params.width, params.height).digit_height * 5 >= params.height * 2);
+        let layout = clock_layout(params.width, params.height).expect("layout fits");
+        assert!(layout.digit_height * 5 >= params.height * 2);
     }
 
     #[test]
@@ -191,7 +209,10 @@ mod tests {
             height: 128,
             dither: DitherMode::Bayer,
         };
-        assert_eq!(render(at, params).bits, render(at, params).bits);
+        assert_eq!(
+            render(at, utc(), params).bits,
+            render(at, utc(), params).bits
+        );
     }
 
     #[test]
@@ -199,9 +220,64 @@ mod tests {
         let first = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 0).unwrap();
         let params = RenderParams::default();
         assert_ne!(
-            render(first, params).bits,
-            render(first + chrono::Duration::minutes(1), params).bits
+            render(first, utc(), params).bits,
+            render(first + chrono::Duration::minutes(1), utc(), params).bits
         );
+    }
+
+    #[test]
+    fn offset_localizes_displayed_digits_across_midnight() {
+        let morning = Utc.with_ymd_and_hms(2026, 8, 21, 9, 41, 0).unwrap();
+        assert_eq!(displayed_hm(morning, utc()), (9, 41));
+        assert_eq!(displayed_hm(morning, minutes(330)), (15, 11));
+
+        // Forward past midnight, and backward before it.
+        let late = Utc.with_ymd_and_hms(2026, 12, 31, 23, 58, 0).unwrap();
+        assert_eq!(displayed_hm(late, minutes(330)), (5, 28));
+        let early = Utc.with_ymd_and_hms(2026, 1, 1, 0, 10, 0).unwrap();
+        assert_eq!(displayed_hm(early, minutes(-300)), (19, 10));
+
+        // The offset reaches the rendered frame, and rendering stays
+        // deterministic for a fixed offset.
+        let params = RenderParams::default();
+        assert_ne!(
+            render(morning, utc(), params).bits,
+            render(morning, minutes(330), params).bits
+        );
+        assert_eq!(
+            render(morning, minutes(330), params).bits,
+            render(morning, minutes(330), params).bits
+        );
+    }
+
+    #[test]
+    fn frames_too_small_for_a_clock_render_pattern_only() {
+        assert!(clock_layout(16, 16).is_none());
+        let at = Utc.with_ymd_and_hms(2026, 8, 21, 9, 41, 0).unwrap();
+        let params = RenderParams {
+            width: 16,
+            height: 16,
+            dither: DitherMode::Bayer,
+        };
+
+        // With no clock drawn, only the UTC-keyed pattern contributes, so the
+        // displayed offset cannot change a single bit.
+        assert_eq!(
+            render(at, utc(), params).bits,
+            render(at, minutes(330), params).bits
+        );
+        let bytes = general_purpose::STANDARD
+            .decode(render(at, utc(), params).bits)
+            .unwrap();
+        assert_eq!(bytes.len(), 2 * 16);
+    }
+
+    fn minutes(offset: i32) -> FixedOffset {
+        FixedOffset::east_opt(offset * 60).expect("valid offset")
+    }
+
+    fn utc() -> FixedOffset {
+        Utc.fix()
     }
 
     fn packed_hash(art: &Art) -> u64 {

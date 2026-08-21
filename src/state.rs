@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Offset, Utc};
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
 
 use crate::{
@@ -87,6 +87,7 @@ pub struct StateHub {
     idle_frame_at: RwLock<Option<DateTime<Utc>>>,
     operation_guard: Mutex<()>,
     playback_activity: watch::Sender<PlaybackActivity>,
+    display_offset: FixedOffset,
     changes: broadcast::Sender<u64>,
     generation: AtomicU64,
     http: reqwest::Client,
@@ -130,10 +131,18 @@ impl StateHub {
             idle_frame_at: RwLock::new(None),
             operation_guard: Mutex::new(()),
             playback_activity,
+            display_offset: Utc.fix(),
             changes,
             generation: AtomicU64::new(0),
             http,
         }
+    }
+
+    /// Localize the idle clock's digits. Scheduling stays on UTC boundaries.
+    #[must_use]
+    pub fn with_display_offset(mut self, offset: FixedOffset) -> Self {
+        self.display_offset = offset;
+        self
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<u64> {
@@ -196,10 +205,19 @@ impl StateHub {
         if self.published.read().await.track_id.is_some() {
             return Ok(false);
         }
+        *self.idle_frame_at.write().await = Some(at);
         if self.changes.receiver_count() == 0 {
+            // Nobody is listening: skip the render and the broadcast, but stay
+            // in clock mode so ticking continues. Clear the cached documents so
+            // a later subscriber builds a frame for its own current minute
+            // rather than being served this skipped one.
             let mut registered = self.registered.write().await;
             registered.clear();
             registered.insert(RenderParams::default());
+            drop(registered);
+            self.documents.write().await.clear();
+            *self.published.write().await = PlaybackObservation::idle(at);
+            return Ok(true);
         }
         let params: Vec<_> = self.registered.read().await.iter().copied().collect();
         let palette = self.idle_palette().await;
@@ -207,7 +225,7 @@ impl StateHub {
         let documents = params
             .into_iter()
             .map(|params| {
-                let art = idle::render(at, params);
+                let art = idle::render(at, self.display_offset, params);
                 (
                     params,
                     Arc::new(document_from_observation(
@@ -279,11 +297,13 @@ impl StateHub {
         params: RenderParams,
     ) -> Result<RenderDoc, AppError> {
         let Some(track_id) = observation.track_id.as_deref() else {
-            let art = self
-                .idle_frame_at
-                .read()
-                .await
-                .map(|at| idle::render(at, params));
+            // Render the minute that is current now, not the one last
+            // published, so a client connecting after a skipped tick still
+            // shows the right time.
+            let art =
+                self.idle_frame_at.read().await.map(|_| {
+                    idle::render(floor_to_minute(Utc::now()), self.display_offset, params)
+                });
             return Ok(document_from_observation(
                 observation,
                 art,
@@ -928,6 +948,26 @@ mod tests {
         // Only the default variant is rebuilt; the two departed clients no
         // longer cost a dither on every publish.
         assert_eq!(hub.cache_stats().await.dithers, 1);
+    }
+
+    #[tokio::test]
+    async fn idle_publish_without_subscribers_skips_broadcast_but_keeps_ticking() {
+        let hub = StateHub::new();
+        assert_eq!(hub.subscriber_count(), 0);
+        let at = Utc.with_ymd_and_hms(2026, 8, 21, 9, 41, 0).unwrap();
+
+        // Ok(true) keeps the scheduler ticking; a false would strand it waiting
+        // for a playback change that never comes while idle.
+        assert!(hub.publish_idle_frame(at).await.unwrap());
+
+        // A client connecting later gets a frame for the minute that is current
+        // now, not the skipped one.
+        let document = hub.current_document(RenderParams::default()).await.unwrap();
+        let art = document.art.as_ref().expect("idle art");
+        assert_ne!(
+            art.bits,
+            idle::render(at, Utc.fix(), RenderParams::default()).bits
+        );
     }
 
     #[tokio::test]
