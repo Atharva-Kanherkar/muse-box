@@ -284,6 +284,23 @@ There is exactly one **packed-bit** encoding in v1, and the ESP32 consumes only 
 }
 ```
 
+Voice actions are stable, machine-readable strings:
+
+| Realtime tool | `action` format |
+|---------------|-----------------|
+| `play` | `spotify:play` |
+| `pause` | `spotify:pause` |
+| `next` | `spotify:next` |
+| `previous` | `spotify:previous` |
+| `search_and_play` | `spotify:play:track:<spotify-track-id>` |
+| `queue_search` | `queue:search:<query>` |
+| `set_volume` | `spotify:volume:<0-100>` |
+| `now_playing` | `query:now_playing` |
+
+`now_playing` is observational and does not mutate Spotify. Search actions use
+Spotify's top track result; the resolved track ID is recorded for immediate
+playback, while queued searches retain the spoken query for display.
+
 ---
 
 ## Playback update loop (background)

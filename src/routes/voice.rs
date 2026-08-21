@@ -368,13 +368,27 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use axum::{
-        body::{Body, to_bytes},
+        Json, Router,
+        body::{Body, BodyDataStream, to_bytes},
+        extract::Request as AxumRequest,
         http::{Request, StatusCode, header},
+        response::IntoResponse,
+        routing::any,
     };
+    use futures::StreamExt;
     use serde_json::Value;
+    use serde_json::json;
+    use tokio::sync::{Mutex as TokioMutex, Notify};
     use tower::ServiceExt;
 
     use crate::{
@@ -384,6 +398,40 @@ mod tests {
     };
 
     use super::*;
+
+    enum ModelResult {
+        Pause,
+        Fail,
+    }
+
+    struct GatedModel {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        result: ModelResult,
+    }
+
+    impl VoiceModel for GatedModel {
+        fn command<'a>(
+            &'a self,
+            samples: &'a [i16],
+            rate: u32,
+            _context: PlaybackContext,
+        ) -> VoiceFuture<'a> {
+            Box::pin(async move {
+                assert_eq!(rate, 16_000);
+                assert_eq!(samples, [120, -120]);
+                self.entered.notify_one();
+                self.release.notified().await;
+                match self.result {
+                    ModelResult::Pause => Ok(VoiceIntent {
+                        transcript: "pause".to_string(),
+                        tool: ToolCall::Pause,
+                    }),
+                    ModelResult::Fail => Err(AppError::Voice("model timeout".to_string())),
+                }
+            })
+        }
+    }
 
     #[tokio::test]
     async fn route_rejects_auth_content_type_params_and_body_size_matrix() {
@@ -466,6 +514,311 @@ mod tests {
                 .expect("query action"),
             "query:now_playing"
         );
+    }
+
+    #[tokio::test]
+    async fn every_tool_dispatches_once_and_uses_a_stable_action_string() {
+        let requests = Arc::new(TokioMutex::new(Vec::new()));
+        let observed = requests.clone();
+        let app = Router::new().fallback(any(move |request: AxumRequest| {
+            let observed = observed.clone();
+            async move {
+                let method = request.method().to_string();
+                let uri = request.uri().to_string();
+                observed.lock().await.push((method, uri.clone()));
+                if uri.starts_with("/v1/search?") {
+                    Json(json!({ "tracks": { "items": [{ "id": "resolved-id" }] } }))
+                        .into_response()
+                } else {
+                    StatusCode::NO_CONTENT.into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dispatch mock");
+        let address = listener.local_addr().expect("dispatch mock address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("dispatch mock");
+        });
+        let spotify = SpotifyClient::with_test_api_url(
+            SpotifyConfig {
+                client_id: "client".to_string(),
+                client_secret: "secret".to_string(),
+                redirect_uri: "http://localhost/callback".to_string(),
+                token_store_path: PathBuf::from("unused"),
+            },
+            format!("http://{address}/v1"),
+        );
+        spotify.authorize_for_test().await;
+
+        let tools = [
+            ToolCall::Play,
+            ToolCall::Pause,
+            ToolCall::Next,
+            ToolCall::Previous,
+            ToolCall::SearchAndPlay {
+                query: "mellow".to_string(),
+            },
+            ToolCall::QueueSearch {
+                query: "focus".to_string(),
+            },
+            ToolCall::SetVolume { percent: 55 },
+            ToolCall::NowPlaying,
+        ];
+        let mut actions = Vec::new();
+        for tool in &tools {
+            actions.push(dispatch_tool(&spotify, tool).await.expect("dispatch"));
+        }
+        assert_eq!(
+            actions,
+            [
+                "spotify:play",
+                "spotify:pause",
+                "spotify:next",
+                "spotify:previous",
+                "spotify:play:track:resolved-id",
+                "queue:search:focus",
+                "spotify:volume:55",
+                "query:now_playing",
+            ]
+        );
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 9);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(_, uri)| uri == "/v1/me/player/play")
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(_, uri)| uri == "/v1/me/player/pause")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(_, uri)| uri.starts_with("/v1/search?"))
+                .count(),
+            2
+        );
+        assert!(requests.iter().any(|(_, uri)| {
+            uri.starts_with("/v1/me/player/queue?uri=spotify%3Atrack%3Aresolved-id")
+        }));
+    }
+
+    #[tokio::test]
+    async fn wav_pause_e2e_emits_thinking_then_matching_paused_doc() {
+        let pause_calls = Arc::new(AtomicUsize::new(0));
+        let spotify = mock_spotify(pause_calls.clone(), false).await;
+        let hub = Arc::new(StateHub::new());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = routes::router(
+            spotify,
+            "device-token".to_string(),
+            hub,
+            Arc::new(GatedModel {
+                entered: entered.clone(),
+                release: release.clone(),
+                result: ModelResult::Pause,
+            }),
+        );
+        let mut events = open_state_stream(&app).await;
+        assert_eq!(next_state(&mut events).await["state"], "idle");
+
+        let request = voice_request(wav_fixture(16_000, 1, 1, 16, &[120, -120]));
+        let voice_app = app.clone();
+        let request_task =
+            tokio::spawn(async move { voice_app.oneshot(request).await.expect("voice response") });
+        entered.notified().await;
+        let thinking = next_state(&mut events).await;
+        assert_eq!(thinking["state"], "thinking");
+
+        release.notify_one();
+        let response = request_task.await.expect("voice task");
+        assert_eq!(response.status(), StatusCode::OK);
+        let returned: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("voice body"),
+        )
+        .expect("voice document");
+        let published = next_state(&mut events).await;
+
+        assert_eq!(pause_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(returned["state"], "paused");
+        assert_eq!(returned, published);
+        assert_eq!(returned["voice_log"][0]["transcript"], "pause");
+        assert_eq!(returned["voice_log"][0]["action"], "spotify:pause");
+    }
+
+    #[tokio::test]
+    async fn model_failure_after_thinking_emits_corrective_document() {
+        let spotify = mock_spotify(Arc::new(AtomicUsize::new(0)), false).await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = routes::router(
+            spotify,
+            "device-token".to_string(),
+            Arc::new(StateHub::new()),
+            Arc::new(GatedModel {
+                entered: entered.clone(),
+                release: release.clone(),
+                result: ModelResult::Fail,
+            }),
+        );
+        let mut events = open_state_stream(&app).await;
+        assert_eq!(next_state(&mut events).await["state"], "idle");
+
+        let voice_app = app.clone();
+        let task = tokio::spawn(async move {
+            voice_app
+                .oneshot(voice_request(wav_fixture(16_000, 1, 1, 16, &[120, -120])))
+                .await
+                .expect("voice response")
+        });
+        entered.notified().await;
+        assert_eq!(next_state(&mut events).await["state"], "thinking");
+        release.notify_one();
+
+        let response = task.await.expect("voice task");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 1024)
+                .await
+                .expect("error body"),
+        )
+        .expect("JSON error");
+        assert_eq!(body, json!({ "error": "model timeout" }));
+        assert_ne!(next_state(&mut events).await["state"], "thinking");
+    }
+
+    #[tokio::test]
+    async fn spotify_failure_after_thinking_emits_corrective_document() {
+        let spotify = mock_spotify(Arc::new(AtomicUsize::new(0)), true).await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = routes::router(
+            spotify,
+            "device-token".to_string(),
+            Arc::new(StateHub::new()),
+            Arc::new(GatedModel {
+                entered: entered.clone(),
+                release: release.clone(),
+                result: ModelResult::Pause,
+            }),
+        );
+        let mut events = open_state_stream(&app).await;
+        let _initial = next_state(&mut events).await;
+
+        let voice_app = app.clone();
+        let task = tokio::spawn(async move {
+            voice_app
+                .oneshot(voice_request(wav_fixture(16_000, 1, 1, 16, &[120, -120])))
+                .await
+                .expect("voice response")
+        });
+        entered.notified().await;
+        assert_eq!(next_state(&mut events).await["state"], "thinking");
+        release.notify_one();
+
+        let response = task.await.expect("voice task");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_ne!(next_state(&mut events).await["state"], "thinking");
+    }
+
+    async fn mock_spotify(pause_calls: Arc<AtomicUsize>, fail_pause: bool) -> SpotifyClient {
+        let app = Router::new().fallback(any(move |request: AxumRequest| {
+            let pause_calls = pause_calls.clone();
+            async move {
+                match (request.method().as_str(), request.uri().path()) {
+                    ("PUT", "/v1/me/player/pause") => {
+                        pause_calls.fetch_add(1, Ordering::SeqCst);
+                        if fail_pause {
+                            StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            StatusCode::NO_CONTENT.into_response()
+                        }
+                    }
+                    ("GET", "/v1/me/player/currently-playing") => Json(json!({
+                        "is_playing": false,
+                        "progress_ms": 42,
+                        "item": {
+                            "id": "known-track",
+                            "name": "Known Track",
+                            "duration_ms": 120000,
+                            "artists": [{ "name": "Known Artist" }],
+                            "album": { "name": "Known Album", "images": [] }
+                        }
+                    }))
+                    .into_response(),
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Spotify mock");
+        let address = listener.local_addr().expect("Spotify mock address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("Spotify mock");
+        });
+        let spotify = SpotifyClient::with_test_api_url(
+            SpotifyConfig {
+                client_id: "client".to_string(),
+                client_secret: "secret".to_string(),
+                redirect_uri: "http://localhost/callback".to_string(),
+                token_store_path: PathBuf::from("unused"),
+            },
+            format!("http://{address}/v1"),
+        );
+        spotify.authorize_for_test().await;
+        spotify
+    }
+
+    async fn open_state_stream(app: &Router) -> BodyDataStream {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/state")
+                    .header(header::AUTHORIZATION, "Bearer device-token")
+                    .body(Body::empty())
+                    .expect("state request"),
+            )
+            .await
+            .expect("state response");
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().into_data_stream()
+    }
+
+    async fn next_state(events: &mut BodyDataStream) -> Value {
+        let chunk = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("SSE event timeout")
+            .expect("SSE stream ended")
+            .expect("SSE chunk");
+        let event = std::str::from_utf8(&chunk).expect("UTF-8 SSE");
+        let data = event
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("SSE data line");
+        serde_json::from_str(data).expect("SSE JSON")
+    }
+
+    fn voice_request(wav: Vec<u8>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/voice")
+            .header(header::AUTHORIZATION, "Bearer device-token")
+            .header(header::CONTENT_TYPE, "audio/wav")
+            .body(Body::from(wav))
+            .expect("voice request")
     }
 
     #[test]
