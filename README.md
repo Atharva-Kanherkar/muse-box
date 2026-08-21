@@ -32,6 +32,7 @@ Do not build Spotify logic, image decoding, or JPEG resize into the client. The 
     "dither": "bayer",
     "bits": "<base64, packed 1-bit, row-major, MSB first>"
   },
+  "art_url": "https://i.scdn.co/image/ab67616d0000b273...",
   "palette": ["#e8663a", "#e8a63a"],
   "progress_ms": 84000,
   "duration_ms": 272000,
@@ -256,6 +257,7 @@ Session details:
 | `artist` | `string \| null` | Artist name. |
 | `album` | `string \| null` | Album title. |
 | `art` | `Art \| null` | Dithered artwork (or idle frame). See below. |
+| `art_url` | `string \| null` | Full-color album art URL (Spotify CDN). The web client uses this for its polished UI; the ESP32 ignores it. |
 | `palette` | `string[]` | Exactly two colors extracted from the cover. `palette[0]` = dominant background, `palette[1]` = accent (LED wash + UI highlights). |
 | `progress_ms` | `u64` | Playback position at `server_ts`. |
 | `duration_ms` | `u64` | Total track length. |
@@ -270,7 +272,7 @@ Session details:
 | `dither` | `"bayer" \| "atkinson"` | Algorithm used. |
 | `bits` | `string` | Base64 of packed 1-bit data. **Row-major, MSB-first within each byte, each row padded to a whole byte. `1` = foreground (ink), `0` = background.** Not a PNG; clients unpack it straight into a framebuffer or `ImageData`. |
 
-There is exactly one art encoding in v1. The web client renders the same packed bits the panel does; that is what makes it the reference renderer. (A full-color debug toggle in the web UI is allowed, but it is a debug view, not a mode of the contract.)
+There is exactly one **packed-bit** encoding in v1, and the ESP32 consumes only that. The web client is free to render a genuinely nice full-color UI from `art_url`; it also keeps a 1-bit "panel preview" toggle that renders the exact packed bits the hardware will blit. That toggle is what makes the web client the reference renderer.
 
 ### Voice log entry
 
@@ -345,7 +347,7 @@ Small k-means or median-cut over the resized cover. Exactly two colors:
 
 - `GET /state` via `EventSource`; reconnect = just reconnect, the first event restores everything.
 - Interpolate the progress bar locally from `progress_ms` + `server_ts`.
-- Unpack `art.bits` into `ImageData` and draw to `<canvas>`.
+- Render the polished UI from `art_url` (full color, nice typography, the works). Keep a "panel preview" toggle that unpacks `art.bits` into `ImageData` on a `<canvas>`, pixel-for-pixel what the hardware will show.
 - `POST /voice` with WAV recorded via `getUserMedia` + an AudioWorklet.
 - Drive FFT bars/LED-preview from a WebAudio `AnalyserNode`, colored by `palette[1]`.
 
@@ -403,6 +405,25 @@ Optional:
 
 ---
 
+## CI and contribution rules
+
+Every PR runs the full gauntlet in `.github/workflows/ci.yml` and all jobs must pass:
+
+1. `cargo fmt --all --check`
+2. `cargo clippy --all-targets --all-features -- -D warnings`
+3. Strict clippy on production code (`--lib --bins`): `unwrap`, `expect`, `panic!`, `todo!`, `unimplemented!`, `dbg!`, `println!`/`eprintln!` are all **denied**. Return `AppError`/`anyhow::Error` instead; log with `tracing`. Tests may unwrap.
+4. `cargo test --all-targets` with `RUSTFLAGS=-D warnings`, plus a zero-tests guard: a run where no tests execute fails CI.
+5. `cargo doc` with `RUSTDOCFLAGS=-D warnings`.
+6. `cargo audit` (RustSec advisories).
+
+`Cargo.lock` is committed and CI runs `--locked`; update the lockfile in the same PR as the dependency change. Each issue lists its own acceptance criteria; a PR is done when the criteria boxes are checked, the tests specified in the issue exist, and CI is green.
+
+## Deployment
+
+The backend runs on **Railway**: one service built from this repo, secrets set as Railway variables (`SPOTIFY_*`, `OPENAI_API_KEY`, `DEVICE_API_TOKEN`), TLS terminated by Railway's domain. The Spotify refresh token is persisted to a path on a small Railway volume so redeploys do not require re-auth. `SPOTIFY_REDIRECT_URI` must point at the Railway domain's `/auth/spotify/callback`.
+
+---
+
 ## Development plan
 
 ### Phase 1: web app
@@ -438,8 +459,10 @@ Settled (so future sessions do not relitigate):
 - **GPT Realtime, not STT + LLM.** One session does transcription + intent + tool calls.
 - **No `fft_bands` in the contract.** Beat reactivity is device-local from the device's own mic; the server only supplies the palette.
 - **Progress is interpolated client-side.** No per-second SSE pushes.
-- **One art encoding** (packed 1-bit + `w`/`h`/`dither` metadata). The web UI renders it faithfully; full color is a debug toggle only.
+- **One packed-bit art encoding for hardware; the web UI renders a nice full-color UI** from `art_url`, with a 1-bit panel-preview toggle as the reference renderer.
 - **Single Spotify account, single user, static device token.** This is furniture, not a product.
+- **Backend hosted on Railway.** TLS terminated by Railway; secrets live in Railway service variables; the refresh-token store path points at a Railway volume.
+- **Backend is built first.** All open issues are backend-only until phase 1 item 8 (web client).
 
 Still open:
 

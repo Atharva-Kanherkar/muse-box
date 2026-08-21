@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 
@@ -24,7 +24,10 @@ impl IntoResponse for AppError {
             AppError::Voice(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),
             AppError::Internal(err) => {
                 tracing::error!("internal error: {:#}", err);
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
         };

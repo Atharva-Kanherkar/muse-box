@@ -8,7 +8,7 @@ pub struct Config {
     pub spotify_client_secret: String,
     pub spotify_redirect_uri: String,
     pub openai_api_key: String,
-    pub openai_model: String,
+    pub openai_realtime_model: String,
     pub device_api_token: String,
 }
 
@@ -28,7 +28,8 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:3000/auth/spotify/callback".to_string()),
             openai_api_key: std::env::var("OPENAI_API_KEY")
                 .context("OPENAI_API_KEY is required")?,
-            openai_model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+            openai_realtime_model: std::env::var("OPENAI_REALTIME_MODEL")
+                .unwrap_or_else(|_| "gpt-realtime-mini".to_string()),
             device_api_token: std::env::var("DEVICE_API_TOKEN")
                 .unwrap_or_else(|_| "dev-token-change-me".to_string()),
         })

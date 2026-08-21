@@ -2,7 +2,29 @@
 
 ## Project goal
 
-Build a voice-controlled Spotify decoration: terminal-aesthetic dithered display + reactive LEDs. Web app first, ESP32 hardware second. Both clients consume the same backend-rendered document. Personal project: one user, one Spotify account, one box.
+Build a voice-controlled Spotify decoration: terminal-aesthetic dithered display + reactive LEDs. Web app first, ESP32 hardware second. Both clients consume the same backend-rendered document. Personal project: one user, one Spotify account, one box. **Current focus: backend only.** The web client starts after the backend issues are closed.
+
+## How to work in this repo
+
+1. **One issue per PR.** Pick an open issue, branch off `master` (`issue-<n>-short-name`), implement exactly that issue's scope. Do not bundle issues or drive-by refactors.
+2. **The issue's acceptance criteria are the spec.** Every checkbox must be demonstrably true, and the tests named in the issue must exist and pass. If a criterion is impossible or wrong, say so on the issue instead of silently deviating.
+3. **CI is the gate and it is strict** (`.github/workflows/ci.yml`): rustfmt, clippy with `-D warnings` on all targets, a second clippy pass on production code denying `unwrap`/`expect`/`panic!`/`todo!`/`unimplemented!`/`dbg!`/`println!`/`eprintln!`, tests under `RUSTFLAGS=-D warnings` with a zero-tests guard, rustdoc with `-D warnings`, and `cargo audit`. Run locally before pushing:
+
+   ```
+   cargo fmt --all
+   cargo clippy --all-targets --all-features -- -D warnings
+   cargo clippy --lib --bins --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::todo -D clippy::unimplemented -D clippy::dbg_macro -D clippy::print_stdout -D clippy::print_stderr
+   cargo test --all-targets
+   ```
+
+4. **No panicking shortcuts in production code.** Handlers return `AppError`; internal fallibility uses `anyhow`/`thiserror`; logging goes through `tracing`. Tests may unwrap freely.
+5. **`Cargo.lock` is committed; CI runs `--locked`.** New dependencies need a one-line justification in the PR description. Prefer the deps already in `Cargo.toml`.
+6. **Do not change the RenderDoc contract casually.** Additive optional fields are fine; anything breaking bumps `RENDER_DOCUMENT_VERSION` and updates README, this file, and the tests in the same PR.
+7. **Never commit secrets.** `.env` is gitignored; real values live in Railway service variables.
+
+## Deployment target
+
+Railway, single service built from this repo. TLS is terminated by Railway. Secrets are Railway variables. The Spotify refresh token persists to a configurable path (Railway volume) so redeploys do not force re-auth. Bind to `HOST`/`PORT` from env (Railway injects `PORT`).
 
 ## Architecture rules
 
@@ -49,4 +71,4 @@ Build a voice-controlled Spotify decoration: terminal-aesthetic dithered display
 - Clamp `palette[1]` (HSL: L in [0.35, 0.75], S >= 0.4); k-means on dark covers returns near-black accents that look broken on LEDs.
 - SSE on ESP32: one TLS handshake per uptime is the target; steady-state playback must produce zero SSE traffic between track changes.
 - Spotify playback control requires Premium (the owner has it); dev-mode app on the owner's account, no quota extension needed.
-- The web UI is a permanent debug view and the reference renderer, not a throwaway prototype.
+- The web UI renders a polished full-color interface from `art_url`, but its 1-bit "panel preview" toggle (rendering `art.bits` exactly) is the hardware reference renderer. Both live in the same client; neither is a throwaway.

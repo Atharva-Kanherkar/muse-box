@@ -1,0 +1,91 @@
+# Tough CI: every job must pass on every PR. No exceptions, no allow-lists
+# without a written justification in the PR description.
+#
+# The strict clippy pass denies unwrap/expect/panic/todo/dbg/print in
+# production code (lib + bins). Tests are exempt (they run under the normal
+# -D warnings pass only).
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (deny warnings + strict prod lints)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy, all targets (tests included), deny all warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Clippy, production code only, forbid panicking shortcuts
+        run: >
+          cargo clippy --locked --lib --bins --all-features --
+          -D warnings
+          -D clippy::unwrap_used
+          -D clippy::expect_used
+          -D clippy::panic
+          -D clippy::todo
+          -D clippy::unimplemented
+          -D clippy::dbg_macro
+          -D clippy::print_stdout
+          -D clippy::print_stderr
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --all-features --all-targets
+      - name: Fail if the crate has zero tests
+        run: |
+          out=$(cargo test --locked --all-features --all-targets 2>&1 | grep -E '^test result' || true)
+          total=$(echo "$out" | grep -oE '[0-9]+ passed' | awk '{s+=$1} END {print s+0}')
+          echo "total tests passed: $total"
+          if [ "$total" -eq 0 ]; then
+            echo "::error::No tests ran. Every feature PR must ship tests (see AGENTS.md)."
+            exit 1
+          fi
+
+  docs:
+    name: rustdoc (deny warnings)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --locked --no-deps --all-features
+
+  audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
