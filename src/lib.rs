@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod error;
+pub mod idle;
 pub mod image;
 pub mod render;
 pub mod routes;
