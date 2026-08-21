@@ -3,6 +3,9 @@
 use std::collections::BTreeMap;
 
 use ::image::{DynamicImage, GenericImageView, ImageError, Rgb, RgbImage, imageops::FilterType};
+use base64::{Engine as _, engine::general_purpose};
+
+use crate::render::{Art, DitherMode};
 
 /// Errors returned when source artwork cannot be converted into a valid frame.
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +84,33 @@ pub fn extract_palette(image: &RgbImage) -> [String; 2] {
     let dominant = vector_to_rgb(dominant);
     let accent = clamp_accent(vector_to_rgb(accent));
     [format_hex(dominant), format_hex(accent)]
+}
+
+/// Convert a resized RGB image into a packed, base64-encoded 1-bit frame.
+pub fn dither(image: &RgbImage, mode: DitherMode) -> Art {
+    let ink = match mode {
+        DitherMode::Bayer => bayer_ink(image),
+        DitherMode::Atkinson => atkinson_ink(image),
+    };
+    let packed = pack_1bit(image.width(), image.height(), &ink);
+    Art {
+        w: image.width(),
+        h: image.height(),
+        dither: mode,
+        bits: general_purpose::STANDARD.encode(packed),
+    }
+}
+
+/// Run decode, resize, palette extraction, dithering, and packed Art construction.
+pub fn process(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    mode: DitherMode,
+) -> Result<(Art, [String; 2]), ImagePipelineError> {
+    let image = resize(bytes, width, height)?;
+    let palette = extract_palette(&image);
+    Ok((dither(&image, mode), palette))
 }
 
 #[derive(Clone, Copy)]
@@ -239,6 +269,85 @@ fn format_hex(color: [u8; 3]) -> String {
     format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2])
 }
 
+fn bayer_ink(image: &RgbImage) -> Vec<bool> {
+    const MATRIX: [[u16; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+    image
+        .enumerate_pixels()
+        .map(|(x, y, pixel)| {
+            let threshold = MATRIX[y as usize % 4][x as usize % 4] * 16 + 8;
+            luminance(pixel) < threshold
+        })
+        .collect()
+}
+
+fn atkinson_ink(image: &RgbImage) -> Vec<bool> {
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let mut luminances: Vec<f32> = image
+        .pixels()
+        .map(|pixel| f32::from(luminance(pixel)))
+        .collect();
+    let mut ink = vec![false; luminances.len()];
+    const NEIGHBORS: [(isize, isize); 6] = [(1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)];
+
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            let Some(value) = luminances.get(index).copied() else {
+                continue;
+            };
+            let is_ink = value < 128.0;
+            if let Some(output) = ink.get_mut(index) {
+                *output = is_ink;
+            }
+            let quantized = if is_ink { 0.0 } else { 255.0 };
+            let distributed_error = (value - quantized) / 8.0;
+
+            for (offset_x, offset_y) in NEIGHBORS {
+                let Some(neighbor_x) = x.checked_add_signed(offset_x) else {
+                    continue;
+                };
+                let Some(neighbor_y) = y.checked_add_signed(offset_y) else {
+                    continue;
+                };
+                if neighbor_x >= width || neighbor_y >= height {
+                    continue;
+                }
+                let neighbor_index = neighbor_y * width + neighbor_x;
+                if let Some(neighbor) = luminances.get_mut(neighbor_index) {
+                    *neighbor = (*neighbor + distributed_error).clamp(0.0, 255.0);
+                }
+            }
+        }
+    }
+    ink
+}
+
+fn luminance(pixel: &Rgb<u8>) -> u16 {
+    ((299 * u32::from(pixel[0]) + 587 * u32::from(pixel[1]) + 114 * u32::from(pixel[2]) + 500)
+        / 1000) as u16
+}
+
+fn pack_1bit(width: u32, height: u32, ink: &[bool]) -> Vec<u8> {
+    let width = width as usize;
+    let height = height as usize;
+    let row_bytes = width.div_ceil(8);
+    let mut packed = vec![0_u8; row_bytes.saturating_mul(height)];
+    for y in 0..height {
+        for x in 0..width {
+            let source_index = y * width + x;
+            if !ink.get(source_index).copied().unwrap_or(false) {
+                continue;
+            }
+            let target_index = y * row_bytes + x / 8;
+            if let Some(byte) = packed.get_mut(target_index) {
+                *byte |= 1 << (7 - x % 8);
+            }
+        }
+    }
+    packed
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -341,6 +450,85 @@ mod tests {
         let second = extract_palette(&image);
         assert_eq!(first, second);
         assert_eq!(first[0], "#14283c");
+    }
+
+    #[test]
+    fn packed_length_matches_padded_rows() {
+        for width in [1, 7, 8, 9, 400] {
+            for height in [1, 3, 400] {
+                let image = RgbImage::from_fn(width, height, |x, y| {
+                    let value = ((x + y) % 256) as u8;
+                    Rgb([value, value, value])
+                });
+                for mode in [DitherMode::Bayer, DitherMode::Atkinson] {
+                    let art = dither(&image, mode);
+                    let packed = general_purpose::STANDARD.decode(art.bits).unwrap();
+                    assert_eq!(packed.len(), width.div_ceil(8) as usize * height as usize);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packing_is_row_major_msb_first() {
+        let bits = [
+            true, false, true, false, false, false, false, true, false, true, false, true, true,
+            true, true, false,
+        ];
+        assert_eq!(pack_1bit(8, 2, &bits), [0b1010_0001, 0b0101_1110]);
+    }
+
+    #[test]
+    fn dither_modes_have_stable_golden_snapshots() {
+        let image = gradient_fixture();
+        let bayer = dither(&image, DitherMode::Bayer).bits;
+        let atkinson = dither(&image, DitherMode::Atkinson).bits;
+        assert_ne!(bayer, atkinson);
+        assert_eq!(
+            (bayer.as_str(), atkinson.as_str()),
+            (
+                "9VD/qtVU/qpVUPqq1UT+qlUQ+qrVQP6qVQD6qlVA6qg=",
+                "/6T9sP1K90j80Psy7yD5jPbA3FD3EOmE7KDaINsI5MA="
+            )
+        );
+    }
+
+    #[test]
+    fn process_builds_complete_art_and_palette() {
+        let source = DynamicImage::ImageRgb8(RgbImage::from_fn(20, 10, |x, _| {
+            if x < 15 {
+                Rgb([10, 20, 30])
+            } else {
+                Rgb([220, 160, 80])
+            }
+        }));
+        let bytes = encode(source, ImageFormat::Png);
+        let (art, palette) = process(&bytes, 9, 7, DitherMode::Atkinson).unwrap();
+
+        assert_eq!((art.w, art.h, art.dither), (9, 7, DitherMode::Atkinson));
+        assert_eq!(palette.len(), 2);
+        assert_eq!(
+            general_purpose::STANDARD.decode(art.bits).unwrap().len(),
+            14
+        );
+    }
+
+    #[test]
+    fn pipeline_is_deterministic() {
+        let bytes = encode(
+            DynamicImage::ImageRgb8(gradient_fixture()),
+            ImageFormat::Png,
+        );
+        let first = process(&bytes, 16, 16, DitherMode::Atkinson).unwrap();
+        let second = process(&bytes, 16, 16, DitherMode::Atkinson).unwrap();
+        assert_eq!(first, second);
+    }
+
+    fn gradient_fixture() -> RgbImage {
+        RgbImage::from_fn(16, 16, |x, y| {
+            let value = (x * 12 + y * 4) as u8;
+            Rgb([value, value, value])
+        })
     }
 
     fn parse_hex(value: &str) -> [u8; 3] {
