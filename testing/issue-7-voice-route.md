@@ -19,7 +19,13 @@
 - Voice log entries are newest first and capped at five; the sixth evicts the
   oldest.
 - Any failure after `thinking` returns the existing JSON error shape and
-  publishes a corrected non-`thinking` document.
+  publishes a corrected non-`thinking` document, ordered before the response.
+- A request that never finishes also clears `thinking`. Axum drops the handler
+  future when the caller disconnects, and `publish_thinking` rewrites only the
+  cached documents, leaving `published` untouched: the poll loop therefore sees
+  no meaningful change and never republishes, so a playing or paused box would
+  sit on `thinking` indefinitely. A drop guard restores a real document on any
+  exit the normal paths miss.
 - Action strings match the documented stable formats in README.
 
 ## Unit Tests
@@ -28,6 +34,8 @@
 - Parse PCM16 stereo WAV data and downmix each frame with saturating-safe
   arithmetic.
 - Reject non-PCM, non-16-bit, malformed, truncated, and over-duration WAVs.
+- Neither the WAV nor the raw-PCM parser panics on arbitrary or mutated input;
+  the endpoint is reachable by any holder of the device token.
 - Validate raw PCM parameters, byte alignment, channel count, and duration.
 - Keep only five voice-log entries in newest-first order.
 - Map every Realtime tool to its documented action string.
@@ -41,6 +49,9 @@
 - Force a Realtime timeout/failure and a Spotify action failure independently;
   assert each caller receives an error and SSE receives a follow-up
   non-`thinking` document.
+- Abort a request while the model is in flight against a playing track, whose
+  steady progress the poll loop would never treat as a change, and assert the
+  document returns to a non-`thinking` state.
 - Assert each mutating tool calls the correct Spotify endpoint and that search
   commands use the top search result.
 
