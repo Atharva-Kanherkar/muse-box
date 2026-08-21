@@ -31,6 +31,7 @@ pub struct RealtimeManager {
     model: Arc<str>,
     endpoint: Arc<str>,
     session: Mutex<Option<RealtimeSocket>>,
+    command_deadline: Duration,
 }
 
 impl fmt::Debug for RealtimeManager {
@@ -59,7 +60,22 @@ impl RealtimeManager {
             model: Arc::from(model.into()),
             endpoint: Arc::from(endpoint.into()),
             session: Mutex::new(None),
+            command_deadline: COMMAND_DEADLINE,
         }
+    }
+
+    /// Shorten the command deadline. Tests use this instead of pausing Tokio
+    /// time, because auto-advancing virtual time next to real socket I/O fires
+    /// the deadline while the runtime is merely waiting on the network.
+    #[cfg(test)]
+    fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.command_deadline = deadline;
+        self
+    }
+
+    #[cfg(test)]
+    async fn session_is_open(&self) -> bool {
+        self.session.lock().await.is_some()
     }
 
     pub async fn command(
@@ -73,17 +89,30 @@ impl RealtimeManager {
         }
         let audio = resample_to_24khz(pcm_mono, input_rate)?;
         let mut session = self.session.lock().await;
-        if session.is_none() {
-            *session = Some(self.connect().await?);
-        }
-        let result = match session.as_mut() {
-            Some(socket) => Self::run_command(socket, &audio, &context).await,
-            None => Err(AppError::Voice(
-                "realtime session was not available".to_string(),
-            )),
+        // The deadline covers connect and the audio sends too, not just the
+        // wait for a reply: a peer that accepts and never answers would
+        // otherwise hang here forever holding the session lock, wedging every
+        // later voice command.
+        let exchange = async {
+            if session.is_none() {
+                *session = Some(self.connect().await?);
+            }
+            match session.as_mut() {
+                Some(socket) => Self::run_command(socket, &audio, &context).await,
+                None => Err(AppError::Voice(
+                    "realtime session was not available".to_string(),
+                )),
+            }
         };
-        if result.is_err() {
-            tracing::warn!("realtime command failed; resetting session");
+        let result = match tokio::time::timeout(self.command_deadline, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(AppError::Voice("model timeout".to_string())),
+        };
+        if let Err(error) = &result {
+            // Connect failures reach this too. They previously returned through
+            // `?` above, so a bad key or an unreachable endpoint produced no log
+            // line at all.
+            tracing::warn!(%error, "realtime command failed; resetting session");
             *session = None;
         }
         result
@@ -101,9 +130,9 @@ impl RealtimeManager {
         let authorization = HeaderValue::from_str(&format!("Bearer {}", self.api_key))
             .map_err(|_| AppError::Voice("invalid OpenAI API key format".to_string()))?;
         request.headers_mut().insert(AUTHORIZATION, authorization);
-        let (mut socket, _) = connect_async(request)
-            .await
-            .map_err(|_| AppError::Voice("failed to connect to realtime service".to_string()))?;
+        let (mut socket, _) = connect_async(request).await.map_err(|error| {
+            AppError::Voice(format!("failed to connect to realtime service: {error}"))
+        })?;
         send_json(&mut socket, &session_update()).await?;
         Ok(socket)
     }
@@ -145,10 +174,7 @@ impl RealtimeManager {
         )
         .await?;
 
-        match tokio::time::timeout(COMMAND_DEADLINE, Self::receive_intent(socket)).await {
-            Ok(result) => result,
-            Err(_) => Err(AppError::Voice("model timeout".to_string())),
-        }
+        Self::receive_intent(socket).await
     }
 
     async fn receive_intent(socket: &mut RealtimeSocket) -> Result<VoiceIntent, AppError> {
@@ -525,10 +551,9 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(
 mod tests {
     use std::{
         f64::consts::TAU,
-        io::{self, Write},
         sync::{
-            Arc, Mutex as StdMutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+            atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -786,56 +811,45 @@ mod tests {
         assert_eq!(connections.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn timeout_resets_session_and_manager_reconnects() {
+        // A short real deadline instead of `start_paused`: paused time
+        // auto-advances whenever the runtime goes idle, so waiting on a real
+        // socket would fire the deadline spuriously.
         let (listener, endpoint) = mock_listener().await;
         let connections = Arc::new(AtomicUsize::new(0));
-        let ready = Arc::new(AtomicBool::new(false));
         let server = tokio::spawn({
             let connections = connections.clone();
-            let ready = ready.clone();
             async move {
+                // Accept, read the command, then never answer.
                 let mut first = accept_mock(&listener, &connections).await;
                 receive_json(&mut first).await;
                 receive_command(&mut first).await;
-                ready.store(true, Ordering::SeqCst);
-                while first.next().await.is_some() {}
+                let stalled = first;
 
                 let mut second = accept_mock(&listener, &connections).await;
                 receive_json(&mut second).await;
                 receive_command(&mut second).await;
                 send_success(&mut second, "input-2", "resume", "play", "{}").await;
+                drop(stalled);
             }
         });
-        let manager = Arc::new(RealtimeManager::with_endpoint(
-            "test-key",
-            "gpt-realtime-mini",
-            endpoint,
-        ));
+        let manager = RealtimeManager::with_endpoint("test-key", "gpt-realtime-mini", endpoint)
+            .with_deadline(Duration::from_millis(250));
         let audio = vec![123_i16; 1_600];
-        let first_command = tokio::spawn({
-            let manager = manager.clone();
-            let audio = audio.clone();
-            async move {
-                manager
-                    .command(
-                        &audio,
-                        16_000,
-                        context("Song", "Artist", PlaybackState::Paused),
-                    )
-                    .await
-            }
-        });
-        while !ready.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
 
-        tokio::time::advance(Duration::from_millis(9_999)).await;
-        tokio::task::yield_now().await;
-        assert!(!first_command.is_finished());
-        tokio::time::advance(Duration::from_millis(1)).await;
-        let timeout = first_command.await.unwrap();
+        let timeout = manager
+            .command(
+                &audio,
+                16_000,
+                context("Song", "Artist", PlaybackState::Paused),
+            )
+            .await;
         assert!(matches!(timeout, Err(AppError::Voice(message)) if message == "model timeout"));
+        assert!(
+            !manager.session_is_open().await,
+            "a timed-out session must be discarded"
+        );
 
         let recovered = manager
             .command(
@@ -850,42 +864,99 @@ mod tests {
         assert_eq!(connections.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn diagnostics_never_contain_api_key() {
+        // Asserted on the values themselves rather than on captured log output:
+        // tracing's per-callsite interest cache is process-global, so a sibling
+        // test touching the same `warn!` can silence it here and the assertion
+        // flakes with test parallelism.
+        let secret = "sk-proj-do-not-log-this-value";
         let (listener, endpoint) = mock_listener().await;
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = accept_async(stream).await.unwrap();
             receive_json(&mut socket).await;
-            receive_command(&mut socket).await;
             socket.close(None).await.unwrap();
         });
-        let secret = "sk-proj-do-not-log-this-value";
-        let manager = RealtimeManager::with_endpoint(secret, "gpt-realtime-mini", endpoint);
-        let captured = Arc::new(StdMutex::new(Vec::new()));
-        let writer_buffer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || CapturedWriter(writer_buffer.clone()))
-            .finish();
-        let dispatch = tracing::Dispatch::new(subscriber);
-        let guard = tracing::dispatcher::set_default(&dispatch);
-        let result = manager
+        let manager = RealtimeManager::with_endpoint(secret, "gpt-realtime-mini", endpoint)
+            .with_deadline(Duration::from_secs(5));
+
+        let error = manager
             .command(
                 &[1; 1_600],
                 16_000,
                 context("Song", "Artist", PlaybackState::Playing),
             )
-            .await;
-        drop(guard);
-        assert!(result.is_err());
+            .await
+            .expect_err("the server closes without answering");
         server.await.unwrap();
 
-        let trace = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
-        assert!(trace.contains("realtime command failed; resetting session"));
-        assert!(!trace.contains(secret));
+        assert!(!error.to_string().contains(secret), "{error}");
+        assert!(!format!("{error:?}").contains(secret));
         assert!(!format!("{manager:?}").contains(secret));
+        assert!(
+            !manager.session_is_open().await,
+            "a failed command must reset the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_connect_times_out_instead_of_hanging() {
+        // Accept the TCP connection and never complete the WebSocket upgrade.
+        // The deadline has to cover `connect`, or this wedges the session lock
+        // forever and every later voice command blocks behind it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let manager = RealtimeManager::with_endpoint("test-key", "gpt-realtime-mini", endpoint)
+            .with_deadline(Duration::from_millis(250));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.command(
+                &[1; 1_600],
+                16_000,
+                context("Song", "Artist", PlaybackState::Playing),
+            ),
+        )
+        .await
+        .expect("the command deadline must fire instead of hanging");
+        assert!(matches!(outcome, Err(AppError::Voice(message)) if message == "model timeout"));
+        assert!(!manager.session_is_open().await);
+    }
+
+    #[tokio::test]
+    async fn connect_failure_is_reported_without_leaking_the_key() {
+        // Nothing is listening: the failure happens inside `connect`, which used
+        // to return early and therefore never log or reset anything.
+        let secret = "sk-proj-do-not-log-this-value";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let manager = RealtimeManager::with_endpoint(secret, "gpt-realtime-mini", endpoint)
+            .with_deadline(Duration::from_secs(5));
+
+        let error = manager
+            .command(
+                &[1; 1_600],
+                16_000,
+                context("Song", "Artist", PlaybackState::Playing),
+            )
+            .await
+            .expect_err("connect must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("failed to connect to realtime service:"),
+            "the cause must be preserved for operators: {message}"
+        );
+        // The cause is preserved for operators, but never the credential.
+        assert!(!message.contains(secret), "{message}");
+        assert!(!manager.session_is_open().await);
     }
 
     async fn mock_listener() -> (TcpListener, String) {
@@ -1047,19 +1118,6 @@ mod tests {
             track: Some(track.to_string()),
             artist: Some(artist.to_string()),
             state,
-        }
-    }
-
-    struct CapturedWriter(Arc<StdMutex<Vec<u8>>>);
-
-    impl Write for CapturedWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
         }
     }
 }
