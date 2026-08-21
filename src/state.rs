@@ -1,15 +1,31 @@
-//! Shared playback state and meaningful-change detection for the SSE feed.
+//! Shared playback state, render caching, and meaningful-change detection.
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
-use crate::{error::AppError, render::DitherMode, spotify::PlaybackObservation};
+use crate::{
+    error::AppError,
+    image,
+    render::{Art, DitherMode, PlaybackState, RENDER_DOCUMENT_VERSION, RenderDoc},
+    spotify::PlaybackObservation,
+};
 
 const MIN_RENDER_DIMENSION: u32 = 16;
 const MAX_RENDER_DIMENSION: u32 = 1024;
 const DEFAULT_RENDER_DIMENSION: u32 = 400;
 const SEEK_THRESHOLD_MS: u64 = 2_000;
+const BROADCAST_CAPACITY: usize = 32;
+const MAX_RENDER_VARIANTS: usize = 32;
+const DEFAULT_PALETTE: [&str; 2] = ["#1a1a1a", "#e0e0e0"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RenderParams {
@@ -47,6 +63,220 @@ impl RenderParams {
             height,
             dither,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub downloads: u64,
+    pub dithers: u64,
+}
+
+/// Shared state for all SSE subscribers and the single Spotify poll loop.
+pub struct StateHub {
+    published: RwLock<PlaybackObservation>,
+    documents: RwLock<HashMap<RenderParams, Arc<RenderDoc>>>,
+    registered: RwLock<HashSet<RenderParams>>,
+    render_cache: Mutex<RenderCache>,
+    operation_guard: Mutex<()>,
+    changes: broadcast::Sender<u64>,
+    generation: AtomicU64,
+    http: reqwest::Client,
+}
+
+#[derive(Default)]
+struct RenderCache {
+    track_id: Option<String>,
+    source_bytes: Option<Vec<u8>>,
+    palette: Option<[String; 2]>,
+    art: HashMap<RenderParams, Art>,
+    stats: CacheStats,
+}
+
+impl StateHub {
+    pub fn new() -> Self {
+        Self::with_http(reqwest::Client::new())
+    }
+
+    pub fn with_http(http: reqwest::Client) -> Self {
+        let idle = PlaybackObservation::idle(Utc::now());
+        let params = RenderParams::default();
+        let document = Arc::new(document_from_observation(&idle, None, default_palette()));
+        let (changes, _) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            published: RwLock::new(idle),
+            documents: RwLock::new(HashMap::from([(params, document)])),
+            registered: RwLock::new(HashSet::from([params])),
+            render_cache: Mutex::new(RenderCache::default()),
+            operation_guard: Mutex::new(()),
+            changes,
+            generation: AtomicU64::new(0),
+            http,
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    pub async fn current_document(&self, params: RenderParams) -> Result<Arc<RenderDoc>, AppError> {
+        {
+            let mut registered = self.registered.write().await;
+            if !registered.contains(&params) && registered.len() >= MAX_RENDER_VARIANTS {
+                registered.clear();
+            }
+            registered.insert(params);
+        }
+        if let Some(document) = self.documents.read().await.get(&params).cloned() {
+            return Ok(document);
+        }
+
+        let _guard = self.operation_guard.lock().await;
+        if let Some(document) = self.documents.read().await.get(&params).cloned() {
+            return Ok(document);
+        }
+        let observation = self.published.read().await.clone();
+        let document = Arc::new(self.build_document(&observation, params).await?);
+        let mut documents = self.documents.write().await;
+        if !documents.contains_key(&params) && documents.len() >= MAX_RENDER_VARIANTS {
+            documents.clear();
+        }
+        documents.insert(params, document.clone());
+        Ok(document)
+    }
+
+    pub async fn publish_if_meaningful(
+        &self,
+        observation: PlaybackObservation,
+    ) -> Result<bool, AppError> {
+        self.publish(observation, false).await
+    }
+
+    /// Hook for voice commands, which are meaningful even without a Spotify transition.
+    pub async fn force_publish(&self, observation: PlaybackObservation) -> Result<bool, AppError> {
+        self.publish(observation, true).await
+    }
+
+    pub async fn published_observation(&self) -> PlaybackObservation {
+        self.published.read().await.clone()
+    }
+
+    pub async fn cache_stats(&self) -> CacheStats {
+        self.render_cache.lock().await.stats
+    }
+
+    async fn publish(
+        &self,
+        observation: PlaybackObservation,
+        force: bool,
+    ) -> Result<bool, AppError> {
+        let _guard = self.operation_guard.lock().await;
+        let previous = self.published.read().await.clone();
+        if !force && !is_meaningful_change(&previous, &observation) {
+            return Ok(false);
+        }
+
+        if previous.track_id != observation.track_id {
+            self.render_cache
+                .lock()
+                .await
+                .reset(observation.track_id.clone());
+        }
+        let params: Vec<_> = self.registered.read().await.iter().copied().collect();
+        let mut documents = HashMap::with_capacity(params.len());
+        for params in params {
+            let document = Arc::new(self.build_document(&observation, params).await?);
+            documents.insert(params, document);
+        }
+
+        *self.published.write().await = observation;
+        *self.documents.write().await = documents;
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let _send_result = self.changes.send(generation);
+        Ok(true)
+    }
+
+    async fn build_document(
+        &self,
+        observation: &PlaybackObservation,
+        params: RenderParams,
+    ) -> Result<RenderDoc, AppError> {
+        let Some(track_id) = observation.track_id.as_deref() else {
+            return Ok(document_from_observation(
+                observation,
+                None,
+                default_palette(),
+            ));
+        };
+        let Some(art_url) = observation.art_url.as_deref() else {
+            return Ok(document_from_observation(
+                observation,
+                None,
+                default_palette(),
+            ));
+        };
+
+        let mut cache = self.render_cache.lock().await;
+        if cache.track_id.as_deref() != Some(track_id) {
+            cache.reset(Some(track_id.to_string()));
+        }
+        if let Some(art) = cache.art.get(&params).cloned() {
+            return Ok(document_from_observation(
+                observation,
+                Some(art),
+                cache.palette.clone().unwrap_or_else(default_palette),
+            ));
+        }
+        if cache.source_bytes.is_none() {
+            let bytes = self
+                .http
+                .get(art_url)
+                .send()
+                .await
+                .context("failed to download Spotify artwork")?
+                .error_for_status()
+                .context("Spotify artwork returned an error")?
+                .bytes()
+                .await
+                .context("failed to read Spotify artwork")?
+                .to_vec();
+            cache.source_bytes = Some(bytes);
+            cache.stats.downloads += 1;
+        }
+
+        let source = cache.source_bytes.as_deref().ok_or_else(|| {
+            AppError::Internal(anyhow::anyhow!("art cache lost downloaded source bytes"))
+        })?;
+        let (art, palette) = image::process(source, params.width, params.height, params.dither)
+            .context("failed to render Spotify artwork")?;
+        cache.stats.dithers += 1;
+        if cache.palette.is_none() {
+            cache.palette = Some(palette);
+        }
+        if !cache.art.contains_key(&params) && cache.art.len() >= MAX_RENDER_VARIANTS {
+            cache.art.clear();
+        }
+        cache.art.insert(params, art.clone());
+        Ok(document_from_observation(
+            observation,
+            Some(art),
+            cache.palette.clone().unwrap_or_else(default_palette),
+        ))
+    }
+}
+
+impl Default for StateHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RenderCache {
+    fn reset(&mut self, track_id: Option<String>) {
+        self.track_id = track_id;
+        self.source_bytes = None;
+        self.palette = None;
+        self.art.clear();
     }
 }
 
@@ -89,8 +319,47 @@ fn parse_dimension(value: Option<&String>, name: &str, default: u32) -> Result<u
     Ok(parsed)
 }
 
+fn document_from_observation(
+    observation: &PlaybackObservation,
+    art: Option<Art>,
+    palette: [String; 2],
+) -> RenderDoc {
+    let state = match (&observation.track_id, observation.is_playing) {
+        (None, _) => PlaybackState::Idle,
+        (Some(_), true) => PlaybackState::Playing,
+        (Some(_), false) => PlaybackState::Paused,
+    };
+    RenderDoc {
+        version: RENDER_DOCUMENT_VERSION,
+        state,
+        server_ts: Some(observation.observed_at),
+        track_id: observation.track_id.clone(),
+        track: observation.track.clone(),
+        artist: observation.artist.clone(),
+        album: observation.album.clone(),
+        art,
+        art_url: observation.art_url.clone(),
+        palette: palette.into(),
+        progress_ms: observation.progress_ms,
+        duration_ms: observation.duration_ms,
+        voice_log: Vec::new(),
+    }
+}
+
+fn default_palette() -> [String; 2] {
+    DEFAULT_PALETTE.map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::Cursor,
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    };
+
+    use ::image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use axum::{Router, body::Body, response::IntoResponse, routing::get};
+    use base64::{Engine as _, engine::general_purpose};
     use chrono::Duration;
 
     use super::*;
@@ -114,7 +383,6 @@ mod tests {
                 dither: DitherMode::Atkinson,
             }
         );
-
         for invalid in [
             HashMap::from([("w".to_string(), "15".to_string())]),
             HashMap::from([("h".to_string(), "1025".to_string())]),
@@ -128,22 +396,127 @@ mod tests {
     #[test]
     fn meaningful_change_detects_track_playback_and_seek_only() {
         let start = Utc::now();
-        let published = observation(start, "track-a", true, 10_000);
-
-        let steady = observation(start + Duration::seconds(2), "track-a", true, 12_000);
+        let published = observation(start, "track-a", true, 10_000, None);
+        let steady = observation(start + Duration::seconds(2), "track-a", true, 12_000, None);
         assert!(!is_meaningful_change(&published, &steady));
-
-        let boundary = observation(start + Duration::seconds(2), "track-a", true, 14_000);
+        let boundary = observation(start + Duration::seconds(2), "track-a", true, 14_000, None);
         assert!(!is_meaningful_change(&published, &boundary));
-
-        let seek = observation(start + Duration::seconds(2), "track-a", true, 14_001);
+        let seek = observation(start + Duration::seconds(2), "track-a", true, 14_001, None);
         assert!(is_meaningful_change(&published, &seek));
-
-        let paused = observation(start + Duration::seconds(2), "track-a", false, 12_000);
+        let paused = observation(start + Duration::seconds(2), "track-a", false, 12_000, None);
         assert!(is_meaningful_change(&published, &paused));
-
-        let changed = observation(start + Duration::seconds(2), "track-b", true, 12_000);
+        let changed = observation(start + Duration::seconds(2), "track-b", true, 12_000, None);
         assert!(is_meaningful_change(&published, &changed));
+    }
+
+    #[tokio::test]
+    async fn document_preserves_poll_timestamp_and_progress() {
+        let hub = StateHub::new();
+        let at = Utc::now();
+        let observation = observation(at, "track", true, 12_345, None);
+        hub.force_publish(observation).await.unwrap();
+        let document = hub.current_document(RenderParams::default()).await.unwrap();
+        assert_eq!(document.server_ts, Some(at));
+        assert_eq!(document.progress_ms, 12_345);
+    }
+
+    #[tokio::test]
+    async fn steady_progress_is_silent_but_track_and_seek_publish_once() {
+        let hub = StateHub::new();
+        let mut receiver = hub.subscribe();
+        let start = Utc::now();
+        assert!(
+            hub.publish_if_meaningful(observation(start, "track", true, 0, None))
+                .await
+                .unwrap()
+        );
+        receiver.recv().await.unwrap();
+
+        assert!(
+            !hub.publish_if_meaningful(observation(
+                start + Duration::seconds(2),
+                "track",
+                true,
+                2_000,
+                None,
+            ))
+            .await
+            .unwrap()
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        assert!(
+            hub.publish_if_meaningful(observation(
+                start + Duration::seconds(2),
+                "track",
+                true,
+                4_001,
+                None,
+            ))
+            .await
+            .unwrap()
+        );
+        receiver.recv().await.unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn render_cache_deduplicates_same_params_and_sizes_distinct_params() {
+        let (art_url, downloads) = spawn_art_server().await;
+        let hub = StateHub::new();
+        hub.force_publish(observation(Utc::now(), "track", true, 0, Some(art_url)))
+            .await
+            .unwrap();
+        let defaults = RenderParams::default();
+        let first = hub.current_document(defaults).await.unwrap();
+        let second = hub.current_document(defaults).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            hub.cache_stats().await,
+            CacheStats {
+                downloads: 1,
+                dithers: 1
+            }
+        );
+
+        let small = RenderParams {
+            width: 16,
+            height: 16,
+            dither: DitherMode::Atkinson,
+        };
+        let document = hub.current_document(small).await.unwrap();
+        let packed = general_purpose::STANDARD
+            .decode(document.art.as_ref().unwrap().bits.as_bytes())
+            .unwrap();
+        assert_eq!(packed.len(), 32);
+        assert_eq!(
+            hub.cache_stats().await,
+            CacheStats {
+                downloads: 1,
+                dithers: 2
+            }
+        );
+        assert_eq!(downloads.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn broadcast_fans_out_to_two_subscribers() {
+        let hub = StateHub::new();
+        let mut first = hub.subscribe();
+        let mut second = hub.subscribe();
+        hub.force_publish(PlaybackObservation::idle(Utc::now()))
+            .await
+            .unwrap();
+        assert_eq!(first.recv().await.unwrap(), second.recv().await.unwrap());
+        let first_doc = hub.current_document(RenderParams::default()).await.unwrap();
+        let second_doc = hub.current_document(RenderParams::default()).await.unwrap();
+        assert!(Arc::ptr_eq(&first_doc, &second_doc));
     }
 
     fn observation(
@@ -151,6 +524,7 @@ mod tests {
         track_id: &str,
         is_playing: bool,
         progress_ms: u64,
+        art_url: Option<String>,
     ) -> PlaybackObservation {
         PlaybackObservation {
             observed_at,
@@ -158,10 +532,40 @@ mod tests {
             track: Some("Track".to_string()),
             artist: Some("Artist".to_string()),
             album: Some("Album".to_string()),
-            art_url: Some("http://example.test/art.png".to_string()),
+            art_url,
             is_playing,
             progress_ms,
             duration_ms: 300_000,
         }
+    }
+
+    async fn spawn_art_server() -> (String, Arc<AtomicUsize>) {
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(RgbImage::from_fn(32, 32, |x, y| {
+            Rgb([(x * 7) as u8, (y * 7) as u8, ((x + y) * 3) as u8])
+        }))
+        .write_to(&mut encoded, ImageFormat::Png)
+        .unwrap();
+        let bytes = Arc::new(encoded.into_inner());
+        let downloads = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/art.png",
+            get({
+                let bytes = bytes.clone();
+                let downloads = downloads.clone();
+                move || {
+                    let bytes = bytes.clone();
+                    let downloads = downloads.clone();
+                    async move {
+                        downloads.fetch_add(1, AtomicOrdering::SeqCst);
+                        Body::from(bytes.as_ref().clone()).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/art.png"), downloads)
     }
 }
