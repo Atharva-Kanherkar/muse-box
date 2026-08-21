@@ -17,7 +17,7 @@ use crate::{
     error::AppError,
     image,
     render::{Art, DitherMode, PlaybackState, RENDER_DOCUMENT_VERSION, RenderDoc},
-    spotify::PlaybackObservation,
+    spotify::{MAX_RATE_LIMIT_BACKOFF, PlaybackObservation},
 };
 
 const MIN_RENDER_DIMENSION: u32 = 16;
@@ -99,7 +99,7 @@ struct RenderCache {
 
 impl StateHub {
     pub fn new() -> Self {
-        Self::with_http(reqwest::Client::new())
+        Self::with_http(crate::spotify::http_client())
     }
 
     pub fn with_http(http: reqwest::Client) -> Self {
@@ -190,6 +190,14 @@ impl StateHub {
                 .await
                 .reset(observation.track_id.clone());
         }
+        // Registrations accumulate as clients connect and are never removed
+        // individually, so with nobody listening drop back to the default
+        // variant instead of re-dithering art for clients that have gone.
+        if self.changes.receiver_count() == 0 {
+            let mut registered = self.registered.write().await;
+            registered.clear();
+            registered.insert(RenderParams::default());
+        }
         let params: Vec<_> = self.registered.read().await.iter().copied().collect();
         let mut documents = HashMap::with_capacity(params.len());
         for params in params {
@@ -235,6 +243,38 @@ impl StateHub {
                 cache.palette.clone().unwrap_or_else(default_palette),
             ));
         }
+        match self.render_art(&mut cache, art_url, params).await {
+            Ok(art) => Ok(document_from_observation(
+                observation,
+                Some(art),
+                cache.palette.clone().unwrap_or_else(default_palette),
+            )),
+            Err(error) => {
+                // Track, artist and play state need no cover. Failing the whole
+                // publish would discard them too, leaving clients on a stale
+                // document until the artwork happened to start working again.
+                tracing::warn!(
+                    %error,
+                    track_id,
+                    art_url,
+                    "failed to render artwork; publishing without art"
+                );
+                Ok(document_from_observation(
+                    observation,
+                    None,
+                    cache.palette.clone().unwrap_or_else(default_palette),
+                ))
+            }
+        }
+    }
+
+    /// Download (once per track) and dither (once per variant) the cover art.
+    async fn render_art(
+        &self,
+        cache: &mut RenderCache,
+        art_url: &str,
+        params: RenderParams,
+    ) -> Result<Art, AppError> {
         if cache.source_bytes.is_none() {
             let bytes = self
                 .http
@@ -265,11 +305,7 @@ impl StateHub {
             cache.art.clear();
         }
         cache.art.insert(params, art.clone());
-        Ok(document_from_observation(
-            observation,
-            Some(art),
-            cache.palette.clone().unwrap_or_else(default_palette),
-        ))
+        Ok(art)
     }
 }
 
@@ -311,7 +347,7 @@ pub async fn run_poll_loop<Fetch, FetchFuture>(
                 NORMAL_POLL_INTERVAL
             }
             Err(crate::spotify::PlaybackFetchError::RateLimited(retry_after)) => {
-                let delay = retry_after.max(MIN_ERROR_BACKOFF);
+                let delay = retry_after.clamp(MIN_ERROR_BACKOFF, MAX_RATE_LIMIT_BACKOFF);
                 tracing::warn!(?delay, "Spotify playback polling rate limited");
                 delay
             }
@@ -627,6 +663,113 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn art_failure_publishes_document_without_art() {
+        let art_url = spawn_failing_art_server(false).await;
+        let hub = Arc::new(StateHub::new());
+        let mut receiver = hub.subscribe();
+        let start = Utc::now();
+
+        let published = hub
+            .publish_if_meaningful(observation(start, "track-a", true, 10_000, Some(art_url)))
+            .await
+            .expect("art failure must not fail the publish");
+        assert!(published);
+        assert!(receiver.try_recv().is_ok(), "the change must be broadcast");
+
+        // Metadata still reaches clients; only the cover is missing.
+        let document = hub
+            .current_document(RenderParams::default())
+            .await
+            .expect("document");
+        assert_eq!(document.track_id.as_deref(), Some("track-a"));
+        assert_eq!(document.track.as_deref(), Some("Track"));
+        assert!(matches!(document.state, PlaybackState::Playing));
+        assert!(document.art.is_none());
+        assert_eq!(
+            hub.published_observation().await.track_id.as_deref(),
+            Some("track-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn art_download_timeout_does_not_hang_publish() {
+        // A peer that accepts and never answers. The injected client mirrors the
+        // production one from spotify::http_client, with a short budget so the
+        // test does not wait out the real timeout.
+        let art_url = spawn_failing_art_server(true).await;
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(150))
+            .connect_timeout(std::time::Duration::from_millis(150))
+            .build()
+            .expect("client");
+        let hub = Arc::new(StateHub::with_http(http));
+        let start = Utc::now();
+
+        let published = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            hub.publish_if_meaningful(observation(start, "track-a", true, 10_000, Some(art_url))),
+        )
+        .await
+        .expect("publish must not hang on a silent peer")
+        .expect("publish");
+        assert!(published);
+        let document = hub
+            .current_document(RenderParams::default())
+            .await
+            .expect("document");
+        assert_eq!(document.track_id.as_deref(), Some("track-a"));
+        assert!(document.art.is_none());
+    }
+
+    #[tokio::test]
+    async fn registered_variants_are_pruned_when_no_subscribers_remain() {
+        let (art_url, _downloads) = spawn_art_server().await;
+        let hub = Arc::new(StateHub::new());
+
+        {
+            let _receiver = hub.subscribe();
+            for dimension in [16, 32] {
+                hub.current_document(RenderParams {
+                    width: dimension,
+                    height: dimension,
+                    dither: DitherMode::Bayer,
+                })
+                .await
+                .expect("document");
+            }
+        }
+        assert_eq!(hub.subscriber_count(), 0);
+
+        hub.publish_if_meaningful(observation(Utc::now(), "track-a", true, 0, Some(art_url)))
+            .await
+            .expect("publish");
+
+        // Only the default variant is rebuilt; the two departed clients no
+        // longer cost a dither on every publish.
+        assert_eq!(hub.cache_stats().await.dithers, 1);
+    }
+
+    async fn spawn_failing_art_server(hang: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        if hang {
+            tokio::spawn(async move {
+                let mut accepted = Vec::new();
+                while let Ok((socket, _)) = listener.accept().await {
+                    accepted.push(socket);
+                }
+            });
+        } else {
+            let app = Router::new().route(
+                "/art.png",
+                get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+            );
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        }
+        format!("http://{address}/art.png")
     }
 
     fn observation(

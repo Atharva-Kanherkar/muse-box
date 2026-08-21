@@ -20,6 +20,16 @@ const SPOTIFY_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const SPOTIFY_API_BASE_URL: &str = "https://api.spotify.com/v1";
 const SPOTIFY_SCOPES: &str = "user-read-playback-state user-modify-playback-state";
 const REFRESH_WINDOW_SECONDS: i64 = 60;
+/// Whole-request budget for every Spotify call. reqwest sets no timeout by
+/// default, and an accepted-but-silent connection would otherwise hang the poll
+/// loop forever: no response, no error, no backoff, and no log line.
+pub(crate) const HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+/// Connect budget, kept well under [`HTTP_TIMEOUT`] so a dead peer is reported
+/// as a connect failure rather than eating the whole request budget.
+pub(crate) const HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+/// Ceiling on an honored `Retry-After`. The header is upstream input, and a
+/// garbled value would otherwise park polling effectively forever.
+pub(crate) const MAX_RATE_LIMIT_BACKOFF: StdDuration = StdDuration::from_secs(300);
 /// How long an unconsumed OAuth state stays valid. Long enough to log in and
 /// approve, short enough that abandoned flows do not accumulate.
 const STATE_TTL_SECONDS: i64 = 600;
@@ -149,6 +159,22 @@ struct SpotifyImage {
     url: String,
 }
 
+/// Build an HTTP client that cannot hang indefinitely.
+///
+/// `build` only fails when the TLS backend cannot be initialized, so the
+/// fallback is unreachable in practice; it exists because a panic here would
+/// take down the process and strict Clippy forbids `unwrap` in production code.
+pub(crate) fn http_client() -> Client {
+    Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .build()
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "falling back to an HTTP client without timeouts");
+            Client::new()
+        })
+}
+
 impl SpotifyClient {
     pub fn new(config: SpotifyConfig) -> Self {
         Self::with_endpoints(config, SpotifyEndpoints::default())
@@ -156,7 +182,7 @@ impl SpotifyClient {
 
     fn with_endpoints(config: SpotifyConfig, endpoints: SpotifyEndpoints) -> Self {
         Self {
-            http: Client::new(),
+            http: http_client(),
             config,
             endpoints,
             pending_states: Arc::new(Mutex::new(HashMap::new())),
@@ -333,7 +359,7 @@ impl SpotifyClient {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
                 .map_or(StdDuration::from_secs(5), StdDuration::from_secs)
-                .max(StdDuration::from_secs(5));
+                .clamp(StdDuration::from_secs(5), MAX_RATE_LIMIT_BACKOFF);
             return Err(PlaybackFetchError::RateLimited(retry_after));
         }
         if status.is_server_error() {
@@ -772,6 +798,40 @@ mod tests {
             client.currently_playing().await,
             Err(PlaybackFetchError::Spotify(AppError::Spotify(_)))
         ));
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_floored_and_capped() {
+        let playback_url = spawn_playback_server(vec![
+            (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "1")]).into_response(),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "999999999")],
+            )
+                .into_response(),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "not-a-number")],
+            )
+                .into_response(),
+        ])
+        .await;
+        let client =
+            SpotifyClient::with_test_api_url(test_config(PathBuf::from("unused")), playback_url);
+        client.authorize_for_test().await;
+
+        // Floored to 5s, capped at the ceiling so a garbled header cannot park
+        // polling forever, and a non-numeric header falls back to the default.
+        for expected in [
+            StdDuration::from_secs(5),
+            MAX_RATE_LIMIT_BACKOFF,
+            StdDuration::from_secs(5),
+        ] {
+            assert!(matches!(
+                client.currently_playing().await,
+                Err(PlaybackFetchError::RateLimited(delay)) if delay == expected
+            ));
+        }
     }
 
     async fn spawn_playback_server(responses: Vec<Response>) -> String {
