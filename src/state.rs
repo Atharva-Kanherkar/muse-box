@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, watch};
 
 use crate::{
     error::AppError,
-    image,
+    idle, image,
     render::{Art, DitherMode, PlaybackState, RENDER_DOCUMENT_VERSION, RenderDoc},
     spotify::{MAX_RATE_LIMIT_BACKOFF, PlaybackObservation},
 };
@@ -30,6 +30,7 @@ const DEFAULT_PALETTE: [&str; 2] = ["#1a1a1a", "#e0e0e0"];
 const NORMAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const MIN_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+const IDLE_THRESHOLD_SECONDS: i64 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RenderParams {
@@ -82,10 +83,19 @@ pub struct StateHub {
     documents: RwLock<HashMap<RenderParams, Arc<RenderDoc>>>,
     registered: RwLock<HashSet<RenderParams>>,
     render_cache: Mutex<RenderCache>,
+    last_accent: RwLock<Option<String>>,
+    idle_frame_at: RwLock<Option<DateTime<Utc>>>,
     operation_guard: Mutex<()>,
+    playback_activity: watch::Sender<PlaybackActivity>,
     changes: broadcast::Sender<u64>,
     generation: AtomicU64,
     http: reqwest::Client,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlaybackActivity {
+    has_track: bool,
+    observed_at: DateTime<Utc>,
 }
 
 #[derive(Default)]
@@ -107,12 +117,19 @@ impl StateHub {
         let params = RenderParams::default();
         let document = Arc::new(document_from_observation(&idle, None, default_palette()));
         let (changes, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (playback_activity, _) = watch::channel(PlaybackActivity {
+            has_track: false,
+            observed_at: idle.observed_at,
+        });
         Self {
             published: RwLock::new(idle),
             documents: RwLock::new(HashMap::from([(params, document)])),
             registered: RwLock::new(HashSet::from([params])),
             render_cache: Mutex::new(RenderCache::default()),
+            last_accent: RwLock::new(None),
+            idle_frame_at: RwLock::new(None),
             operation_guard: Mutex::new(()),
+            playback_activity,
             changes,
             generation: AtomicU64::new(0),
             http,
@@ -173,6 +190,43 @@ impl StateHub {
         self.render_cache.lock().await.stats
     }
 
+    /// Publish a minute-aligned clock if playback is still idle.
+    pub async fn publish_idle_frame(&self, at: DateTime<Utc>) -> Result<bool, AppError> {
+        let _guard = self.operation_guard.lock().await;
+        if self.published.read().await.track_id.is_some() {
+            return Ok(false);
+        }
+        if self.changes.receiver_count() == 0 {
+            let mut registered = self.registered.write().await;
+            registered.clear();
+            registered.insert(RenderParams::default());
+        }
+        let params: Vec<_> = self.registered.read().await.iter().copied().collect();
+        let palette = self.idle_palette().await;
+        let observation = PlaybackObservation::idle(at);
+        let documents = params
+            .into_iter()
+            .map(|params| {
+                let art = idle::render(at, params);
+                (
+                    params,
+                    Arc::new(document_from_observation(
+                        &observation,
+                        Some(art),
+                        palette.clone(),
+                    )),
+                )
+            })
+            .collect();
+
+        *self.published.write().await = observation;
+        *self.idle_frame_at.write().await = Some(at);
+        *self.documents.write().await = documents;
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let _send_result = self.changes.send(generation);
+        Ok(true)
+    }
+
     async fn publish(
         &self,
         observation: PlaybackObservation,
@@ -183,6 +237,8 @@ impl StateHub {
         if !force && !is_meaningful_change(&previous, &observation) {
             return Ok(false);
         }
+
+        *self.idle_frame_at.write().await = None;
 
         if previous.track_id != observation.track_id {
             self.render_cache
@@ -207,6 +263,11 @@ impl StateHub {
 
         *self.published.write().await = observation;
         *self.documents.write().await = documents;
+        let published = self.published.read().await;
+        self.playback_activity.send_replace(PlaybackActivity {
+            has_track: published.track_id.is_some(),
+            observed_at: published.observed_at,
+        });
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let _send_result = self.changes.send(generation);
         Ok(true)
@@ -218,10 +279,15 @@ impl StateHub {
         params: RenderParams,
     ) -> Result<RenderDoc, AppError> {
         let Some(track_id) = observation.track_id.as_deref() else {
+            let art = self
+                .idle_frame_at
+                .read()
+                .await
+                .map(|at| idle::render(at, params));
             return Ok(document_from_observation(
                 observation,
-                None,
-                default_palette(),
+                art,
+                self.idle_palette().await,
             ));
         };
         let Some(art_url) = observation.art_url.as_deref() else {
@@ -301,11 +367,22 @@ impl StateHub {
         if cache.palette.is_none() {
             cache.palette = Some(palette);
         }
+        if let Some(accent) = cache.palette.as_ref().map(|palette| palette[1].clone()) {
+            *self.last_accent.write().await = Some(accent);
+        }
         if !cache.art.contains_key(&params) && cache.art.len() >= MAX_RENDER_VARIANTS {
             cache.art.clear();
         }
         cache.art.insert(params, art.clone());
         Ok(art)
+    }
+
+    async fn idle_palette(&self) -> [String; 2] {
+        let mut palette = default_palette();
+        if let Some(accent) = self.last_accent.read().await.as_ref() {
+            palette[1] = accent.clone();
+        }
+        palette
     }
 }
 
@@ -368,6 +445,107 @@ pub async fn run_poll_loop<Fetch, FetchFuture>(
             }
         }
     }
+}
+
+/// Render idle clocks after 30 seconds without a track, aligned to wall-clock minutes.
+pub async fn run_idle_scheduler(hub: Arc<StateHub>, shutdown: watch::Receiver<bool>) {
+    run_idle_scheduler_with_clock(hub, shutdown, Utc::now).await;
+}
+
+async fn run_idle_scheduler_with_clock<Now>(
+    hub: Arc<StateHub>,
+    mut shutdown: watch::Receiver<bool>,
+    now: Now,
+) where
+    Now: Fn() -> DateTime<Utc>,
+{
+    let mut activity = hub.playback_activity.subscribe();
+    let initial = *activity.borrow();
+    let mut next_tick = (!initial.has_track).then(|| {
+        ceil_to_minute(initial.observed_at + chrono::Duration::seconds(IDLE_THRESHOLD_SECONDS))
+    });
+
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let Some(target) = next_tick else {
+            tokio::select! {
+                changed = activity.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let update = *activity.borrow();
+                    next_tick = (!update.has_track).then(|| {
+                        ceil_to_minute(
+                            update.observed_at + chrono::Duration::seconds(IDLE_THRESHOLD_SECONDS),
+                        )
+                    });
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+            continue;
+        };
+
+        let delay = wall_delay(target, now());
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {
+                let current_minute = floor_to_minute(now());
+                if current_minute < target {
+                    next_tick = Some(target);
+                    continue;
+                }
+                match hub.publish_idle_frame(current_minute).await {
+                    Ok(true) => next_tick = Some(current_minute + chrono::Duration::minutes(1)),
+                    Ok(false) => next_tick = None,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to publish idle frame");
+                        next_tick = Some(current_minute + chrono::Duration::minutes(1));
+                    }
+                }
+            }
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let update = *activity.borrow();
+                next_tick = (!update.has_track).then(|| {
+                    ceil_to_minute(
+                        update.observed_at + chrono::Duration::seconds(IDLE_THRESHOLD_SECONDS),
+                    )
+                });
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn ceil_to_minute(at: DateTime<Utc>) -> DateTime<Utc> {
+    let nanos = i64::from(at.timestamp_subsec_nanos());
+    let without_nanos = at - chrono::Duration::nanoseconds(nanos);
+    let remainder = without_nanos.timestamp().rem_euclid(60);
+    if remainder == 0 && nanos == 0 {
+        without_nanos
+    } else {
+        without_nanos + chrono::Duration::seconds(60 - remainder)
+    }
+}
+
+fn floor_to_minute(at: DateTime<Utc>) -> DateTime<Utc> {
+    at - chrono::Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()))
+        - chrono::Duration::seconds(at.timestamp().rem_euclid(60))
+}
+
+fn wall_delay(target: DateTime<Utc>, now: DateTime<Utc>) -> std::time::Duration {
+    (target - now).to_std().unwrap_or_default()
 }
 
 pub fn is_meaningful_change(
@@ -445,13 +623,13 @@ mod tests {
     use std::{
         collections::VecDeque,
         io::Cursor,
-        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        sync::atomic::{AtomicI64, AtomicUsize, Ordering as AtomicOrdering},
     };
 
     use ::image::{DynamicImage, ImageFormat, Rgb, RgbImage};
     use axum::{Router, body::Body, response::IntoResponse, routing::get};
     use base64::{Engine as _, engine::general_purpose};
-    use chrono::Duration;
+    use chrono::{Duration, TimeZone};
 
     use super::*;
 
@@ -750,6 +928,135 @@ mod tests {
         // Only the default variant is rebuilt; the two departed clients no
         // longer cost a dither on every publish.
         assert_eq!(hub.cache_stats().await.dithers, 1);
+    }
+
+    #[tokio::test]
+    async fn idle_frames_follow_registered_device_params() {
+        let hub = StateHub::new();
+        let _receiver = hub.subscribe();
+        let wide = RenderParams {
+            width: 296,
+            height: 128,
+            dither: DitherMode::Atkinson,
+        };
+        hub.current_document(wide).await.unwrap();
+        let at = Utc.with_ymd_and_hms(2026, 8, 21, 9, 41, 0).unwrap();
+
+        assert!(hub.publish_idle_frame(at).await.unwrap());
+
+        let square = hub.current_document(RenderParams::default()).await.unwrap();
+        let wide_document = hub.current_document(wide).await.unwrap();
+        let square_art = square.art.as_ref().unwrap();
+        let wide_art = wide_document.art.as_ref().unwrap();
+        assert_eq!((square_art.w, square_art.h), (400, 400));
+        assert_eq!(square_art.dither, DitherMode::Bayer);
+        assert_eq!((wide_art.w, wide_art.h), (296, 128));
+        assert_eq!(wide_art.dither, DitherMode::Atkinson);
+    }
+
+    #[tokio::test]
+    async fn idle_palette_keeps_last_rendered_accent() {
+        let (art_url, _downloads) = spawn_art_server().await;
+        let hub = StateHub::new();
+        let at = Utc.with_ymd_and_hms(2026, 8, 21, 9, 41, 0).unwrap();
+        hub.force_publish(observation(at, "track", true, 0, Some(art_url)))
+            .await
+            .unwrap();
+        let track_document = hub.current_document(RenderParams::default()).await.unwrap();
+        let accent = track_document.palette[1].clone();
+
+        hub.force_publish(PlaybackObservation::idle(at + Duration::seconds(1)))
+            .await
+            .unwrap();
+        hub.publish_idle_frame(at + Duration::minutes(1))
+            .await
+            .unwrap();
+        let idle_document = hub.current_document(RenderParams::default()).await.unwrap();
+
+        assert_eq!(idle_document.palette, ["#1a1a1a", accent.as_str()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_scheduler_emits_once_per_minute_then_stops_on_play() {
+        let hub = Arc::new(StateHub::new());
+        let start = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 20).unwrap();
+        hub.force_publish(PlaybackObservation::idle(start))
+            .await
+            .unwrap();
+        let mut receiver = hub.subscribe();
+        let wall_seconds = Arc::new(AtomicI64::new(start.timestamp()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let scheduler = tokio::spawn(run_idle_scheduler_with_clock(hub.clone(), shutdown_rx, {
+            let wall_seconds = wall_seconds.clone();
+            move || {
+                Utc.timestamp_opt(wall_seconds.load(AtomicOrdering::SeqCst), 0)
+                    .unwrap()
+            }
+        }));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(std::time::Duration::from_secs(39)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        wall_seconds.store(
+            (start + Duration::seconds(40)).timestamp(),
+            AtomicOrdering::SeqCst,
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        receiver.try_recv().expect("first minute boundary");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            hub.current_document(RenderParams::default())
+                .await
+                .unwrap()
+                .server_ts,
+            Some(start + Duration::seconds(40))
+        );
+
+        wall_seconds.store(
+            (start + Duration::seconds(100)).timestamp(),
+            AtomicOrdering::SeqCst,
+        );
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        receiver.try_recv().expect("second minute boundary");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        hub.force_publish(observation(
+            start + Duration::seconds(101),
+            "track",
+            true,
+            0,
+            None,
+        ))
+        .await
+        .unwrap();
+        receiver.try_recv().expect("play event");
+        tokio::task::yield_now().await;
+        wall_seconds.store(
+            (start + Duration::seconds(160)).timestamp(),
+            AtomicOrdering::SeqCst,
+        );
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        shutdown_tx.send(true).unwrap();
+        scheduler.await.unwrap();
     }
 
     async fn spawn_failing_art_server(hang: bool) -> String {
