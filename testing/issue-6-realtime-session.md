@@ -8,7 +8,8 @@
 - Supported tool calls are `play`, `pause`, `next`, `previous`, `search_and_play { query }`, `queue_search { query }`, `set_volume { percent }`, and `now_playing`. Unknown names, malformed arguments, empty search queries, and volume outside `0..=100` return `AppError::Voice`.
 - A completed input-transcription event is correlated with the command and returned with the parsed tool call. Supported final function-call event shapes are handled without relying on event ordering.
 - A socket drop fails only the in-flight command and discards that session; the next command reconnects and can succeed.
-- Ten seconds after `response.create` without a completed tool/text response, the command returns `AppError::Voice("model timeout")`, discards the session, and leaves the manager reconnectable.
+- The ten-second deadline covers the whole exchange — connect, the audio sends, and the wait for a reply — not just the wait. A peer that accepts a connection and never upgrades or never answers returns `AppError::Voice("model timeout")` rather than blocking, since the exchange holds the session lock and would otherwise wedge every later command. The command discards the session and leaves the manager reconnectable.
+- Every failure path, connect included, logs the reset once and clears the session. Connect errors carry their underlying cause so a rejected credential is distinguishable from an unreachable endpoint, and no diagnostic surface — error `Display`, error `Debug`, or manager `Debug` — ever contains the API key.
 
 ## Unit Tests
 
@@ -21,8 +22,10 @@
 
 - `realtime::tests::mock_server_reuses_connection_and_returns_transcript_and_tool` — two sequential commands use one mock WebSocket, send append/commit/response events in order, include playback context, and return correlated transcripts and calls.
 - `realtime::tests::dropped_socket_fails_current_command_and_next_reconnects` — the first mock connection drops mid-command; a second connection accepts the next command successfully.
-- `realtime::tests::timeout_resets_session_and_manager_reconnects` — paused Tokio time reaches the hard deadline, returns the exact timeout error by 10.5 seconds, and a following command opens a usable connection.
-- `realtime::tests::diagnostics_never_contain_api_key` — captured tracing and debug output from a failed mock interaction omit the configured secret.
+- `realtime::tests::timeout_resets_session_and_manager_reconnects` — a shortened real deadline reaches a stalled mock, returns the exact timeout error, discards the session, and a following command opens a usable connection. Deliberately not `start_paused`: auto-advancing virtual time beside real socket I/O fires the deadline while the runtime is merely waiting on the network.
+- `realtime::tests::stalled_connect_times_out_instead_of_hanging` — a peer that accepts TCP without upgrading yields the timeout error instead of blocking, guarded so a regression fails fast rather than hanging.
+- `realtime::tests::diagnostics_never_contain_api_key` — a failed mock interaction leaves the secret out of the error `Display`, the error `Debug`, and the manager `Debug`, and resets the session. Asserted on values rather than captured log text, because tracing's per-callsite interest cache is process-global and a sibling test touching the same callsite silences the capture under test parallelism.
+- `realtime::tests::connect_failure_is_reported_without_leaking_the_key` — an unreachable endpoint reports the underlying cause, omits the secret, and leaves no session behind.
 
 ## Smoke Tests
 
