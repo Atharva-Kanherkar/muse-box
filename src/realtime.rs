@@ -510,7 +510,24 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(
 
 #[cfg(test)]
 mod tests {
-    use std::f64::consts::TAU;
+    use std::{
+        f64::consts::TAU,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use base64::{Engine as _, engine::general_purpose};
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::{
+        WebSocketStream, accept_hdr_async,
+        tungstenite::{
+            Message,
+            handshake::server::{ErrorResponse, Request, Response},
+        },
+    };
 
     use super::*;
 
@@ -581,6 +598,317 @@ mod tests {
                 parse_realtime_tool_call(name, args).is_err(),
                 "{name} accepted {args}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_server_reuses_connection_and_returns_transcript_and_tool() {
+        let (listener, endpoint) = mock_listener().await;
+        let connections = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let connections = connections.clone();
+            async move {
+                let mut socket = accept_mock(&listener, &connections).await;
+                let update = receive_json(&mut socket).await;
+                assert_session_update(&update);
+
+                let first_response = receive_command(&mut socket).await;
+                assert!(
+                    first_response
+                        .pointer("/response/instructions")
+                        .and_then(Value::as_str)
+                        .unwrap()
+                        .contains("Massive Attack")
+                );
+                send_server_json(
+                    &mut socket,
+                    json!({
+                        "type": "response.function_call_arguments.done",
+                        "name": "pause",
+                        "arguments": "{}"
+                    }),
+                )
+                .await;
+                send_server_json(
+                    &mut socket,
+                    json!({
+                        "type": "conversation.item.input_audio_transcription.completed",
+                        "item_id": "input-1",
+                        "transcript": "pause this"
+                    }),
+                )
+                .await;
+                send_server_json(
+                    &mut socket,
+                    json!({
+                        "type": "input_audio_buffer.committed",
+                        "item_id": "input-1"
+                    }),
+                )
+                .await;
+
+                let second_response = receive_command(&mut socket).await;
+                assert!(
+                    second_response
+                        .pointer("/response/instructions")
+                        .and_then(Value::as_str)
+                        .unwrap()
+                        .contains("paused")
+                );
+                send_server_json(
+                    &mut socket,
+                    json!({
+                        "type": "input_audio_buffer.committed",
+                        "item_id": "input-2"
+                    }),
+                )
+                .await;
+                send_server_json(
+                    &mut socket,
+                    json!({
+                        "type": "conversation.item.input_audio_transcription.completed",
+                        "item_id": "input-2",
+                        "transcript": "play halo"
+                    }),
+                )
+                .await;
+                send_server_json(
+                    &mut socket,
+                    json!({
+                        "type": "response.done",
+                        "response": {
+                            "output": [{
+                                "type": "function_call",
+                                "name": "search_and_play",
+                                "arguments": "{\"query\":\"Halo Beyoncé\"}"
+                            }]
+                        }
+                    }),
+                )
+                .await;
+            }
+        });
+        let manager = RealtimeManager::with_endpoint("test-key", "gpt-realtime-mini", endpoint);
+        let audio = vec![123_i16; 9_600];
+
+        let first = manager
+            .command(
+                &audio,
+                48_000,
+                context("Teardrop", "Massive Attack", PlaybackState::Playing),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            VoiceIntent {
+                transcript: "pause this".to_string(),
+                tool: ToolCall::Pause
+            }
+        );
+        let second = manager
+            .command(
+                &audio,
+                48_000,
+                context("Teardrop", "Massive Attack", PlaybackState::Paused),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            VoiceIntent {
+                transcript: "play halo".to_string(),
+                tool: ToolCall::SearchAndPlay {
+                    query: "Halo Beyoncé".to_string()
+                }
+            }
+        );
+        server.await.unwrap();
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_socket_fails_current_command_and_next_reconnects() {
+        let (listener, endpoint) = mock_listener().await;
+        let connections = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let connections = connections.clone();
+            async move {
+                let mut first = accept_mock(&listener, &connections).await;
+                receive_json(&mut first).await;
+                receive_command(&mut first).await;
+                first.close(None).await.unwrap();
+
+                let mut second = accept_mock(&listener, &connections).await;
+                assert_session_update(&receive_json(&mut second).await);
+                receive_command(&mut second).await;
+                send_success(&mut second, "input-2", "resume", "play", "{}").await;
+            }
+        });
+        let manager = RealtimeManager::with_endpoint("test-key", "gpt-realtime-mini", endpoint);
+        let audio = vec![123_i16; 1_600];
+        let first = manager
+            .command(
+                &audio,
+                16_000,
+                context("Song", "Artist", PlaybackState::Paused),
+            )
+            .await;
+        assert!(
+            matches!(first, Err(AppError::Voice(message)) if message == "realtime connection dropped")
+        );
+
+        let second = manager
+            .command(
+                &audio,
+                16_000,
+                context("Song", "Artist", PlaybackState::Paused),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.tool, ToolCall::Play);
+        assert_eq!(second.transcript, "resume");
+        server.await.unwrap();
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    async fn mock_listener() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}/v1/realtime", listener.local_addr().unwrap());
+        (listener, endpoint)
+    }
+
+    async fn accept_mock(
+        listener: &TcpListener,
+        connections: &AtomicUsize,
+    ) -> WebSocketStream<TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        connections.fetch_add(1, Ordering::SeqCst);
+        accept_hdr_async(stream, inspect_handshake).await.unwrap()
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn inspect_handshake(request: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-key")
+        );
+        assert_eq!(request.uri().path(), "/v1/realtime");
+        assert_eq!(request.uri().query(), Some("model=gpt-realtime-mini"));
+        Ok(response)
+    }
+
+    async fn receive_json(socket: &mut WebSocketStream<TcpStream>) -> Value {
+        let message = socket.next().await.unwrap().unwrap();
+        let Message::Text(text) = message else {
+            panic!("expected a text event");
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    async fn receive_command(socket: &mut WebSocketStream<TcpStream>) -> Value {
+        let mut event_types = Vec::new();
+        loop {
+            let event = receive_json(socket).await;
+            let event_type = event.get("type").and_then(Value::as_str).unwrap();
+            event_types.push(event_type.to_string());
+            if event_type == "input_audio_buffer.append" {
+                let bytes = general_purpose::STANDARD
+                    .decode(event.get("audio").and_then(Value::as_str).unwrap())
+                    .unwrap();
+                assert!(!bytes.is_empty());
+                assert_eq!(bytes.len() % 2, 0);
+                assert!(bytes.len() <= AUDIO_CHUNK_SAMPLES * 2);
+            }
+            if event_type == "response.create" {
+                assert!(event_types.len() >= 3);
+                assert_eq!(
+                    event_types[event_types.len() - 2],
+                    "input_audio_buffer.commit"
+                );
+                assert!(
+                    event_types[..event_types.len() - 2]
+                        .iter()
+                        .all(|kind| kind == "input_audio_buffer.append")
+                );
+                return event;
+            }
+        }
+    }
+
+    async fn send_server_json(socket: &mut WebSocketStream<TcpStream>, event: Value) {
+        socket
+            .send(Message::Text(serde_json::to_string(&event).unwrap().into()))
+            .await
+            .unwrap();
+    }
+
+    async fn send_success(
+        socket: &mut WebSocketStream<TcpStream>,
+        item_id: &str,
+        transcript: &str,
+        name: &str,
+        arguments: &str,
+    ) {
+        send_server_json(
+            socket,
+            json!({
+                "type": "input_audio_buffer.committed",
+                "item_id": item_id
+            }),
+        )
+        .await;
+        send_server_json(
+            socket,
+            json!({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": item_id,
+                "transcript": transcript
+            }),
+        )
+        .await;
+        send_server_json(
+            socket,
+            json!({
+                "type": "response.function_call_arguments.done",
+                "name": name,
+                "arguments": arguments
+            }),
+        )
+        .await;
+    }
+
+    fn assert_session_update(update: &Value) {
+        assert_eq!(
+            update.get("type").and_then(Value::as_str),
+            Some("session.update")
+        );
+        assert_eq!(
+            update.pointer("/session/output_modalities"),
+            Some(&json!(["text"]))
+        );
+        assert_eq!(
+            update.pointer("/session/audio/input/format/rate"),
+            Some(&json!(24_000))
+        );
+        assert_eq!(
+            update.pointer("/session/audio/input/turn_detection"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            update.pointer("/session/tools"),
+            Some(&spotify_tool_schema())
+        );
+    }
+
+    fn context(track: &str, artist: &str, state: PlaybackState) -> PlaybackContext {
+        PlaybackContext {
+            track: Some(track.to_string()),
+            artist: Some(artist.to_string()),
+            state,
         }
     }
 }
