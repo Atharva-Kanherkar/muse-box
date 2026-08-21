@@ -1,13 +1,15 @@
 # muse-box
 
-A voice-controlled Spotify controller with a dithered, terminal-aesthetic display and reactive LEDs.
+A voice-controlled Spotify decoration: a dithered, terminal-aesthetic display with reactive LEDs. It sits on a shelf, looks beautiful whether or not music is playing, and does what you tell it.
+
+This is a personal project for one person, one Spotify account, one box. It is deliberately not designed to scale, multi-tenant, or monetize.
 
 The project is intentionally built in two phases:
 
-1. **Web app first** — a browser-based client that exercises the same backend the hardware will use. Fast iteration, easy debugging, no serial cables.
-2. **Hardware second** — an ESP32-S3 with a 1-bit-ish e-paper/IPS panel and an I2S microphone. It consumes the exact same backend endpoints as the web app.
+1. **Web app first**: a browser-based client that exercises the same backend the hardware will use. Fast iteration, easy debugging, no serial cables.
+2. **Hardware second**: an ESP32-S3 with a 1-bit-ish e-paper/IPS panel and an I2S microphone. It consumes the exact same backend endpoints as the web app.
 
-Both clients are dumb renderers. The backend owns Spotify OAuth, voice intent parsing, the LLM tool chain, palette extraction, dithering, and beat detection.
+Both clients are dumb renderers. The backend owns Spotify OAuth, the GPT Realtime voice session, tool execution, palette extraction, dithering, and the idle-mode art.
 
 ---
 
@@ -19,14 +21,20 @@ Do not build Spotify logic, image decoding, or JPEG resize into the client. The 
 {
   "version": 1,
   "state": "playing",
+  "server_ts": "2026-08-21T12:00:00.000Z",
+  "track_id": "5FVd6KXrgO9B3JPmC8OPst",
   "track": "Do I Wanna Know?",
   "artist": "Arctic Monkeys",
   "album": "AM",
-  "art_1bit": "<base64, 1-bit or half-block dithered, 400x400>",
-  "palette": ["#e8663a", "#2a3350"],
+  "art": {
+    "w": 400,
+    "h": 400,
+    "dither": "bayer",
+    "bits": "<base64, packed 1-bit, row-major, MSB first>"
+  },
+  "palette": ["#e8663a", "#e8a63a"],
   "progress_ms": 84000,
   "duration_ms": 272000,
-  "fft_bands": [0.0, 0.12, 0.34, 0.21, 0.08, 0.05, 0.02, 0.01],
   "voice_log": [
     {
       "transcript": "play something mellow",
@@ -37,37 +45,75 @@ Do not build Spotify logic, image decoding, or JPEG resize into the client. The 
 }
 ```
 
-Any client — React canvas, ESP32 LVGL, a CLI — only needs to satisfy two contracts:
+Any client (React canvas, ESP32 LVGL, a CLI) only needs to satisfy two contracts:
 
-- `POST /voice` — upload audio, receive the updated render document.
-- `GET /state` — SSE stream of render documents, one per meaningful change.
+- `POST /voice`: upload audio, receive the updated render document.
+- `GET /state`: SSE stream of render documents, one per meaningful change.
 
 Everything else is backend implementation detail.
 
 ---
 
-## Repository layout (planned)
+## Making it feel alive
+
+This box is a decoration first. Three rules keep it from feeling like a status dashboard:
+
+### 1. Progress is interpolated, never streamed
+
+The backend does **not** push a document every second while a track plays. It pushes one document per meaningful change (track change, play/pause, seek, voice command) and stamps it with `server_ts` and `progress_ms`. Clients animate locally:
+
+```
+rendered_progress = progress_ms + (now - server_ts)   // while state == "playing"
+```
+
+That is how a 1-per-track update becomes a 60 fps progress bar. The backend still polls Spotify every 1-3 seconds internally; if the observed position drifts more than ~2 s from the expected position (someone seeked from their phone), it broadcasts a fresh document. Nobody re-blits a 20 KB album cover because a second elapsed.
+
+### 2. Beat reactivity is device-local
+
+There is no `fft_bands` field. Beat data over a 1 Hz SSE stream can never look alive (LEDs need 30-60 Hz), and Spotify [deprecated the audio-features and audio-analysis endpoints in November 2024](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api), so there is no server-side beat grid to lean on anyway.
+
+Instead, the device already has ears:
+
+- **ESP32**: the I2S microphone hears the room. Run a small FFT on-device at full frame rate and drive the LED strip from local audio energy.
+- **Web client**: same idea with a WebAudio `AnalyserNode`.
+
+The server supplies the *color* (`palette`), the device supplies the *motion* (its own mic). This is the classic music-visualizer split and it is the only version that actually pulses on the beat.
+
+### 3. Idle mode is a first-class feature
+
+A shelf decoration is idle most of the day, so `state: "idle"` renders something worth looking at, not a blank panel. The backend renders idle frames server-side (same fat-backend rule) and pushes one document per minute:
+
+- **v1**: a large dithered clock over a slowly evolving Bayer pattern field.
+- Later modes: the last album cover slowly decaying/eroding, generative dither drift.
+
+One 20 KB frame per minute costs nothing and keeps every client dumb.
+
+---
+
+## Repository layout
+
+The backend crate lives at the repo root. The web client is a subdirectory.
 
 ```
 muse-box/
-├── README.md          # this file
+├── README.md
 ├── AGENTS.md          # agent-specific conventions
 ├── .env.example       # required environment variables
-├── backend/           # Rust Axum server
-│   ├── src/
-│   │   ├── main.rs
-│   │   ├── config.rs
-│   │   ├── state.rs
-│   │   ├── error.rs
-│   │   ├── render.rs       # render document types
-│   │   ├── image.rs        # palette + dither pipeline
-│   │   ├── spotify.rs      # OAuth + API client
-│   │   ├── voice.rs        # STT + LLM intent handling
-│   │   └── routes/
-│   │       ├── mod.rs
-│   │       ├── state.rs    # SSE /state
-│   │       └── voice.rs    # POST /voice
-│   └── Cargo.toml
+├── Cargo.toml         # Rust Axum backend (root crate)
+├── src/
+│   ├── main.rs
+│   ├── config.rs
+│   ├── state.rs
+│   ├── error.rs
+│   ├── render.rs      # render document types
+│   ├── image.rs       # palette + dither pipeline
+│   ├── spotify.rs     # OAuth + API client
+│   ├── realtime.rs    # GPT Realtime session (voice)
+│   ├── idle.rs        # idle-mode frame generator
+│   └── routes/
+│       ├── mod.rs
+│       ├── state.rs   # SSE /state
+│       └── voice.rs   # POST /voice
 └── web/               # React/Vite client (phase 1)
     ├── src/
     ├── index.html
@@ -78,17 +124,25 @@ muse-box/
 
 ## Public API
 
-### 1. `GET /state` — Server-Sent Events
+### 1. `GET /state`: Server-Sent Events
 
-One long-lived connection. The backend pushes a `RenderDoc` every time playback state changes, once per second while progress advances, or immediately after a successful voice command.
+One long-lived connection. On connect (and reconnect), the backend **immediately sends the current document**, then pushes a new one on every meaningful change: track change, play/pause, seek detection, voice command, idle-frame tick.
 
-**Request headers**
+**Request**
 
 ```http
-GET /state HTTP/1.1
+GET /state?w=400&h=400&dither=bayer HTTP/1.1
 Authorization: Bearer <DEVICE_API_TOKEN>
 Accept: text/event-stream
 ```
+
+**Per-device render parameters** (query string):
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `w` | `400` | Art width in pixels. The panel is not chosen yet; the device asks for its own size instead of the contract baking one in. |
+| `h` | `400` | Art height in pixels. |
+| `dither` | `bayer` | `bayer` or `atkinson`. |
 
 **Event format**
 
@@ -101,82 +155,44 @@ data: {"version":1,"state":"playing",...}
 
 Clients must:
 
-- Reconnect automatically if the connection drops.
-- Use `Last-Event-ID` if available, or simply call `GET /state` fresh.
+- Reconnect automatically if the connection drops. The fresh document on connect is the whole recovery story; there is no replay and no `Last-Event-ID` handling.
 - Ignore unknown fields (forwards compatibility).
-- Respect `version` and refuse to render documents with a major version they do not understand.
+- Refuse to render documents with a major `version` they do not understand.
 
 Why SSE and not polling? On an ESP32, one TLS handshake for the entire uptime is the difference between usable and painful. In the browser, `EventSource` is free.
 
 ---
 
-### 2. `POST /voice` — voice command
+### 2. `POST /voice`: voice command
 
-Upload a raw audio blob. The backend transcribes it, routes it through an LLM with tool calling, executes the resulting Spotify action, and returns the new render document.
+Upload an audio blob. The backend feeds it into a persistent **GPT Realtime** session (audio in, tool calls out; no separate STT step), executes the resulting Spotify action, and returns the new render document.
 
 **Request**
 
 ```http
-POST /voice HTTP/1.1
+POST /voice?rate=16000&bits=16&ch=1 HTTP/1.1
 Authorization: Bearer <DEVICE_API_TOKEN>
-Content-Type: audio/webm
+Content-Type: audio/pcm
 
 <binary audio bytes>
 ```
 
-Accepted content types: `audio/webm`, `audio/wav`, `audio/ogg`, `audio/mpeg`, `audio/raw`.
+Accepted content types, deliberately short:
 
-The device must include the audio format. The backend does not sniff.
+| Content-Type | Notes |
+|--------------|-------|
+| `audio/wav` | Self-describing header. Web client default. |
+| `audio/pcm` | Raw samples. **Requires** `rate`, `bits`, `ch` query params (raw PCM carries no format info; the backend does not sniff). ESP32 default. |
 
-**Response — success (200 OK)**
+`webm`/`ogg`/`opus` are intentionally not accepted: decoding them server-side pulls in an ffmpeg-class dependency for zero benefit. The web client records WAV (or raw PCM via an AudioWorklet); the ESP32 sends raw PCM straight off the I2S bus. The backend resamples to 24 kHz mono PCM16 for the Realtime API.
 
-```json
-{
-  "version": 1,
-  "state": "playing",
-  "track": "Do I Wanna Know?",
-  "artist": "Arctic Monkeys",
-  "album": "AM",
-  "art_1bit": "...base64...",
-  "palette": ["#e8663a", "#2a3350"],
-  "progress_ms": 84000,
-  "duration_ms": 272000,
-  "fft_bands": [],
-  "voice_log": [
-    {
-      "transcript": "play arctic monkeys",
-      "action": "spotify:play:track:5FVd6KXrgO9B3JPmC8OPst",
-      "timestamp": "2026-08-21T12:00:00Z"
-    }
-  ]
-}
-```
+**Processing states**: the moment the upload lands, the backend broadcasts `state: "thinking"` over SSE so the box visibly reacts before the 2-5 s of model + Spotify round trips finish. (`"listening"` is reserved for the future streaming-voice mode; in blob mode the client knows it is recording.)
 
-**Response — command understood but not actionable (200 OK)**
+**Response, success (200 OK)**: the full updated render document, same shape as SSE. The `voice_log` gains an entry with the Realtime transcript and the executed action.
 
-```json
-{
-  "version": 1,
-  "state": "playing",
-  "track": "Do I Wanna Know?",
-  "artist": "Arctic Monkeys",
-  "album": "AM",
-  "art_1bit": "...base64...",
-  "palette": ["#e8663a", "#2a3350"],
-  "progress_ms": 84000,
-  "duration_ms": 272000,
-  "fft_bands": [],
-  "voice_log": [
-    {
-      "transcript": "what's playing",
-      "action": "query:now_playing",
-      "timestamp": "2026-08-21T12:00:00Z"
-    }
-  ]
-}
-```
+**Response, understood but not actionable (200 OK)**: same document; the `voice_log` entry records the query action (e.g. `query:now_playing`).
 
-**Response — error (4xx/5xx)**
+**Response, error (4xx/5xx)**
 
 ```json
 {
@@ -186,13 +202,45 @@ The device must include the audio format. The backend does not sniff.
 
 ---
 
-### 3. `GET /auth/spotify` — start Spotify OAuth
+### 3. `GET /auth/spotify`: start Spotify OAuth
 
-Browser-only helper. Redirects to Spotify.
+Browser-only helper. Redirects to Spotify. Includes a random `state` parameter, verified on callback (standard CSRF protection, cheap even for a one-user box).
 
-### 4. `GET /auth/spotify/callback` — OAuth callback
+### 4. `GET /auth/spotify/callback`: OAuth callback
 
-Spotify redirects here. The backend exchanges the code for refresh/access tokens and stores them. On first auth it returns a simple HTML page that also prints the `DEVICE_API_TOKEN` for provisioning.
+Spotify redirects here. The backend verifies `state`, exchanges the code for refresh/access tokens, and stores them. On first auth it returns a simple HTML page that also prints the `DEVICE_API_TOKEN` for provisioning.
+
+---
+
+## Voice pipeline: GPT Realtime
+
+One model call does the whole job: audio goes in, a tool call comes out. There is no Whisper step and no second LLM.
+
+```
+Device/browser
+      │
+      ▼
+ POST /voice (audio blob)
+      │ broadcast state:"thinking" over SSE
+      ▼
+┌──────────┐  input_audio_buffer.append   ┌──────────────┐
+│ Backend  │ ───────────────────────────► │ GPT Realtime │
+│          │      + commit + response     │  (WebSocket) │
+│          │ ◄─────────────────────────── │              │
+└────┬─────┘   transcript + tool call     └──────────────┘
+     │
+     │ execute tool ──► Spotify API
+     │ fetch art → palette → dither → RenderDoc
+     ▼
+ 200 OK (RenderDoc)  +  same doc broadcast over SSE
+```
+
+Session details:
+
+- The backend keeps **one lazy, persistent WebSocket** to the Realtime API: opened on the first voice command, reused across commands, reopened on drop. The device never talks to OpenAI.
+- Model comes from `OPENAI_REALTIME_MODEL`. Default is the mini realtime model (roughly a third of the flagship price per audio minute, and a shelf decoration does not need flagship reasoning). Swap to the full model with one env var if command understanding disappoints.
+- Session config: text-only output modality (the box does not talk back, for now), input audio transcription enabled (that transcript is what lands in `voice_log`), server-side turn detection **disabled**. Blob mode commits the buffer manually: `append` → `commit` → `response.create`.
+- Tools exposed to the model: `play`, `pause`, `next`, `previous`, `search_and_play`, `queue_search`, `set_volume`, `now_playing`. Current playback context is injected into the session so "play the acoustic version of this" resolves.
 
 ---
 
@@ -201,18 +249,30 @@ Spotify redirects here. The backend exchanges the code for refresh/access tokens
 | Field | Type | Description |
 |-------|------|-------------|
 | `version` | `u32` | Document version. Bumped on breaking schema changes. |
-| `state` | `"idle" \| "playing" \| "paused"` | Playback state. |
+| `state` | `"idle" \| "playing" \| "paused" \| "thinking" \| "listening"` | Playback/interaction state. `thinking` = a voice command is being processed. `listening` = reserved for streaming voice. |
+| `server_ts` | `string` (RFC 3339) | When this document was built. Clients interpolate progress from it. |
+| `track_id` | `string \| null` | Spotify track ID. Clients may use it to cache decoded art. |
 | `track` | `string \| null` | Track title. |
 | `artist` | `string \| null` | Artist name. |
 | `album` | `string \| null` | Album title. |
-| `art_1bit` | `string \| null` | Base64-encoded dithered album art. Format depends on `version`; v1 is a 1-bit bitmap at 400x400. |
-| `palette` | `string[]` | Dominant/accent colors extracted from the cover. First entry is the primary background; second is accent. |
-| `progress_ms` | `u64` | Current playback position in milliseconds. |
-| `duration_ms` | `u64` | Total track length in milliseconds. |
-| `fft_bands` | `f32[]` | Optional beat-reactivity data (0.0–1.0). Empty when the backend has no mic input or when the device is not the audio source. |
+| `art` | `Art \| null` | Dithered artwork (or idle frame). See below. |
+| `palette` | `string[]` | Exactly two colors extracted from the cover. `palette[0]` = dominant background, `palette[1]` = accent (LED wash + UI highlights). |
+| `progress_ms` | `u64` | Playback position at `server_ts`. |
+| `duration_ms` | `u64` | Total track length. |
 | `voice_log` | `VoiceLogEntry[]` | Last N voice commands. N is backend-defined (default 5). |
 
-### Voice log entry schema
+### Art object
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `w` | `u32` | Width in pixels (matches the device's requested `w`). |
+| `h` | `u32` | Height in pixels. |
+| `dither` | `"bayer" \| "atkinson"` | Algorithm used. |
+| `bits` | `string` | Base64 of packed 1-bit data. **Row-major, MSB-first within each byte, each row padded to a whole byte. `1` = foreground (ink), `0` = background.** Not a PNG; clients unpack it straight into a framebuffer or `ImageData`. |
+
+There is exactly one art encoding in v1. The web client renders the same packed bits the panel does; that is what makes it the reference renderer. (A full-color debug toggle in the web UI is allowed, but it is a debug view, not a mode of the contract.)
+
+### Voice log entry
 
 ```json
 {
@@ -224,54 +284,24 @@ Spotify redirects here. The backend exchanges the code for refresh/access tokens
 
 ---
 
-## Data flow
-
-### Playback update loop (background)
+## Playback update loop (background)
 
 ```
-┌─────────────┐     poll/notify      ┌──────────┐     ┌─────────────────┐
+┌─────────────┐   poll every 1-3 s   ┌──────────┐     ┌──────────────────┐
 │   Spotify   │ ───────────────────► │ Backend  │ ──► │  RenderDoc cache │
 │    API      │                      │          │     │  + broadcast SSE │
-└─────────────┘                      └──────────┘     └─────────────────┘
+└─────────────┘                      └──────────┘     └──────────────────┘
 ```
 
-The backend polls Spotify every 1–3 seconds while a track is playing. On change, it:
+On a **meaningful change only** (new track, play/pause flip, seek drift > ~2 s), the backend:
 
 1. Fetches new track metadata and album art URL.
 2. Downloads the art.
 3. Extracts a palette.
-4. Dithers the art to 1-bit.
-5. Builds a new `RenderDoc`.
-6. Broadcasts it over all open SSE connections.
+4. Dithers the art per connected device's requested size/algorithm.
+5. Builds a new `RenderDoc` and broadcasts it over all open SSE connections.
 
-### Voice command loop
-
-```
-Device/_browser
-      │
-      ▼
- POST /voice (audio blob)
-      │
-      ▼
-┌──────────┐   STT   ┌─────────┐   intent + tools   ┌─────────┐
-│ Backend  │ ───────► │  LLM    │ ─────────────────► │ Spotify │
-│          │ ◄─────── │         │ ◄───────────────── │  API    │
-└────┬─────┘          └─────────┘                    └────┬────┘
-     │                                                    │
-     │  fetch art → palette → dither → RenderDoc          │
-     │◄───────────────────────────────────────────────────┘
-     │
-     ▼
- 200 OK (RenderDoc)
-```
-
-1. Audio is uploaded as a raw blob.
-2. Backend sends it to a cloud STT service (OpenAI Whisper).
-3. Transcript + current playback context are sent to an LLM with a tool schema.
-4. LLM emits a tool call such as `play`, `pause`, `next`, `search_and_play`, `set_volume`, or `describe`.
-5. Backend executes the Spotify action.
-6. Backend builds a fresh render document and returns it.
-7. The same document is broadcast over SSE.
+Steady-state playback produces **zero** SSE traffic between track changes. Clients animate progress themselves.
 
 ---
 
@@ -281,33 +311,31 @@ The backend owns every hard image operation so the clients stay cheap.
 
 ```
 ┌────────────────┐    ┌─────────────┐    ┌──────────────┐    ┌─────────────┐
-│  Spotify art   │───►│ resize 400  │───►│   palette    │───►│  1-bit      │
-│  JPEG/PNG      │    │ x 400       │    │ extraction   │    │  dither     │
+│  Spotify art   │───►│ resize to   │───►│   palette    │───►│  1-bit      │
+│  JPEG/PNG      │    │ device w×h  │    │ extraction   │    │  dither     │
 └────────────────┘    └─────────────┘    └──────────────┘    └──────┬──────┘
                                                                     │
                                                                     ▼
                                                           ┌──────────────────┐
                                                           │ base64 RenderDoc │
-                                                          │ art_1bit field   │
+                                                          │ art.bits field   │
                                                           └──────────────────┘
 ```
 
 ### Dither strategy
 
-V1 uses **Bayer-ordered dither** to a 1-bit image. Future versions may add:
+V1 ships **Bayer-ordered** and **Atkinson** (selected per device via the `dither` query param on `/state`). Future candidates:
 
-- Atkinson error diffusion (more texture).
 - Half-block mode (`▀` with independent fg/bg colors) for higher effective resolution in terminal-like clients.
-- Full-color fallback for the web UI.
 
-The client does not decide the dither mode; it is set per-device by a backend config or query parameter on `/state`.
+The client never decides the dither mode; it only asks for one.
 
 ### Palette extraction
 
-Use a small k-means or median-cut over the resized cover. The backend returns exactly two colors:
+Small k-means or median-cut over the resized cover. Exactly two colors:
 
-1. `palette[0]` — dominant background.
-2. `palette[1]` — accent (used for LED wash and UI highlights).
+1. `palette[0]`: dominant background.
+2. `palette[1]`: accent, **clamped for display**. Dark album covers happily hand k-means a near-black "accent," and an LED wash of near-black looks broken. Clamp the accent in HSL to roughly `L ∈ [0.35, 0.75]`, `S ≥ 0.4` before emitting it.
 
 ---
 
@@ -315,19 +343,19 @@ Use a small k-means or median-cut over the resized cover. The backend returns ex
 
 ### Web client (phase 1)
 
-- `GET /state` via `EventSource`.
-- `POST /voice` via `fetch()` with `getUserMedia()` audio.
-- Render `art_1bit` to a `<canvas>` or draw it as an `<img>` if the backend provides a PNG.
-- Use `palette` for CSS theming and FFT bars.
+- `GET /state` via `EventSource`; reconnect = just reconnect, the first event restores everything.
+- Interpolate the progress bar locally from `progress_ms` + `server_ts`.
+- Unpack `art.bits` into `ImageData` and draw to `<canvas>`.
+- `POST /voice` with WAV recorded via `getUserMedia` + an AudioWorklet.
+- Drive FFT bars/LED-preview from a WebAudio `AnalyserNode`, colored by `palette[1]`.
 
 ### ESP32 client (phase 2)
 
-- One TLS connection to `/state`.
-- Parse the SSE stream incrementally; JSON objects are small.
-- Decode `art_1bit` base64 into a framebuffer.
-- Blit the 1-bit buffer to the panel via DMA.
-- Drive the LED strip from `palette[1]` and/or `fft_bands`.
-- Voice: stream I2S microphone audio to `POST /voice`.
+- One TLS connection to `/state?w=<panel_w>&h=<panel_h>&dither=atkinson`.
+- Parse the SSE stream incrementally; documents are small and infrequent.
+- Base64-decode `art.bits` directly into the framebuffer, blit via DMA.
+- Drive the LED strip: hue from `palette[1]`, motion from an on-device FFT of the I2S mic at 30-60 Hz.
+- Voice: record from the I2S mic, `POST /voice` as raw PCM with `rate/bits/ch` params.
 
 ### Why the UI does not "transfer"
 
@@ -337,15 +365,23 @@ There is no browser on the ESP32. LVGL is a C toolkit with a scene graph, not a 
 
 ## Security model
 
+Right-sized for one person's shelf. Not a product.
+
 | Secret | Location | Reason |
 |--------|----------|--------|
-| Spotify refresh token | Backend database/env | Never on device. ESP32 flash is dumpable. |
-| LLM API key | Backend env | Same reason. |
-| `DEVICE_API_TOKEN` | One per device, revocable | The device holds only this token. All other auth is server-side. |
+| Spotify refresh token | Backend env/storage | Never on device. ESP32 flash is dumpable. |
+| OpenAI API key | Backend env | Same reason. |
+| `DEVICE_API_TOKEN` | One static token, env var | The device holds only this. Revoke = change the env var. |
 
-The device authenticates every request with `Authorization: Bearer <DEVICE_API_TOKEN>`.
+Every request carries `Authorization: Bearer <DEVICE_API_TOKEN>`. OAuth uses a `state` parameter. TLS in "production" (i.e., whenever the backend leaves localhost); local dev may use HTTP.
 
-For development, `DEVICE_API_TOKEN` can be a static env var. In production it should be provisioned per-device and rotatable.
+---
+
+## Spotify API reality check
+
+- **Premium is required** for the playback-control endpoints (play/pause/skip/volume). Covered.
+- A **development-mode app** on your own account is all this needs; no quota extension, no review.
+- The `audio-features`, `audio-analysis`, and `recommendations` endpoints were [deprecated for new apps in November 2024](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api). This is why beat reactivity is device-local and why "play something mellow" is resolved by the model + `search_and_play`, not by Spotify's recommendation engine.
 
 ---
 
@@ -363,37 +399,50 @@ Optional:
 
 - `HOST` (default `0.0.0.0`)
 - `PORT` (default `3000`)
-- `OPENAI_MODEL` (default `gpt-4o-mini`)
+- `OPENAI_REALTIME_MODEL` (default: the mini realtime model, e.g. `gpt-realtime-mini`; set to `gpt-realtime` for the flagship)
 
 ---
 
 ## Development plan
 
-### Phase 1 — web app
+### Phase 1: web app
 
-1. Rust backend scaffold (Axum, SSE, config).
-2. Spotify OAuth + token refresh.
-3. `GET /state` SSE endpoint.
-4. `POST /voice` stub that returns the current state.
-5. Image pipeline: download art, resize, palette, dither.
-6. LLM tool schema + intent execution.
-7. React client: canvas renderer, `getUserMedia` voice button.
+1. Rust backend scaffold (Axum, SSE, config). ✅
+2. Spotify OAuth (`state` param) + token refresh.
+3. `GET /state` SSE endpoint: current-doc-on-connect, broadcast-on-change, per-device render params.
+4. Image pipeline: download art, resize, palette (+ clamp), Bayer + Atkinson dither, packed 1-bit output.
+5. Idle mode: dithered clock frame generator, one doc per minute.
+6. GPT Realtime session manager: persistent WS, tool schema, blob → PCM16/24k → append/commit/response.
+7. `POST /voice`: tool execution against Spotify, `thinking` broadcast, voice_log.
+8. React client: canvas renderer (packed-bit unpack), interpolated progress, WAV voice button, WebAudio bars.
 
-### Phase 2 — hardware
+### Phase 2: hardware
 
 1. ESP32-S3 firmware skeleton.
-2. Connect to same `/state` SSE stream.
-3. Decode and blit `art_1bit`.
-4. Add I2S microphone and `POST /voice` upload.
-5. Add LED strip output from `palette`/`fft_bands`.
+2. Connect to the same `/state` SSE stream at panel-native size.
+3. Decode and blit `art.bits`.
+4. I2S microphone: local FFT → LED strip (hue from `palette`).
+5. `POST /voice` raw-PCM upload.
 6. Iterate on physical case and panel choice.
+
+### Phase 2.5 (optional): streaming voice
+
+Replace the blob upload with a WebSocket that relays mic audio to the Realtime session continuously, with server-side turn detection. That is when `state: "listening"` comes alive and the box becomes a true walkie-talkie. Blob mode stays as the fallback.
 
 ---
 
-## Open questions
+## Decisions log
 
-- Should the web UI support full-color album art as a toggle, or stay strictly 1-bit to match hardware?
-- Should beat data (`fft_bands`) be computed server-side from a room microphone stream, or omitted entirely when the device is the only mic source?
-- Should we support multiple Spotify accounts / multiple devices per account?
+Settled (so future sessions do not relitigate):
 
-These decisions live in the backend; clients are unaffected.
+- **GPT Realtime, not STT + LLM.** One session does transcription + intent + tool calls.
+- **No `fft_bands` in the contract.** Beat reactivity is device-local from the device's own mic; the server only supplies the palette.
+- **Progress is interpolated client-side.** No per-second SSE pushes.
+- **One art encoding** (packed 1-bit + `w`/`h`/`dither` metadata). The web UI renders it faithfully; full color is a debug toggle only.
+- **Single Spotify account, single user, static device token.** This is furniture, not a product.
+
+Still open:
+
+- Panel choice (drives the real `w`/`h` and whether Atkinson beats Bayer in the flesh).
+- Spoken replies: Realtime can talk back if the box ever gets a speaker. Off for now.
+- Idle mode variants beyond the clock.
