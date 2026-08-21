@@ -17,7 +17,7 @@ pub enum PlaybackState {
     Listening,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DitherMode {
     Bayer,
@@ -25,7 +25,7 @@ pub enum DitherMode {
 }
 
 /// Dithered artwork (album cover or idle frame), ready to blit.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Art {
     pub w: u32,
     pub h: u32,
