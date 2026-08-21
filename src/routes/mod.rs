@@ -1,4 +1,5 @@
 mod state;
+pub mod voice;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -8,7 +9,7 @@ use axum::{
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde_json::{Value, json};
 
@@ -31,15 +32,26 @@ pub fn router(
     spotify: SpotifyClient,
     device_api_token: String,
     state_hub: Arc<StateHub>,
+    voice_model: Arc<dyn voice::VoiceModel>,
 ) -> Router {
+    let voice_state = voice::VoiceState {
+        spotify: spotify.clone(),
+        model: voice_model,
+        hub: state_hub.clone(),
+        guard: Arc::new(tokio::sync::Mutex::new(())),
+    };
     let state = AppState {
         spotify,
         device_api_token: device_api_token.clone(),
         state_hub,
     };
+    let voice_route = Router::new()
+        .route("/voice", post(voice::post_voice))
+        .with_state(voice_state);
     let protected = Router::new()
         .route("/health", get(health))
         .route("/state", get(state::get_state))
+        .merge(voice_route)
         .route_layer(middleware::from_fn_with_state(
             device_api_token,
             require_bearer,
@@ -163,7 +175,12 @@ mod tests {
     }
 
     fn test_router(spotify: SpotifyClient, token: &str) -> Router {
-        router(spotify, token.to_string(), Arc::new(StateHub::new()))
+        router(
+            spotify,
+            token.to_string(),
+            Arc::new(StateHub::new()),
+            Arc::new(voice::FailingVoiceModel),
+        )
     }
 
     #[tokio::test]

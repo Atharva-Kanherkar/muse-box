@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use muse_box::{
     config::Config,
+    realtime::RealtimeManager,
     routes,
     spotify::{SpotifyClient, SpotifyConfig},
     state::{StateHub, run_idle_scheduler, run_poll_loop},
@@ -44,6 +45,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state_hub = Arc::new(StateHub::new().with_display_offset(config.idle_display_offset));
+    let realtime = Arc::new(RealtimeManager::new(
+        config.openai_api_key,
+        config.openai_realtime_model,
+    ));
     let (_background_shutdown, poll_shutdown_rx) = tokio::sync::watch::channel(false);
     let idle_shutdown_rx = poll_shutdown_rx.clone();
     let poll_spotify = spotify.clone();
@@ -58,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     let _idle_task = tokio::spawn(run_idle_scheduler(state_hub.clone(), idle_shutdown_rx));
 
-    let app = routes::router(spotify, config.device_api_token, state_hub);
+    let app = routes::router(spotify, config.device_api_token, state_hub, realtime);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("failed to bind server to {bind_addr}"))?;

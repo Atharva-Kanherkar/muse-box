@@ -199,6 +199,7 @@ mod tests {
             }),
             "test-token".to_string(),
             hub,
+            Arc::new(routes::voice::FailingVoiceModel),
         )
     }
 

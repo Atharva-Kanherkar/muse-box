@@ -159,6 +159,21 @@ struct SpotifyImage {
     url: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    tracks: SearchTracks,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchTracks {
+    items: Vec<SearchTrack>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchTrack {
+    id: String,
+}
+
 /// Build an HTTP client that cannot hang indefinitely.
 ///
 /// `build` only fails when the TLS backend cannot be initialized, so the
@@ -400,6 +415,116 @@ impl SpotifyClient {
         })
     }
 
+    pub async fn resume_playback(&self) -> Result<(), AppError> {
+        self.send_player_request(reqwest::Method::PUT, "me/player/play", &[])
+            .await
+    }
+
+    pub async fn pause_playback(&self) -> Result<(), AppError> {
+        self.send_player_request(reqwest::Method::PUT, "me/player/pause", &[])
+            .await
+    }
+
+    pub async fn skip_next(&self) -> Result<(), AppError> {
+        self.send_player_request(reqwest::Method::POST, "me/player/next", &[])
+            .await
+    }
+
+    pub async fn skip_previous(&self) -> Result<(), AppError> {
+        self.send_player_request(reqwest::Method::POST, "me/player/previous", &[])
+            .await
+    }
+
+    pub async fn set_volume(&self, percent: u8) -> Result<(), AppError> {
+        self.send_player_request(
+            reqwest::Method::PUT,
+            "me/player/volume",
+            &[("volume_percent", percent.to_string())],
+        )
+        .await
+    }
+
+    pub async fn search_top_track(&self, query: &str) -> Result<String, AppError> {
+        let access_token = self.access_token().await?;
+        let url = format!(
+            "{}/search",
+            self.endpoints.api_base_url.trim_end_matches('/')
+        );
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(access_token)
+            .query(&[("q", query), ("type", "track"), ("limit", "1")])
+            .send()
+            .await
+            .map_err(spotify_api_error)?
+            .error_for_status()
+            .map_err(spotify_api_error)?
+            .json::<SearchResponse>()
+            .await
+            .map_err(spotify_api_error)?;
+        response
+            .tracks
+            .items
+            .into_iter()
+            .next()
+            .map(|track| track.id)
+            .ok_or_else(|| AppError::Spotify(format!("no Spotify track matched: {query}")))
+    }
+
+    pub async fn play_track(&self, track_id: &str) -> Result<(), AppError> {
+        let access_token = self.access_token().await?;
+        let url = format!(
+            "{}/me/player/play",
+            self.endpoints.api_base_url.trim_end_matches('/')
+        );
+        self.http
+            .put(url)
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({
+                "uris": [format!("spotify:track:{track_id}")]
+            }))
+            .send()
+            .await
+            .map_err(spotify_api_error)?
+            .error_for_status()
+            .map_err(spotify_api_error)?;
+        Ok(())
+    }
+
+    pub async fn queue_track(&self, track_id: &str) -> Result<(), AppError> {
+        self.send_player_request(
+            reqwest::Method::POST,
+            "me/player/queue",
+            &[("uri", format!("spotify:track:{track_id}"))],
+        )
+        .await
+    }
+
+    async fn send_player_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<(), AppError> {
+        let access_token = self.access_token().await?;
+        let url = format!(
+            "{}/{}",
+            self.endpoints.api_base_url.trim_end_matches('/'),
+            path
+        );
+        self.http
+            .request(method, url)
+            .bearer_auth(access_token)
+            .query(query)
+            .send()
+            .await
+            .map_err(spotify_api_error)?
+            .error_for_status()
+            .map_err(spotify_api_error)?;
+        Ok(())
+    }
+
     async fn consume_state(&self, state: &str) -> bool {
         let issued = self.pending_states.lock().await.remove(state);
         match issued {
@@ -517,6 +642,10 @@ fn spotify_request_error(error: reqwest::Error) -> AppError {
     AppError::Spotify(format!("Spotify token request failed: {error}"))
 }
 
+fn spotify_api_error(error: reqwest::Error) -> AppError {
+    AppError::Spotify(format!("Spotify Web API request failed: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -531,10 +660,11 @@ mod tests {
 
     use axum::{
         Json, Router,
-        extract::Form,
+        body::to_bytes,
+        extract::{Form, Request},
         http::{StatusCode, header},
         response::{IntoResponse, Response},
-        routing::{get, post},
+        routing::{any, get, post},
     };
     use serde_json::json;
 
@@ -798,6 +928,86 @@ mod tests {
             client.currently_playing().await,
             Err(PlaybackFetchError::Spotify(AppError::Spotify(_)))
         ));
+    }
+
+    #[tokio::test]
+    async fn playback_controls_match_spotify_web_api_contract() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let app = Router::new().fallback(any(move |request: Request| {
+            let observed = observed.clone();
+            async move {
+                let method = request.method().clone();
+                let uri = request.uri().to_string();
+                let authorization = request
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let body = to_bytes(request.into_body(), 1024)
+                    .await
+                    .expect("request body");
+                observed
+                    .lock()
+                    .await
+                    .push((method, uri.clone(), authorization, body.to_vec()));
+                if uri.starts_with("/v1/search?") {
+                    Json(json!({ "tracks": { "items": [{ "id": "top-track" }] } })).into_response()
+                } else {
+                    StatusCode::NO_CONTENT.into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Spotify mock");
+        let address = listener.local_addr().expect("Spotify mock address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("Spotify mock");
+        });
+        let client = SpotifyClient::with_test_api_url(
+            test_config(PathBuf::from("unused")),
+            format!("http://{address}/v1"),
+        );
+        client.authorize_for_test().await;
+
+        client.resume_playback().await.expect("resume");
+        client.pause_playback().await.expect("pause");
+        client.skip_next().await.expect("next");
+        client.skip_previous().await.expect("previous");
+        client.set_volume(73).await.expect("volume");
+        let track_id = client.search_top_track("Teardrop").await.expect("search");
+        assert_eq!(track_id, "top-track");
+        client.play_track(&track_id).await.expect("play track");
+        client.queue_track(&track_id).await.expect("queue track");
+
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 8);
+        assert_eq!(requests[0].0, reqwest::Method::PUT);
+        assert_eq!(requests[0].1, "/v1/me/player/play");
+        assert_eq!(requests[1].1, "/v1/me/player/pause");
+        assert_eq!(requests[2].0, reqwest::Method::POST);
+        assert_eq!(requests[2].1, "/v1/me/player/next");
+        assert_eq!(requests[3].1, "/v1/me/player/previous");
+        assert_eq!(requests[4].1, "/v1/me/player/volume?volume_percent=73");
+        assert!(requests[5].1.contains("q=Teardrop"));
+        assert!(requests[5].1.contains("type=track"));
+        assert!(requests[5].1.contains("limit=1"));
+        assert_eq!(requests[6].1, "/v1/me/player/play");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[6].3).expect("play body"),
+            json!({ "uris": ["spotify:track:top-track"] })
+        );
+        assert_eq!(
+            requests[7].1,
+            "/v1/me/player/queue?uri=spotify%3Atrack%3Atop-track"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.2 == "Bearer test-access-token")
+        );
     }
 
     #[tokio::test]

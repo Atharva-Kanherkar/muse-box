@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 /// Web UI and ESP32 both consume this exact shape.
 pub const RENDER_DOCUMENT_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlaybackState {
     #[default]
@@ -60,7 +60,7 @@ pub struct RenderDoc {
     pub voice_log: Vec<VoiceLogEntry>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoiceLogEntry {
     pub transcript: String,
     pub action: String,
