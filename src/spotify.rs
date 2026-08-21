@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Duration, Utc};
@@ -14,6 +18,12 @@ const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const SPOTIFY_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const SPOTIFY_SCOPES: &str = "user-read-playback-state user-modify-playback-state";
 const REFRESH_WINDOW_SECONDS: i64 = 60;
+/// How long an unconsumed OAuth state stays valid. Long enough to log in and
+/// approve, short enough that abandoned flows do not accumulate.
+const STATE_TTL_SECONDS: i64 = 600;
+/// Hard cap on tracked states. `/auth/spotify` is unauthenticated by design, so
+/// the set needs a ceiling no matter how often it is hit.
+const MAX_PENDING_STATES: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct SpotifyConfig {
@@ -43,7 +53,7 @@ pub struct SpotifyClient {
     http: Client,
     config: SpotifyConfig,
     endpoints: SpotifyEndpoints,
-    pending_states: Arc<Mutex<HashSet<String>>>,
+    pending_states: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
     token: Arc<RwLock<Option<StoredToken>>>,
     refresh_guard: Arc<Mutex<()>>,
 }
@@ -72,7 +82,7 @@ impl SpotifyClient {
             http: Client::new(),
             config,
             endpoints,
-            pending_states: Arc::new(Mutex::new(HashSet::new())),
+            pending_states: Arc::new(Mutex::new(HashMap::new())),
             token: Arc::new(RwLock::new(None)),
             refresh_guard: Arc::new(Mutex::new(())),
         }
@@ -98,7 +108,26 @@ impl SpotifyClient {
         OsRng.fill_bytes(&mut random);
         let state = general_purpose::URL_SAFE_NO_PAD.encode(random);
 
-        self.pending_states.lock().await.insert(state.clone());
+        {
+            let mut pending = self.pending_states.lock().await;
+            let now = Utc::now();
+            pending.retain(|_, issued| now - *issued < Duration::seconds(STATE_TTL_SECONDS));
+            // Still full of live states? Drop the oldest to make room, so a
+            // flood of unfinished flows cannot grow this without bound.
+            while pending.len() >= MAX_PENDING_STATES {
+                let oldest = pending
+                    .iter()
+                    .min_by_key(|(_, issued)| **issued)
+                    .map(|(key, _)| key.clone());
+                match oldest {
+                    Some(key) => {
+                        pending.remove(&key);
+                    }
+                    None => break,
+                }
+            }
+            pending.insert(state.clone(), now);
+        }
 
         let mut url = Url::parse(&self.endpoints.authorize_url)
             .map_err(|error| AppError::Spotify(format!("invalid authorize URL: {error}")))?;
@@ -180,7 +209,11 @@ impl SpotifyClient {
     }
 
     async fn consume_state(&self, state: &str) -> bool {
-        self.pending_states.lock().await.remove(state)
+        let issued = self.pending_states.lock().await.remove(state);
+        match issued {
+            Some(issued) => Utc::now() - issued < Duration::seconds(STATE_TTL_SECONDS),
+            None => false,
+        }
     }
 
     async fn refresh_access_token(&self, force: bool) -> Result<(), AppError> {
@@ -230,7 +263,11 @@ fn token_needs_refresh(token: &StoredToken, now: DateTime<Utc>) -> bool {
     token.expires_at <= now + Duration::seconds(REFRESH_WINDOW_SECONDS)
 }
 
-async fn persist_token(path: &PathBuf, token: &StoredToken) -> Result<(), AppError> {
+/// Writes the token store atomically: a fresh sibling temp file is written,
+/// synced, and renamed over the destination. Truncating the real file in place
+/// would leave an empty or partial store if the process died mid-write, and a
+/// lost refresh token means the box needs a browser to come back.
+async fn persist_token(path: &Path, token: &StoredToken) -> Result<(), AppError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -242,21 +279,27 @@ async fn persist_token(path: &PathBuf, token: &StoredToken) -> Result<(), AppErr
     let bytes = serde_json::to_vec_pretty(token).map_err(|error| {
         AppError::Spotify(format!("failed to serialize Spotify token: {error}"))
     })?;
+
+    let mut temp_name = path.file_name().unwrap_or_default().to_os_string();
+    temp_name.push(".tmp");
+    let temp_path = path.with_file_name(temp_name);
+
     let mut options = tokio::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);
     #[cfg(unix)]
     {
         options.mode(0o600);
     }
-    let mut file = options
-        .open(path)
-        .await
-        .map_err(|error| AppError::Spotify(format!("failed to open token store: {error}")))?;
+    let mut file = options.open(&temp_path).await.map_err(|error| {
+        AppError::Spotify(format!("failed to open token store temporary: {error}"))
+    })?;
 
     #[cfg(unix)]
     {
+        // mode() only applies when the file is created, so an inherited temp
+        // file keeps its old permissions without this.
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        tokio::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))
             .await
             .map_err(|error| {
                 AppError::Spotify(format!("failed to secure token store permissions: {error}"))
@@ -269,6 +312,11 @@ async fn persist_token(path: &PathBuf, token: &StoredToken) -> Result<(), AppErr
     file.sync_all()
         .await
         .map_err(|error| AppError::Spotify(format!("failed to sync token store: {error}")))?;
+    drop(file);
+
+    tokio::fs::rename(&temp_path, path)
+        .await
+        .map_err(|error| AppError::Spotify(format!("failed to commit token store: {error}")))?;
 
     Ok(())
 }
@@ -356,6 +404,60 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[tokio::test]
+    async fn pending_states_are_capped_and_expired_states_rejected() {
+        let client = SpotifyClient::new(test_config(PathBuf::from("unused")));
+
+        // An abandoned flow must not pin memory: issuing more than the cap
+        // leaves the set at the ceiling rather than growing forever.
+        for _ in 0..(MAX_PENDING_STATES * 2) {
+            client.authorization_url().await.expect("authorization URL");
+        }
+        assert_eq!(client.pending_states.lock().await.len(), MAX_PENDING_STATES);
+
+        // A state older than the TTL is refused even though it was issued here.
+        let stale = "stale-state".to_string();
+        client.pending_states.lock().await.insert(
+            stale.clone(),
+            Utc::now() - Duration::seconds(STATE_TTL_SECONDS + 1),
+        );
+        assert!(!client.consume_state(&stale).await);
+    }
+
+    #[tokio::test]
+    async fn persist_token_replaces_atomically_and_leaves_no_temp_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("spotify.json");
+
+        // A store left world-readable by an earlier run must end up private,
+        // and the rename must not leave its temp file behind.
+        tokio::fs::write(&path, b"{}").await.expect("seed store");
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .await
+            .expect("loosen permissions");
+
+        let token = StoredToken {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires_at: Utc::now() + Duration::hours(1),
+        };
+        persist_token(&path, &token).await.expect("persist token");
+
+        let reloaded: StoredToken =
+            serde_json::from_slice(&tokio::fs::read(&path).await.expect("read token"))
+                .expect("parse token");
+        assert_eq!(reloaded, token);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("token metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(!directory.path().join("spotify.json.tmp").exists());
     }
 
     #[tokio::test]

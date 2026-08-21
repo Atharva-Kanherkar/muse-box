@@ -78,14 +78,35 @@ async fn require_bearer(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == expected_token);
+        .and_then(bearer_credential)
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()));
 
     if !authorized {
         return Err(AppError::Unauthorized);
     }
 
     Ok(next.run(request).await.into_response())
+}
+
+/// Splits the credential out of an `Authorization` header. RFC 7235 makes the
+/// scheme case-insensitive, so an ESP32 that sends `bearer` must still work.
+fn bearer_credential(value: &str) -> Option<&str> {
+    let (scheme, credential) = value.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| credential.trim_start())
+}
+
+/// Compares in time independent of how many leading bytes match, so a caller
+/// cannot probe the token byte by byte.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
 }
 
 fn escape_html(value: &str) -> String {
@@ -156,6 +177,36 @@ mod tests {
                 Request::builder()
                     .uri("/health")
                     .header(header::AUTHORIZATION, "Bearer right-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive_and_credential_must_match_exactly() {
+        assert_eq!(bearer_credential("bearer tok"), Some("tok"));
+        assert_eq!(bearer_credential("BEARER tok"), Some("tok"));
+        assert_eq!(bearer_credential("Bearer  tok"), Some("tok"));
+        assert_eq!(bearer_credential("Basic tok"), None);
+        assert_eq!(bearer_credential("Bearer"), None);
+
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"same", b"sane"));
+        assert!(!constant_time_eq(b"short", b"shorter"));
+
+        // A lowercase scheme from a hand-rolled device client must be accepted.
+        let app = router(
+            test_spotify(PathBuf::from("unused")),
+            "right-token".to_string(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::AUTHORIZATION, "bearer right-token")
                     .body(Body::empty())
                     .expect("request"),
             )

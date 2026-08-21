@@ -8,8 +8,15 @@ use muse_box::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
+    // from_default_env() would default to ERROR, silencing every info! line
+    // when RUST_LOG is unset (the normal case on Railway, where there is no
+    // .env for dotenvy to load).
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
         .init();
 
     let config = Config::from_env()?;
@@ -21,8 +28,16 @@ async fn main() -> anyhow::Result<()> {
         token_store_path: config.spotify_token_store_path,
     });
 
-    if spotify.initialize_from_store().await? {
-        tracing::info!("refreshed persisted Spotify authorization");
+    // Never fatal: a revoked token or a Spotify blip during a redeploy must not
+    // stop the server from binding, or /auth/spotify would be unreachable and
+    // the box could never be re-authorized.
+    match spotify.initialize_from_store().await {
+        Ok(true) => tracing::info!("refreshed persisted Spotify authorization"),
+        Ok(false) => tracing::info!("no persisted Spotify authorization; visit /auth/spotify"),
+        Err(error) => tracing::warn!(
+            %error,
+            "could not restore Spotify authorization; visit /auth/spotify to re-authorize"
+        ),
     }
 
     let app = routes::router(spotify, config.device_api_token);
