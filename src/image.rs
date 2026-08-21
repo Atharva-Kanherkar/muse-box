@@ -221,9 +221,18 @@ fn squared_distance(left: [f64; 3], right: [f64; 3]) -> f64 {
         .sum()
 }
 
+/// Clamp the accent into the displayable band the README requires: lightness
+/// `0.35..=0.75` and saturation `>= 0.4`.
+///
+/// The targets are inset from those bounds on purpose. `hsl_to_rgb` quantizes to
+/// 8 bits per channel, and measuring the result back in HSL lands up to one
+/// quantization step off the requested value, which is enough to fall outside
+/// the band: clamping black to exactly `S = 0.4` yields `#7d3636`, whose
+/// saturation reads back as 0.397. Insetting keeps the emitted color inside the
+/// band, so do not "simplify" these back to the boundary values.
 fn clamp_accent(color: [u8; 3]) -> [u8; 3] {
     let (hue, saturation, lightness) = rgb_to_hsl(color);
-    hsl_to_rgb(hue, saturation.max(0.4), lightness.clamp(0.35, 0.75))
+    hsl_to_rgb(hue, saturation.max(0.42), lightness.clamp(0.36, 0.74))
 }
 
 fn rgb_to_hsl(color: [u8; 3]) -> (f64, f64, f64) {
@@ -374,6 +383,17 @@ mod tests {
         for format in [ImageFormat::Png, ImageFormat::Jpeg] {
             let output = resize(&encode(source.clone(), format), 4, 4).unwrap();
             assert_eq!(output.dimensions(), (4, 4));
+
+            // The 12x6 source center-crops to x in 3..9, so the frame keeps
+            // three red columns and three blue ones. A crop pinned to x = 0
+            // would be entirely red and still have the right dimensions.
+            let left = output.get_pixel(0, 2);
+            let right = output.get_pixel(3, 2);
+            assert!(left[0] > left[2], "{format:?} left edge not red: {left:?}");
+            assert!(
+                right[2] > right[0],
+                "{format:?} right edge not blue: {right:?}"
+            );
         }
     }
 
@@ -432,8 +452,11 @@ mod tests {
             assert_eq!(palette.len(), 2);
             let accent = parse_hex(&palette[1]);
             let (_, saturation, lightness) = rgb_to_hsl(accent);
-            assert!(saturation + 0.01 >= 0.4, "{palette:?}");
-            assert!((0.35 - 0.01..=0.75 + 0.01).contains(&lightness));
+            assert!(saturation >= 0.4, "saturation {saturation} in {palette:?}");
+            assert!(
+                (0.35..=0.75).contains(&lightness),
+                "lightness {lightness} in {palette:?}"
+            );
         }
     }
 
