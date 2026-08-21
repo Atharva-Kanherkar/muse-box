@@ -1003,16 +1003,38 @@ mod tests {
             Some("session.update")
         );
         assert_eq!(
+            update.pointer("/session/type").and_then(Value::as_str),
+            Some("realtime")
+        );
+        assert_eq!(
             update.pointer("/session/output_modalities"),
             Some(&json!(["text"]))
+        );
+        assert_eq!(
+            update
+                .pointer("/session/audio/input/format/type")
+                .and_then(Value::as_str),
+            Some("audio/pcm")
         );
         assert_eq!(
             update.pointer("/session/audio/input/format/rate"),
             Some(&json!(24_000))
         );
         assert_eq!(
+            update
+                .pointer("/session/audio/input/transcription/model")
+                .and_then(Value::as_str),
+            Some(TRANSCRIPTION_MODEL)
+        );
+        assert_eq!(
             update.pointer("/session/audio/input/turn_detection"),
             Some(&Value::Null)
+        );
+        assert_eq!(
+            update
+                .pointer("/session/tool_choice")
+                .and_then(Value::as_str),
+            Some("auto")
         );
         assert_eq!(
             update.pointer("/session/tools"),
