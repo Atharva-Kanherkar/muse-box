@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod idle;
 pub mod image;
+pub mod realtime;
 pub mod render;
 pub mod routes;
 pub mod spotify;
