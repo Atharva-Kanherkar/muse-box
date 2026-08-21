@@ -1,7 +1,7 @@
 //! Shared playback state, render caching, and meaningful-change detection.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     sync::{
         Arc,
@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use crate::{
     error::AppError,
     idle, image,
-    render::{Art, DitherMode, PlaybackState, RENDER_DOCUMENT_VERSION, RenderDoc},
+    render::{Art, DitherMode, PlaybackState, RENDER_DOCUMENT_VERSION, RenderDoc, VoiceLogEntry},
     spotify::{MAX_RATE_LIMIT_BACKOFF, PlaybackObservation},
 };
 
@@ -31,6 +31,7 @@ const NORMAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 const MIN_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 const IDLE_THRESHOLD_SECONDS: i64 = 30;
+const VOICE_LOG_CAPACITY: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RenderParams {
@@ -86,6 +87,7 @@ pub struct StateHub {
     last_accent: RwLock<Option<String>>,
     idle_frame_at: RwLock<Option<DateTime<Utc>>>,
     operation_guard: Mutex<()>,
+    voice_log: Mutex<VecDeque<VoiceLogEntry>>,
     playback_activity: watch::Sender<PlaybackActivity>,
     display_offset: FixedOffset,
     changes: broadcast::Sender<u64>,
@@ -130,6 +132,7 @@ impl StateHub {
             last_accent: RwLock::new(None),
             idle_frame_at: RwLock::new(None),
             operation_guard: Mutex::new(()),
+            voice_log: Mutex::new(VecDeque::with_capacity(VOICE_LOG_CAPACITY)),
             playback_activity,
             display_offset: Utc.fix(),
             changes,
@@ -191,6 +194,27 @@ impl StateHub {
         self.publish(observation, true).await
     }
 
+    /// Broadcast the current document in its transient voice-processing state.
+    pub async fn publish_thinking(&self) {
+        let _guard = self.operation_guard.lock().await;
+        let now = Utc::now();
+        let mut documents = self.documents.write().await;
+        for document in documents.values_mut() {
+            let mut thinking = document.as_ref().clone();
+            thinking.state = PlaybackState::Thinking;
+            thinking.server_ts = Some(now);
+            *document = Arc::new(thinking);
+        }
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let _send_result = self.changes.send(generation);
+    }
+
+    pub async fn append_voice_log(&self, entry: VoiceLogEntry) {
+        let mut log = self.voice_log.lock().await;
+        log.push_front(entry);
+        log.truncate(VOICE_LOG_CAPACITY);
+    }
+
     pub async fn published_observation(&self) -> PlaybackObservation {
         self.published.read().await.clone()
     }
@@ -221,19 +245,16 @@ impl StateHub {
         }
         let params: Vec<_> = self.registered.read().await.iter().copied().collect();
         let palette = self.idle_palette().await;
+        let voice_log: Vec<_> = self.voice_log.lock().await.iter().cloned().collect();
         let observation = PlaybackObservation::idle(at);
         let documents = params
             .into_iter()
             .map(|params| {
                 let art = idle::render(at, self.display_offset, params);
-                (
-                    params,
-                    Arc::new(document_from_observation(
-                        &observation,
-                        Some(art),
-                        palette.clone(),
-                    )),
-                )
+                let mut document =
+                    document_from_observation(&observation, Some(art), palette.clone());
+                document.voice_log.clone_from(&voice_log);
+                (params, Arc::new(document))
             })
             .collect();
 
@@ -292,6 +313,18 @@ impl StateHub {
     }
 
     async fn build_document(
+        &self,
+        observation: &PlaybackObservation,
+        params: RenderParams,
+    ) -> Result<RenderDoc, AppError> {
+        let mut document = self
+            .build_document_without_voice_log(observation, params)
+            .await?;
+        document.voice_log = self.voice_log.lock().await.iter().cloned().collect();
+        Ok(document)
+    }
+
+    async fn build_document_without_voice_log(
         &self,
         observation: &PlaybackObservation,
         params: RenderParams,
@@ -652,6 +685,54 @@ mod tests {
     use chrono::{Duration, TimeZone};
 
     use super::*;
+
+    #[tokio::test]
+    async fn voice_log_is_newest_first_and_evicts_the_sixth_oldest_entry() {
+        let hub = StateHub::new();
+        let started = Utc::now();
+        for index in 0..6 {
+            hub.append_voice_log(VoiceLogEntry {
+                transcript: format!("command-{index}"),
+                action: format!("spotify:test:{index}"),
+                timestamp: started + Duration::seconds(index),
+            })
+            .await;
+        }
+        hub.force_publish(PlaybackObservation::idle(Utc::now()))
+            .await
+            .expect("publish voice log");
+
+        let document = hub
+            .current_document(RenderParams::default())
+            .await
+            .expect("current document");
+        assert_eq!(document.voice_log.len(), VOICE_LOG_CAPACITY);
+        assert_eq!(document.voice_log[0].transcript, "command-5");
+        assert_eq!(document.voice_log[4].transcript, "command-1");
+        assert!(
+            document
+                .voice_log
+                .iter()
+                .all(|entry| entry.transcript != "command-0")
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_is_broadcast_without_replacing_playback_observation() {
+        let hub = StateHub::new();
+        let before = hub.published_observation().await;
+        let mut receiver = hub.subscribe();
+
+        hub.publish_thinking().await;
+        receiver.recv().await.expect("thinking generation");
+
+        let document = hub
+            .current_document(RenderParams::default())
+            .await
+            .expect("thinking document");
+        assert_eq!(document.state, PlaybackState::Thinking);
+        assert_eq!(hub.published_observation().await, before);
+    }
 
     #[test]
     fn render_params_apply_defaults_and_validate_bounds() {
