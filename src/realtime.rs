@@ -1,11 +1,309 @@
 //! Persistent GPT Realtime session management and audio preparation.
 
+use std::{fmt, sync::Arc};
+
+use base64::{Engine as _, engine::general_purpose};
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::{net::TcpStream, sync::Mutex};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        http::{HeaderValue, header::AUTHORIZATION},
+    },
+};
 
 use crate::{error::AppError, render::PlaybackState};
 
 const REALTIME_SAMPLE_RATE: u32 = 24_000;
+const AUDIO_CHUNK_SAMPLES: usize = 4_800;
+const DEFAULT_REALTIME_ENDPOINT: &str = "wss://api.openai.com/v1/realtime";
+const TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
+
+type RealtimeSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub struct RealtimeManager {
+    api_key: Arc<str>,
+    model: Arc<str>,
+    endpoint: Arc<str>,
+    session: Mutex<Option<RealtimeSocket>>,
+}
+
+impl fmt::Debug for RealtimeManager {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RealtimeManager")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RealtimeManager {
+    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_endpoint(api_key, model, DEFAULT_REALTIME_ENDPOINT)
+    }
+
+    fn with_endpoint(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        endpoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            api_key: Arc::from(api_key.into()),
+            model: Arc::from(model.into()),
+            endpoint: Arc::from(endpoint.into()),
+            session: Mutex::new(None),
+        }
+    }
+
+    pub async fn command(
+        &self,
+        pcm_mono: &[i16],
+        input_rate: u32,
+        context: PlaybackContext,
+    ) -> Result<VoiceIntent, AppError> {
+        if pcm_mono.is_empty() {
+            return Err(AppError::Voice("audio input must not be empty".to_string()));
+        }
+        let audio = resample_to_24khz(pcm_mono, input_rate)?;
+        let mut session = self.session.lock().await;
+        if session.is_none() {
+            *session = Some(self.connect().await?);
+        }
+        let result = match session.as_mut() {
+            Some(socket) => Self::run_command(socket, &audio, &context).await,
+            None => Err(AppError::Voice(
+                "realtime session was not available".to_string(),
+            )),
+        };
+        if result.is_err() {
+            *session = None;
+        }
+        result
+    }
+
+    async fn connect(&self) -> Result<RealtimeSocket, AppError> {
+        let url = format!(
+            "{}?model={}",
+            self.endpoint,
+            urlencoding::encode(&self.model)
+        );
+        let mut request = url
+            .into_client_request()
+            .map_err(|_| AppError::Voice("invalid realtime endpoint configuration".to_string()))?;
+        let authorization = HeaderValue::from_str(&format!("Bearer {}", self.api_key))
+            .map_err(|_| AppError::Voice("invalid OpenAI API key format".to_string()))?;
+        request.headers_mut().insert(AUTHORIZATION, authorization);
+        let (mut socket, _) = connect_async(request)
+            .await
+            .map_err(|_| AppError::Voice("failed to connect to realtime service".to_string()))?;
+        send_json(&mut socket, &session_update()).await?;
+        Ok(socket)
+    }
+
+    async fn run_command(
+        socket: &mut RealtimeSocket,
+        audio: &[i16],
+        context: &PlaybackContext,
+    ) -> Result<VoiceIntent, AppError> {
+        for chunk in audio.chunks(AUDIO_CHUNK_SAMPLES) {
+            let mut bytes = Vec::with_capacity(chunk.len() * 2);
+            for sample in chunk {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            send_json(
+                socket,
+                &json!({
+                    "type": "input_audio_buffer.append",
+                    "audio": general_purpose::STANDARD.encode(bytes)
+                }),
+            )
+            .await?;
+        }
+        send_json(socket, &json!({ "type": "input_audio_buffer.commit" })).await?;
+        let context_json = serde_json::to_string(context)
+            .map_err(|_| AppError::Voice("failed to serialize playback context".to_string()))?;
+        send_json(
+            socket,
+            &json!({
+                "type": "response.create",
+                "response": {
+                    "output_modalities": ["text"],
+                    "tool_choice": "required",
+                    "instructions": format!(
+                        "Choose exactly one Spotify tool for the spoken command. Current playback context: {context_json}"
+                    )
+                }
+            }),
+        )
+        .await?;
+
+        let mut progress = CommandProgress::default();
+        loop {
+            let message = socket
+                .next()
+                .await
+                .ok_or_else(|| AppError::Voice("realtime connection dropped".to_string()))?;
+            match message {
+                Ok(Message::Text(text)) => {
+                    progress.consume(&text)?;
+                    if let (Some(transcript), Some(tool)) =
+                        (progress.transcript.as_ref(), progress.tool.as_ref())
+                    {
+                        return Ok(VoiceIntent {
+                            transcript: transcript.clone(),
+                            tool: tool.clone(),
+                        });
+                    }
+                    if progress.response_done && progress.tool.is_none() {
+                        return Err(AppError::Voice(
+                            "model returned no Spotify tool call".to_string(),
+                        ));
+                    }
+                }
+                Ok(Message::Ping(payload)) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|_| AppError::Voice("realtime connection dropped".to_string()))?;
+                }
+                Ok(Message::Close(_)) | Err(_) => {
+                    return Err(AppError::Voice("realtime connection dropped".to_string()));
+                }
+                Ok(Message::Binary(_)) => {
+                    return Err(AppError::Voice(
+                        "realtime service returned an unexpected binary event".to_string(),
+                    ));
+                }
+                Ok(Message::Pong(_) | Message::Frame(_)) => {}
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct CommandProgress {
+    committed_item_id: Option<String>,
+    pending_transcript: Option<(String, String)>,
+    transcript: Option<String>,
+    tool: Option<ToolCall>,
+    response_done: bool,
+}
+
+impl CommandProgress {
+    fn consume(&mut self, text: &str) -> Result<(), AppError> {
+        let event: Value = serde_json::from_str(text)
+            .map_err(|_| AppError::Voice("realtime service returned invalid JSON".to_string()))?;
+        match event.get("type").and_then(Value::as_str) {
+            Some("input_audio_buffer.committed") => {
+                if let Some(item_id) = event.get("item_id").and_then(Value::as_str) {
+                    self.committed_item_id = Some(item_id.to_string());
+                    if self
+                        .pending_transcript
+                        .as_ref()
+                        .is_some_and(|(pending_id, _)| pending_id == item_id)
+                    {
+                        self.transcript = self
+                            .pending_transcript
+                            .take()
+                            .map(|(_, transcript)| transcript);
+                    }
+                }
+            }
+            Some("conversation.item.input_audio_transcription.completed") => {
+                let item_id = required_string(&event, "item_id")?;
+                let transcript = required_string(&event, "transcript")?;
+                if self.committed_item_id.as_deref() == Some(item_id) {
+                    self.transcript = Some(transcript.to_string());
+                } else {
+                    self.pending_transcript = Some((item_id.to_string(), transcript.to_string()));
+                }
+            }
+            Some("response.function_call_arguments.done") => {
+                let name = required_string(&event, "name")?;
+                let arguments = required_string(&event, "arguments")?;
+                self.tool = Some(parse_realtime_tool_call(name, arguments)?);
+            }
+            Some("response.done") => {
+                self.response_done = true;
+                if self.tool.is_none() {
+                    self.tool = tool_from_response_done(&event)?;
+                }
+            }
+            Some("error") => {
+                let message = event
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown realtime service error");
+                return Err(AppError::Voice(format!(
+                    "realtime service error: {message}"
+                )));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn required_string<'a>(event: &'a Value, field: &str) -> Result<&'a str, AppError> {
+    event
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Voice(format!("realtime event is missing string field: {field}")))
+}
+
+fn tool_from_response_done(event: &Value) -> Result<Option<ToolCall>, AppError> {
+    let Some(output) = event.pointer("/response/output").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    for item in output {
+        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+            let name = required_string(item, "name")?;
+            let arguments = required_string(item, "arguments")?;
+            return parse_realtime_tool_call(name, arguments).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn session_update() -> Value {
+    json!({
+        "type": "session.update",
+        "session": {
+            "type": "realtime",
+            "output_modalities": ["text"],
+            "audio": {
+                "input": {
+                    "format": {
+                        "type": "audio/pcm",
+                        "rate": REALTIME_SAMPLE_RATE
+                    },
+                    "transcription": {
+                        "model": TRANSCRIPTION_MODEL
+                    },
+                    "turn_detection": null
+                }
+            },
+            "tools": spotify_tool_schema(),
+            "tool_choice": "auto",
+            "instructions": "Interpret spoken Spotify controls. Use the current playback context to resolve references such as this track or its acoustic version."
+        }
+    })
+}
+
+async fn send_json(socket: &mut RealtimeSocket, value: &Value) -> Result<(), AppError> {
+    let text = serde_json::to_string(value)
+        .map_err(|_| AppError::Voice("failed to serialize realtime event".to_string()))?;
+    socket
+        .send(Message::Text(text.into()))
+        .await
+        .map_err(|_| AppError::Voice("realtime connection dropped".to_string()))
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PlaybackContext {
