@@ -23,3 +23,7 @@ urlencoding = "2"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
