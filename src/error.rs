@@ -15,6 +15,8 @@ pub enum AppError {
     Internal(#[from] anyhow::Error),
     #[error("unauthorized")]
     Unauthorized,
+    #[error("bad request: {0}")]
+    BadRequest(String),
 }
 
 impl IntoResponse for AppError {
@@ -30,6 +32,7 @@ impl IntoResponse for AppError {
                 )
             }
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
         };
 
         let body = Json(json!({ "error": message }));
