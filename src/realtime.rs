@@ -1,6 +1,6 @@
 //! Persistent GPT Realtime session management and audio preparation.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose};
 use futures::{SinkExt, StreamExt};
@@ -20,6 +20,7 @@ use crate::{error::AppError, render::PlaybackState};
 
 const REALTIME_SAMPLE_RATE: u32 = 24_000;
 const AUDIO_CHUNK_SAMPLES: usize = 4_800;
+const COMMAND_DEADLINE: Duration = Duration::from_secs(10);
 const DEFAULT_REALTIME_ENDPOINT: &str = "wss://api.openai.com/v1/realtime";
 const TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
 
@@ -82,6 +83,7 @@ impl RealtimeManager {
             )),
         };
         if result.is_err() {
+            tracing::warn!("realtime command failed; resetting session");
             *session = None;
         }
         result
@@ -143,6 +145,13 @@ impl RealtimeManager {
         )
         .await?;
 
+        match tokio::time::timeout(COMMAND_DEADLINE, Self::receive_intent(socket)).await {
+            Ok(result) => result,
+            Err(_) => Err(AppError::Voice("model timeout".to_string())),
+        }
+    }
+
+    async fn receive_intent(socket: &mut RealtimeSocket) -> Result<VoiceIntent, AppError> {
         let mut progress = CommandProgress::default();
         loop {
             let message = socket
@@ -160,7 +169,7 @@ impl RealtimeManager {
                             tool: tool.clone(),
                         });
                     }
-                    if progress.response_done && progress.tool.is_none() {
+                    if (progress.response_done || progress.text_done) && progress.tool.is_none() {
                         return Err(AppError::Voice(
                             "model returned no Spotify tool call".to_string(),
                         ));
@@ -193,6 +202,7 @@ struct CommandProgress {
     transcript: Option<String>,
     tool: Option<ToolCall>,
     response_done: bool,
+    text_done: bool,
 }
 
 impl CommandProgress {
@@ -234,6 +244,9 @@ impl CommandProgress {
                 if self.tool.is_none() {
                     self.tool = tool_from_response_done(&event)?;
                 }
+            }
+            Some("response.output_text.done") => {
+                self.text_done = true;
             }
             Some("error") => {
                 let message = event
@@ -512,24 +525,25 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(
 mod tests {
     use std::{
         f64::consts::TAU,
+        io::{self, Write},
         sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
-    use base64::{Engine as _, engine::general_purpose};
+    use super::*;
+    use base64::engine::general_purpose;
     use futures::{SinkExt, StreamExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::{
-        WebSocketStream, accept_hdr_async,
+        WebSocketStream, accept_async, accept_hdr_async,
         tungstenite::{
             Message,
             handshake::server::{ErrorResponse, Request, Response},
         },
     };
-
-    use super::*;
 
     #[test]
     fn resampler_has_exact_lengths_for_supported_rates() {
@@ -772,6 +786,108 @@ mod tests {
         assert_eq!(connections.load(Ordering::SeqCst), 2);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn timeout_resets_session_and_manager_reconnects() {
+        let (listener, endpoint) = mock_listener().await;
+        let connections = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let server = tokio::spawn({
+            let connections = connections.clone();
+            let ready = ready.clone();
+            async move {
+                let mut first = accept_mock(&listener, &connections).await;
+                receive_json(&mut first).await;
+                receive_command(&mut first).await;
+                ready.store(true, Ordering::SeqCst);
+                while first.next().await.is_some() {}
+
+                let mut second = accept_mock(&listener, &connections).await;
+                receive_json(&mut second).await;
+                receive_command(&mut second).await;
+                send_success(&mut second, "input-2", "resume", "play", "{}").await;
+            }
+        });
+        let manager = Arc::new(RealtimeManager::with_endpoint(
+            "test-key",
+            "gpt-realtime-mini",
+            endpoint,
+        ));
+        let audio = vec![123_i16; 1_600];
+        let first_command = tokio::spawn({
+            let manager = manager.clone();
+            let audio = audio.clone();
+            async move {
+                manager
+                    .command(
+                        &audio,
+                        16_000,
+                        context("Song", "Artist", PlaybackState::Paused),
+                    )
+                    .await
+            }
+        });
+        while !ready.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(Duration::from_millis(9_999)).await;
+        tokio::task::yield_now().await;
+        assert!(!first_command.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let timeout = first_command.await.unwrap();
+        assert!(matches!(timeout, Err(AppError::Voice(message)) if message == "model timeout"));
+
+        let recovered = manager
+            .command(
+                &audio,
+                16_000,
+                context("Song", "Artist", PlaybackState::Paused),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.tool, ToolCall::Play);
+        server.await.unwrap();
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn diagnostics_never_contain_api_key() {
+        let (listener, endpoint) = mock_listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            receive_json(&mut socket).await;
+            receive_command(&mut socket).await;
+            socket.close(None).await.unwrap();
+        });
+        let secret = "sk-proj-do-not-log-this-value";
+        let manager = RealtimeManager::with_endpoint(secret, "gpt-realtime-mini", endpoint);
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let writer_buffer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedWriter(writer_buffer.clone()))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        let result = manager
+            .command(
+                &[1; 1_600],
+                16_000,
+                context("Song", "Artist", PlaybackState::Playing),
+            )
+            .await;
+        drop(guard);
+        assert!(result.is_err());
+        server.await.unwrap();
+
+        let trace = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(trace.contains("realtime command failed; resetting session"));
+        assert!(!trace.contains(secret));
+        assert!(!format!("{manager:?}").contains(secret));
+    }
+
     async fn mock_listener() -> (TcpListener, String) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}/v1/realtime", listener.local_addr().unwrap());
@@ -909,6 +1025,19 @@ mod tests {
             track: Some(track.to_string()),
             artist: Some(artist.to_string()),
             state,
+        }
+    }
+
+    struct CapturedWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 }
