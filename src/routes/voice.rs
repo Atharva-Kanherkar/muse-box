@@ -88,31 +88,34 @@ pub(crate) async fn post_voice(
     let audio = decode_audio(&content_type, &query, &body)?;
 
     let _guard = state.guard.lock().await;
+    // Armed before `thinking` goes out: if the caller disconnects mid-flight the
+    // handler future is dropped and no `?` or match arm below ever runs, so this
+    // guard is the only thing that can put the display back.
+    let mut thinking = ThinkingGuard::new(state.hub.clone());
     state.hub.publish_thinking().await;
+
+    let outcome = run_voice_command(&state, &audio).await;
+    if outcome.is_err() {
+        // Recovered inline rather than left to the guard, so the follow-up
+        // broadcast is ordered before the response instead of racing it.
+        recover_document(&state.hub).await;
+    }
+    thinking.settle();
+    outcome.map(Json)
+}
+
+async fn run_voice_command(state: &VoiceState, audio: &AudioInput) -> Result<RenderDoc, AppError> {
     let observation = state.hub.published_observation().await;
     let context = PlaybackContext {
         track: observation.track.clone(),
         artist: observation.artist.clone(),
         state: playback_state(&observation),
     };
-    let intent = match state
+    let intent = state
         .model
         .command(&audio.samples, audio.rate, context)
-        .await
-    {
-        Ok(intent) => intent,
-        Err(error) => {
-            recover_document(&state.hub).await;
-            return Err(error);
-        }
-    };
-    let action = match dispatch_tool(&state.spotify, &intent.tool).await {
-        Ok(action) => action,
-        Err(error) => {
-            recover_document(&state.hub).await;
-            return Err(error);
-        }
-    };
+        .await?;
+    let action = dispatch_tool(&state.spotify, &intent.tool).await?;
     state
         .hub
         .append_voice_log(VoiceLogEntry {
@@ -121,19 +124,55 @@ pub(crate) async fn post_voice(
             timestamp: Utc::now(),
         })
         .await;
-    let fresh = match state.spotify.currently_playing().await {
-        Ok(observation) => observation,
-        Err(error) => {
-            recover_document(&state.hub).await;
-            return Err(playback_error(error));
-        }
-    };
-    if let Err(error) = state.hub.force_publish(fresh).await {
-        recover_document(&state.hub).await;
-        return Err(error);
-    }
+    let fresh = state
+        .spotify
+        .currently_playing()
+        .await
+        .map_err(playback_error)?;
+    state.hub.force_publish(fresh).await?;
     let document = state.hub.current_document(RenderParams::default()).await?;
-    Ok(Json(document.as_ref().clone()))
+    Ok(document.as_ref().clone())
+}
+
+/// Restores a real document if a voice request never finishes.
+///
+/// `publish_thinking` only rewrites the cached documents; `published` is left
+/// alone, so the poll loop sees no meaningful change and never republishes. A
+/// playing box (steady progress is not a change) or a paused one would sit on
+/// `thinking` indefinitely.
+struct ThinkingGuard {
+    hub: Arc<StateHub>,
+    settled: bool,
+}
+
+impl ThinkingGuard {
+    fn new(hub: Arc<StateHub>) -> Self {
+        Self {
+            hub,
+            settled: false,
+        }
+    }
+
+    fn settle(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for ThinkingGuard {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let hub = Arc::clone(&self.hub);
+        // Drop cannot await, so the recovery has to outlive this frame.
+        // `try_current` keeps this panic-free if ever dropped off-runtime.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                tracing::warn!("voice request ended before completing; restoring playback state");
+                recover_document(&hub).await;
+            });
+        }
+    }
 }
 
 async fn dispatch_tool(spotify: &SpotifyClient, tool: &ToolCall) -> Result<String, AppError> {
@@ -430,6 +469,124 @@ mod tests {
                     ModelResult::Fail => Err(AppError::Voice("model timeout".to_string())),
                 }
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_still_restores_a_non_thinking_document() {
+        let hub = Arc::new(StateHub::new());
+        // A playing track: steady progress is not a meaningful change, so the
+        // poll loop would never republish and rescue this on its own.
+        hub.force_publish(PlaybackObservation {
+            observed_at: Utc::now(),
+            track_id: Some("track-a".to_string()),
+            track: Some("Song".to_string()),
+            artist: Some("Artist".to_string()),
+            album: Some("Album".to_string()),
+            art_url: None,
+            is_playing: true,
+            progress_ms: 1_000,
+            duration_ms: 300_000,
+        })
+        .await
+        .expect("seed playback");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = routes::router(
+            SpotifyClient::new(SpotifyConfig {
+                client_id: "client".to_string(),
+                client_secret: "secret".to_string(),
+                redirect_uri: "http://localhost/callback".to_string(),
+                token_store_path: PathBuf::from("unused"),
+            }),
+            "device-token".to_string(),
+            hub.clone(),
+            Arc::new(GatedModel {
+                entered: entered.clone(),
+                release,
+                result: ModelResult::Pause,
+            }),
+        );
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/voice?rate=16000&bits=16&ch=1")
+            .header(header::CONTENT_TYPE, "audio/pcm")
+            .header(header::AUTHORIZATION, "Bearer device-token")
+            .body(Body::from(vec![120, 0, 136, 255]))
+            .expect("request");
+        let call = tokio::spawn(async move { app.oneshot(request).await });
+
+        // `thinking` is published and the model is in flight.
+        entered.notified().await;
+        assert!(matches!(
+            hub.current_document(RenderParams::default())
+                .await
+                .expect("thinking document")
+                .state,
+            PlaybackState::Thinking
+        ));
+
+        // The caller goes away: flaky wifi, or a client timeout shorter than the
+        // model deadline.
+        call.abort();
+        let _ = call.await;
+
+        // The guard's recovery runs on its own task, so give it a bounded chance.
+        let mut state = PlaybackState::Thinking;
+        for _ in 0..200 {
+            state = hub
+                .current_document(RenderParams::default())
+                .await
+                .expect("document")
+                .state
+                .clone();
+            if !matches!(state, PlaybackState::Thinking) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            matches!(state, PlaybackState::Playing),
+            "a dropped request must not leave the box stuck: {state:?}"
+        );
+    }
+
+    #[test]
+    fn wav_and_pcm_parsers_never_panic_on_arbitrary_input() {
+        // Deterministic xorshift. A hand-rolled binary parser is exactly where a
+        // slice or arithmetic panic hides, and this endpoint is reachable by any
+        // holder of the device token.
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let valid = wav_fixture(16_000, 1, 1, 16, &[120, -120, 32_767, -32_768]);
+
+        for iteration in 0..20_000 {
+            let mut bytes = if iteration % 3 == 0 {
+                valid.clone()
+            } else {
+                let length = (next() % 96) as usize;
+                (0..length).map(|_| (next() & 0xff) as u8).collect()
+            };
+            if !bytes.is_empty() {
+                for _ in 0..1 + (next() % 4) {
+                    let index = (next() as usize) % bytes.len();
+                    bytes[index] = (next() & 0xff) as u8;
+                }
+            }
+            let _ = decode_wav(&bytes);
+
+            let mut query = HashMap::new();
+            query.insert("rate".to_string(), (next() % 200_000).to_string());
+            query.insert("bits".to_string(), (next() % 64).to_string());
+            query.insert("ch".to_string(), (next() % 8).to_string());
+            let _ = decode_raw_pcm(&query, &bytes);
         }
     }
 
