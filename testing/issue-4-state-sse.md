@@ -12,6 +12,13 @@
 - Artwork is downloaded once per track and dithered once per distinct `(track_id, w, h, dither)` request. Same-parameter subscribers receive identical documents; different dimensions receive correctly sized packed art.
 - Subscriber disconnect only drops its receiver/stream; it never creates or owns a polling task.
 
+### Failure-mode behavior (added during review of PR #10)
+
+- Every outbound HTTP call (Spotify API and artwork CDN) carries a whole-request and connect timeout. reqwest applies no timeout by default, and an accepted-but-silent peer would otherwise hang the poll loop indefinitely while holding the publish guard, blocking new subscribers too.
+- Artwork that cannot be downloaded or decoded never withholds the rest of the document: the publish proceeds with `art: null` so track, artist, and play state still reach clients, and the failure is logged once per attempt rather than failing the publish.
+- An honored `Retry-After` is floored at 5 seconds and capped at 300 seconds, so a garbled upstream header cannot park polling effectively forever.
+- Render-variant registrations are dropped back to the default variant once no subscribers remain, so publishes stop re-dithering art for clients that have disconnected.
+
 ## Unit Tests
 
 - `state::tests::render_params_apply_defaults_and_validate_bounds` — defaults and both valid modes parse; out-of-range, malformed, and unknown values fail.
@@ -26,6 +33,10 @@
 - `state::tests::render_cache_deduplicates_same_params_and_sizes_distinct_params` — two identical requests perform one dither/download; another size has correct packed length.
 - `state::tests::broadcast_fans_out_to_two_subscribers` — two receivers observe the same generation/document.
 - `state::tests::poll_loop_survives_errors_and_respects_retry_after` — paused Tokio time proves 429/5xx do not kill the loop and enforce backoff.
+- `state::tests::art_failure_publishes_document_without_art` — a 500 from the artwork host still publishes and broadcasts, with metadata intact and `art` absent.
+- `state::tests::art_download_timeout_does_not_hang_publish` — a peer that accepts and never answers times out and degrades instead of hanging the publish.
+- `state::tests::registered_variants_are_pruned_when_no_subscribers_remain` — after every subscriber leaves, a publish rebuilds only the default variant.
+- `spotify::tests::retry_after_is_floored_and_capped` — 1s floors to 5s, an absurd value caps at 300s, and a non-numeric header falls back to the default.
 - `routes::state::tests::sse_is_immediate_silent_for_steady_progress_then_emits_changes` — connect through the bearer-protected router against mocked externals; assert initial event, silence, then ordered single change/seek events.
 - `routes::state::tests::state_route_rejects_auth_and_parameter_matrix` — missing/wrong bearer returns 401; invalid width, height, dither, and malformed numbers return JSON 400.
 
