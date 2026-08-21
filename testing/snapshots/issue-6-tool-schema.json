@@ -1,0 +1,104 @@
+[
+  {
+    "type": "function",
+    "name": "play",
+    "description": "Resume the current Spotify playback.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "pause",
+    "description": "Pause the current Spotify playback.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "next",
+    "description": "Skip to the next Spotify track.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "previous",
+    "description": "Return to the previous Spotify track.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "search_and_play",
+    "description": "Search Spotify and immediately play the best matching track.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Spotify search query including useful track and artist details.",
+          "minLength": 1
+        }
+      },
+      "required": ["query"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "queue_search",
+    "description": "Search Spotify and add the best matching track to the queue.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Spotify search query including useful track and artist details.",
+          "minLength": 1
+        }
+      },
+      "required": ["query"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "set_volume",
+    "description": "Set Spotify playback volume to an exact percentage.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "percent": {
+          "type": "integer",
+          "description": "Volume percentage from 0 through 100.",
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "required": ["percent"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "now_playing",
+    "description": "Report the current Spotify track, artist, and playback state.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  }
+]
