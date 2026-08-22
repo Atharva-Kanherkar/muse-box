@@ -87,13 +87,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::taste::TasteIndex;
-
-    /// An empty index: taste search returns nothing and dispatch falls back to
-    /// a plain Spotify search, which is what these tests assert against.
-    fn test_taste() -> Arc<TasteIndex> {
-        Arc::new(TasteIndex::new("test-key", PathBuf::from("unused")))
-    }
 
     #[tokio::test]
     async fn the_stream_is_kept_warm_without_emitting_state_events() {
@@ -247,7 +240,7 @@ mod tests {
     }
 
     fn test_router(hub: Arc<StateHub>) -> Router {
-        routes::router(
+        routes::test_router_with(
             SpotifyClient::new(SpotifyConfig {
                 client_id: "client".to_string(),
                 client_secret: "secret".to_string(),
@@ -257,7 +250,6 @@ mod tests {
             "test-token".to_string(),
             hub,
             Arc::new(routes::voice::FailingVoiceModel),
-            test_taste(),
         )
     }
 

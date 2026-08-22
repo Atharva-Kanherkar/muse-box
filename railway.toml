@@ -2,7 +2,10 @@
 # rather than configured by hand in the dashboard.
 
 [build]
-builder = "NIXPACKS"
+# Explicit: the repo has both a Cargo project and a Node client, and provider
+# detection picks the wrong one.
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
 # /health is bearer-protected by design, so a platform probe pointed at it

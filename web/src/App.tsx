@@ -14,56 +14,13 @@ import {
 } from "./lib/types";
 import { sendControl } from "./lib/voice";
 
-const STORAGE_KEY = "muse-box.connection";
-
-interface Connection {
-  baseUrl: string;
-  token: string;
-}
-
-function loadConnection(): Connection {
-  const fallback: Connection = {
-    baseUrl: import.meta.env.VITE_API_BASE_URL ?? "",
-    token: import.meta.env.VITE_DEVICE_TOKEN ?? "",
-  };
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw) as Partial<Connection>;
-    return {
-      baseUrl: parsed.baseUrl ?? fallback.baseUrl,
-      token: parsed.token ?? fallback.token,
-    };
-  } catch {
-    return fallback;
-  }
-}
-
-/**
- * The deployed backend address, served by this app's own host at runtime, so
- * repointing it is a variable change rather than a rebuild. Never the token:
- * anything served here is public.
- */
-async function fetchServedBaseUrl(): Promise<string> {
-  try {
-    const response = await fetch("/config.json", { cache: "no-store" });
-    if (!response.ok) return "";
-    const body = (await response.json()) as { apiBaseUrl?: string };
-    return body.apiBaseUrl?.trim() ?? "";
-  } catch {
-    // Dev server, or no config route: fall back to whatever was compiled in.
-    return "";
-  }
-}
-
 /**
  * Only trouble gets words. A working stream needs no narration, and labelling
- * it "connecting" every time the page loads made a healthy system look flaky.
+ * it "connecting" on every load made a healthy system look flaky.
  */
 function statusText(status: ConnectionStatus): string | null {
   switch (status.kind) {
     case "open":
-      return null;
     case "idle":
     case "connecting":
       return null;
@@ -120,65 +77,32 @@ function Icon({ shape }: { shape: "prev" | "next" | "play" | "pause" | "gear" })
 }
 
 export default function App() {
-  const [connection, setConnection] = useState<Connection>(loadConnection);
-  const [draft, setDraft] = useState<Connection>(connection);
-  // Undefined until the host has been asked; prevents a flash of the setup
-  // sheet before the served address is known.
-  const [servedBaseUrl, setServedBaseUrl] = useState<string | undefined>(undefined);
   const [doc, setDoc] = useState<RenderDoc | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>({ kind: "idle" });
-  const [setupOpen, setSetupOpen] = useState(false);
   const [progress, setProgress] = useState(0);
   const [busy, setBusy] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
+  const [signingIn, setSigningIn] = useState(false);
   const idleCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    void fetchServedBaseUrl().then((url) => {
-      if (cancelled) return;
-      setServedBaseUrl(url);
-      // Only adopt it when nothing was chosen here, so an explicit override
-      // from the setup sheet still wins.
-      if (url) {
-        setConnection((current) =>
-          current.baseUrl.trim() === "" ? { ...current, baseUrl: url } : current,
-        );
-        setDraft((current) =>
-          current.baseUrl.trim() === "" ? { ...current, baseUrl: url } : current,
-        );
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
+  // Not signed in: the Spotify authorization a person already has to complete
+  // is the login, so send them straight into it. No token, no setup screen.
+  const signIn = useCallback(() => {
+    setSigningIn(true);
+    window.location.href = "/auth/spotify";
   }, []);
 
-  const ready = servedBaseUrl !== undefined;
-  const configured = connection.baseUrl.trim() !== "" && connection.token !== "";
-
   useEffect(() => {
-    if (!configured) {
-      setStatus({ kind: "idle" });
-      return;
-    }
-    let url: string;
-    try {
-      url = stateUrl(connection.baseUrl, DEFAULT_RENDER_PARAMS);
-    } catch {
-      setStatus({ kind: "failed", reason: "Backend URL is not valid" });
-      return;
-    }
     const controller = new AbortController();
     void runStateStream({
-      url,
-      token: connection.token,
+      url: stateUrl(DEFAULT_RENDER_PARAMS),
       onDocument: setDoc,
       onStatus: setStatus,
+      onUnauthorized: signIn,
       signal: controller.signal,
     });
     return () => controller.abort();
-  }, [configured, connection.baseUrl, connection.token]);
+  }, [signIn]);
 
   // The album's own palette drives the whole page.
   useEffect(() => {
@@ -214,10 +138,10 @@ export default function App() {
 
   const control = useCallback(
     (action: "play" | "pause" | "next" | "previous") => {
-      if (busy || !configured) return;
+      if (busy) return;
       setBusy(true);
       setControlError(null);
-      void sendControl(connection.baseUrl, connection.token, action)
+      void sendControl(action)
         .catch((cause: unknown) =>
           setControlError(
             cause instanceof Error ? cause.message : "Control failed",
@@ -225,24 +149,8 @@ export default function App() {
         )
         .finally(() => setBusy(false));
     },
-    [busy, configured, connection.baseUrl, connection.token],
+    [busy],
   );
-
-  function save(event: React.FormEvent) {
-    event.preventDefault();
-    const next: Connection = {
-      baseUrl: draft.baseUrl.trim().replace(/\/+$/, ""),
-      token: draft.token.trim(),
-    };
-    setConnection(next);
-    setDoc(null);
-    setSetupOpen(false);
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-    } catch {
-      // Private browsing: works, just does not persist.
-    }
-  }
 
   const playing = doc?.state === "playing";
   const percent =
@@ -260,14 +168,6 @@ export default function App() {
             {statusText(status)}
           </span>
         ) : null}
-        <button
-          type="button"
-          className="ghost"
-          aria-label="Setup"
-          onClick={() => setSetupOpen(true)}
-        >
-          <Icon shape="gear" />
-        </button>
       </header>
 
       <main className="centerpiece">
@@ -282,7 +182,7 @@ export default function App() {
             />
           ) : (
             <div className="cover-art cover-empty">
-              {configured ? "quiet" : "setup"}
+              {signingIn ? "signing in" : "quiet"}
             </div>
           )}
 
@@ -292,7 +192,7 @@ export default function App() {
                 type="button"
                 className="key"
                 aria-label="Previous track"
-                disabled={!configured || busy}
+                disabled={busy}
                 onClick={() => control("previous")}
               >
                 <Icon shape="prev" />
@@ -301,7 +201,7 @@ export default function App() {
                 type="button"
                 className="key key-main"
                 aria-label={playing ? "Pause" : "Play"}
-                disabled={!configured || busy}
+                disabled={busy}
                 onClick={() => control(playing ? "pause" : "play")}
               >
                 <Icon shape={playing ? "pause" : "play"} />
@@ -310,7 +210,7 @@ export default function App() {
                 type="button"
                 className="key"
                 aria-label="Next track"
-                disabled={!configured || busy}
+                disabled={busy}
                 onClick={() => control("next")}
               >
                 <Icon shape="next" />
@@ -325,10 +225,7 @@ export default function App() {
 
         <div className="titles">
           <h1 className="title">{doc?.track ?? "Nothing playing"}</h1>
-          <p className="byline">
-            {doc?.artist ??
-              (configured ? "say “Muse” to begin" : "add your backend to begin")}
-          </p>
+          <p className="byline">{doc?.artist ?? "say “Muse” to begin"}</p>
           {doc && doc.duration_ms > 0 ? (
             <p className="times">
               {formatDuration(progress)} · {formatDuration(doc.duration_ms)}
@@ -340,55 +237,8 @@ export default function App() {
       </main>
 
       <footer className="dock">
-        <VoiceControl
-          baseUrl={connection.baseUrl}
-          token={connection.token}
-          disabled={!configured}
-        />
+        <VoiceControl />
       </footer>
-
-      {setupOpen || (ready && !configured) ? (
-        <div
-          className="veil-screen"
-          role="dialog"
-          aria-label="Backend setup"
-          onClick={(event) => {
-            if (event.target === event.currentTarget && configured) {
-              setSetupOpen(false);
-            }
-          }}
-        >
-          <form className="sheet" onSubmit={save}>
-            <h2 className="sheet-head">Backend</h2>
-            <label className="field">
-              Address
-              <input
-                type="url"
-                placeholder="https://muse-box.up.railway.app"
-                value={draft.baseUrl}
-                onChange={(event) =>
-                  setDraft({ ...draft, baseUrl: event.target.value })
-                }
-              />
-            </label>
-            <label className="field">
-              Device token
-              <input
-                type="password"
-                placeholder="DEVICE_API_TOKEN"
-                autoComplete="off"
-                value={draft.token}
-                onChange={(event) =>
-                  setDraft({ ...draft, token: event.target.value })
-                }
-              />
-            </label>
-            <button className="controlish" type="submit">
-              Save
-            </button>
-          </form>
-        </div>
-      ) : null}
     </div>
   );
 }

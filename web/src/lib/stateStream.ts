@@ -22,9 +22,10 @@ export type ConnectionStatus =
 
 export interface StateStreamOptions {
   url: string;
-  token: string;
   onDocument: (doc: RenderDoc) => void;
   onStatus: (status: ConnectionStatus) => void;
+  /** Called when the server says we are not signed in. */
+  onUnauthorized: () => void;
   signal: AbortSignal;
 }
 
@@ -107,9 +108,9 @@ async function readStream(
  */
 export async function runStateStream({
   url,
-  token,
   onDocument,
   onStatus,
+  onUnauthorized,
   signal,
 }: StateStreamOptions): Promise<void> {
   let attempt = 0;
@@ -118,13 +119,16 @@ export async function runStateStream({
     onStatus({ kind: "connecting", attempt });
     try {
       const response = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}`, Accept: "text/event-stream" },
+        headers: { Accept: "text/event-stream" },
+        // Same origin, so the session cookie rides along on its own.
+        credentials: "same-origin",
         signal,
         cache: "no-store",
       });
 
       if (response.status === 401) {
-        onStatus({ kind: "failed", reason: "Device token rejected" });
+        // Not signed in: the Spotify authorization doubles as the login.
+        onUnauthorized();
         return;
       }
       if (!response.ok) {
@@ -160,13 +164,15 @@ export async function runStateStream({
   }
 }
 
-export function stateUrl(
-  baseUrl: string,
-  params: { w: number; h: number; dither: string },
-): string {
-  const url = new URL("/state", baseUrl);
-  url.searchParams.set("w", String(params.w));
-  url.searchParams.set("h", String(params.h));
-  url.searchParams.set("dither", params.dither);
-  return url.toString();
+export function stateUrl(params: {
+  w: number;
+  h: number;
+  dither: string;
+}): string {
+  const query = new URLSearchParams({
+    w: String(params.w),
+    h: String(params.h),
+    dither: params.dither,
+  });
+  return `/state?${query.toString()}`;
 }

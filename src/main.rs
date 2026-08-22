@@ -5,6 +5,7 @@ use muse_box::{
     config::Config,
     realtime::RealtimeManager,
     routes,
+    session::SessionStore,
     spotify::{SpotifyClient, SpotifyConfig},
     state::{StateHub, run_idle_scheduler, run_poll_loop},
     taste::{MAX_INDEXED_TRACKS, TasteIndex},
@@ -29,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     let spotify = SpotifyClient::new(SpotifyConfig {
         client_id: config.spotify_client_id,
         client_secret: config.spotify_client_secret,
-        redirect_uri: config.spotify_redirect_uri,
+        redirect_uri: config.spotify_redirect_uri.clone(),
         token_store_path: config.spotify_token_store_path,
     });
 
@@ -98,8 +99,28 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let app = routes::router(spotify, config.device_api_token, state_hub, realtime, taste)
-        .layer(routes::cors_layer(&config.cors_allowed_origins));
+    let sessions = Arc::new(SessionStore::new(config.session_store_path.clone()));
+    match sessions.load().await {
+        Ok(0) => tracing::info!("no browser sessions yet; visit /auth/spotify to sign in"),
+        Ok(count) => tracing::info!(sessions = count, "restored browser sessions"),
+        Err(error) => tracing::warn!(%error, "could not restore browser sessions"),
+    }
+
+    // A Secure cookie is dropped over plain http, which is how local
+    // development is served.
+    let secure_cookies = config.spotify_redirect_uri.starts_with("https://");
+
+    let app = routes::router(routes::RouterConfig {
+        spotify,
+        device_api_token: config.device_api_token,
+        state_hub,
+        voice_model: realtime,
+        taste,
+        sessions,
+        secure_cookies,
+        client_root: config.client_root.clone(),
+    })
+    .layer(routes::cors_layer(&config.cors_allowed_origins));
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("failed to bind server to {bind_addr}"))?;

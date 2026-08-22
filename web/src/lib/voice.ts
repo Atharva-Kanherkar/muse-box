@@ -332,22 +332,19 @@ export async function playSpeech(speech: Speech): Promise<void> {
 
 /** Posts one utterance as raw PCM16 and returns the rebuilt document. */
 export async function sendVoiceCommand(
-  baseUrl: string,
-  token: string,
   utterance: Utterance,
   signal?: AbortSignal,
 ): Promise<RenderDoc & { speech?: Speech }> {
-  const url = new URL("/voice", baseUrl);
-  url.searchParams.set("rate", String(Math.round(utterance.sampleRate)));
-  url.searchParams.set("bits", "16");
-  url.searchParams.set("ch", "1");
+  const query = new URLSearchParams({
+    rate: String(Math.round(utterance.sampleRate)),
+    bits: "16",
+    ch: "1",
+  });
 
-  const response = await fetch(url, {
+  const response = await fetch(`/voice?${query.toString()}`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "audio/pcm",
-    },
+    headers: { "Content-Type": "audio/pcm" },
+    credentials: "same-origin",
     body: utterance.pcm,
     ...(signal ? { signal } : {}),
   });
@@ -368,16 +365,12 @@ export async function sendVoiceCommand(
 /** One transport action from the on-screen player. The updated document
  * arrives over the stream, so the response body is only read for errors. */
 export async function sendControl(
-  baseUrl: string,
-  token: string,
   action: "play" | "pause" | "next" | "previous",
 ): Promise<void> {
-  const response = await fetch(new URL("/control", baseUrl), {
+  const response = await fetch("/control", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
     body: JSON.stringify({ action }),
   });
   if (!response.ok) {

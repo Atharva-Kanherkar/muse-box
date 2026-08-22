@@ -11,6 +11,7 @@ pub mod image;
 pub mod realtime;
 pub mod render;
 pub mod routes;
+pub mod session;
 pub mod spotify;
 pub mod state;
 pub mod taste;

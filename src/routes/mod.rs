@@ -8,19 +8,30 @@ use axum::{
     extract::{FromRef, Query, Request, State},
     http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    services::{ServeDir, ServeFile},
+};
 
-use crate::{error::AppError, spotify::SpotifyClient, state::StateHub, taste::TasteIndex};
+use crate::{
+    error::AppError,
+    session::{self, SessionStore},
+    spotify::SpotifyClient,
+    state::StateHub,
+    taste::TasteIndex,
+};
 
 #[derive(Clone)]
 pub(crate) struct AppState {
     spotify: SpotifyClient,
-    device_api_token: String,
     state_hub: Arc<StateHub>,
+    sessions: Arc<SessionStore>,
+    /// False for local http development, where a Secure cookie would be dropped.
+    secure_cookies: bool,
 }
 
 impl FromRef<AppState> for Arc<StateHub> {
@@ -29,13 +40,39 @@ impl FromRef<AppState> for Arc<StateHub> {
     }
 }
 
-pub fn router(
-    spotify: SpotifyClient,
+#[derive(Clone)]
+struct Credentials {
     device_api_token: String,
-    state_hub: Arc<StateHub>,
-    voice_model: Arc<dyn voice::VoiceModel>,
-    taste: Arc<TasteIndex>,
-) -> Router {
+    sessions: Arc<SessionStore>,
+}
+
+/// Everything the router needs. A struct rather than a parameter list: eight
+/// positional arguments, three of them `Arc`s and one a bare `bool`, is a swap
+/// waiting to happen.
+pub struct RouterConfig {
+    pub spotify: SpotifyClient,
+    pub device_api_token: String,
+    pub state_hub: Arc<StateHub>,
+    pub voice_model: Arc<dyn voice::VoiceModel>,
+    pub taste: Arc<TasteIndex>,
+    pub sessions: Arc<SessionStore>,
+    /// False for local http development, where a Secure cookie is dropped.
+    pub secure_cookies: bool,
+    /// Directory of the built web client, served from this same origin.
+    pub client_root: std::path::PathBuf,
+}
+
+pub fn router(config: RouterConfig) -> Router {
+    let RouterConfig {
+        spotify,
+        device_api_token,
+        state_hub,
+        voice_model,
+        taste,
+        sessions,
+        secure_cookies,
+        client_root,
+    } = config;
     let voice_state = voice::VoiceState {
         taste,
         spotify: spotify.clone(),
@@ -43,10 +80,15 @@ pub fn router(
         hub: state_hub.clone(),
         guard: Arc::new(tokio::sync::Mutex::new(())),
     };
+    let credentials = Credentials {
+        device_api_token: device_api_token.clone(),
+        sessions: sessions.clone(),
+    };
     let state = AppState {
         spotify,
-        device_api_token: device_api_token.clone(),
         state_hub,
+        sessions,
+        secure_cookies,
     };
     let voice_route = Router::new()
         .route("/voice", post(voice::post_voice))
@@ -57,9 +99,15 @@ pub fn router(
         .route("/state", get(state::get_state))
         .merge(voice_route)
         .route_layer(middleware::from_fn_with_state(
-            device_api_token,
-            require_bearer,
+            credentials,
+            require_credentials,
         ));
+
+    // Serving the client from this same origin is what makes a plain
+    // SameSite=Lax cookie work: a separate frontend deployment would be
+    // cross-site, and browsers are actively dropping those cookies.
+    let client =
+        ServeDir::new(&client_root).fallback(ServeFile::new(client_root.join("index.html")));
 
     Router::new()
         .route("/auth/spotify", get(start_spotify_auth))
@@ -70,6 +118,7 @@ pub fn router(
         .route("/healthz", get(healthz))
         .merge(protected)
         .with_state(state)
+        .fallback_service(client)
 }
 
 /// Browser preflight support. Without this every cross-origin `fetch` from a
@@ -91,6 +140,30 @@ pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
+/// Router for tests: an empty taste index, a throwaway session store, and
+/// insecure cookies, so test sites only name what they actually vary.
+#[cfg(test)]
+pub(crate) fn test_router_with(
+    spotify: SpotifyClient,
+    device_api_token: impl Into<String>,
+    state_hub: Arc<StateHub>,
+    voice_model: Arc<dyn voice::VoiceModel>,
+) -> Router {
+    router(RouterConfig {
+        spotify,
+        device_api_token: device_api_token.into(),
+        state_hub,
+        voice_model,
+        taste: Arc::new(TasteIndex::new(
+            "test-key",
+            std::path::PathBuf::from("unused"),
+        )),
+        sessions: Arc::new(SessionStore::new(std::path::PathBuf::from("unused"))),
+        secure_cookies: false,
+        client_root: std::path::PathBuf::from("web/dist"),
+    })
+}
+
 async fn start_spotify_auth(State(state): State<AppState>) -> Result<Response, AppError> {
     let location = state.spotify.authorization_url().await?;
     Ok((StatusCode::FOUND, [(header::LOCATION, location)]).into_response())
@@ -99,7 +172,7 @@ async fn start_spotify_auth(State(state): State<AppState>) -> Result<Response, A
 async fn spotify_callback(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Result<Html<String>, AppError> {
+) -> Result<Response, AppError> {
     let code = query
         .get("code")
         .ok_or_else(|| AppError::BadRequest("missing authorization code".to_string()))?;
@@ -112,10 +185,20 @@ async fn spotify_callback(
         .exchange_authorization_code(code, oauth_state)
         .await?;
 
-    let device_token = escape_html(&state.device_api_token);
-    Ok(Html(format!(
-        "<!doctype html><html><body><h1>Spotify connected</h1><p>Device API token: <code>{device_token}</code></p></body></html>"
-    )))
+    // The authorization a person already has to complete becomes the browser
+    // login, so there is nothing else to set up. The device token is no longer
+    // shown here: hardware reads it from configuration, and putting a secret on
+    // a page invites it into screenshots and history.
+    let handle = state.sessions.issue().await?;
+    let cookie = session::set_cookie_value(&handle, state.secure_cookies);
+    Ok((
+        StatusCode::FOUND,
+        [
+            (header::SET_COOKIE, cookie),
+            (header::LOCATION, "/".to_string()),
+        ],
+    )
+        .into_response())
 }
 
 async fn health() -> Json<Value> {
@@ -126,19 +209,40 @@ async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn require_bearer(
-    State(expected_token): State<String>,
+/// Accepts either credential, because two very different clients call this API.
+///
+/// Hardware carries the device token in a header: it cannot do OAuth and has
+/// nowhere to keep a cookie. A browser carries an `HttpOnly` session cookie and
+/// must never hold the device token, since page JavaScript is public.
+async fn require_credentials(
+    State(credentials): State<Credentials>,
     request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    let authorized = request
-        .headers()
+    let headers = request.headers();
+
+    let bearer_ok = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(bearer_credential)
-        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()));
+        .is_some_and(|token| {
+            constant_time_eq(token.as_bytes(), credentials.device_api_token.as_bytes())
+        });
 
-    if !authorized {
+    let session_ok = if bearer_ok {
+        false
+    } else {
+        match headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(session::session_from_cookie_header)
+        {
+            Some(handle) => credentials.sessions.is_valid(handle).await,
+            None => false,
+        }
+    };
+
+    if !bearer_ok && !session_ok {
         return Err(AppError::Unauthorized);
     }
 
@@ -166,15 +270,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -196,12 +291,6 @@ mod tests {
 
     use super::*;
 
-    /// An empty index: taste search returns nothing and dispatch falls back to
-    /// a plain Spotify search, which is what these tests assert against.
-    fn test_taste() -> Arc<TasteIndex> {
-        Arc::new(TasteIndex::new("test-key", PathBuf::from("unused")))
-    }
-
     fn test_spotify(path: PathBuf) -> SpotifyClient {
         SpotifyClient::new(SpotifyConfig {
             client_id: "client-id".to_string(),
@@ -212,13 +301,71 @@ mod tests {
     }
 
     fn test_router(spotify: SpotifyClient, token: &str) -> Router {
-        router(
+        test_router_with(
             spotify,
-            token.to_string(),
+            token,
             Arc::new(StateHub::new()),
             Arc::new(voice::FailingVoiceModel),
-            test_taste(),
         )
+    }
+
+    #[tokio::test]
+    async fn either_a_session_cookie_or_the_device_token_gets_in() {
+        // Two clients, two credentials: hardware carries the token in a header,
+        // a browser carries an HttpOnly cookie and never holds the token.
+        let sessions = Arc::new(SessionStore::new(
+            tempfile::tempdir().unwrap().path().join("sessions.json"),
+        ));
+        let handle = sessions.issue().await.expect("session");
+        let app = router(RouterConfig {
+            spotify: test_spotify(PathBuf::from("unused")),
+            device_api_token: "device-token".to_string(),
+            state_hub: Arc::new(StateHub::new()),
+            voice_model: Arc::new(voice::FailingVoiceModel),
+            taste: Arc::new(crate::taste::TasteIndex::new("k", PathBuf::from("unused"))),
+            sessions,
+            secure_cookies: false,
+            client_root: PathBuf::from("web/dist"),
+        });
+
+        /// Case name, optional credential header, expected status.
+        type Case = (&'static str, Option<(&'static str, String)>, StatusCode);
+        let cases: [Case; 5] = [
+            ("no credential", None, StatusCode::UNAUTHORIZED),
+            (
+                "hardware bearer",
+                Some(("authorization", "Bearer device-token".to_string())),
+                StatusCode::OK,
+            ),
+            (
+                "browser cookie",
+                Some(("cookie", format!("muse_session={handle}"))),
+                StatusCode::OK,
+            ),
+            (
+                "cookie among others",
+                Some(("cookie", format!("ab=1; muse_session={handle}; cd=2"))),
+                StatusCode::OK,
+            ),
+            (
+                "forged cookie",
+                Some(("cookie", "muse_session=not-a-real-handle".to_string())),
+                StatusCode::UNAUTHORIZED,
+            ),
+        ];
+
+        for (name, credential, expected) in cases {
+            let mut request = Request::builder().uri("/health");
+            if let Some((header_name, value)) = credential {
+                request = request.header(header_name, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), expected, "case: {name}");
+        }
     }
 
     #[tokio::test]
@@ -415,7 +562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_success_returns_provisioning_page() {
+    async fn callback_signs_the_browser_in_without_revealing_the_token() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let calls = Arc::new(AtomicUsize::new(0));
         let token_url = spawn_token_server(calls.clone()).await;
@@ -462,11 +609,30 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
+        // Finishing Spotify authorization signs the browser in and sends it
+        // home. It must not print the device token: a secret on a page ends up
+        // in screenshots and history, and hardware reads it from configuration.
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/")
+        );
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("a session cookie");
+        assert!(cookie.starts_with("muse_session="), "{cookie}");
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+        assert!(!cookie.contains("device-token"), "{cookie}");
+
         let body = to_bytes(response.into_body(), 16 * 1024)
             .await
             .expect("response body");
-        assert!(String::from_utf8_lossy(&body).contains("device-token"));
+        assert!(!String::from_utf8_lossy(&body).contains("device-token"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

@@ -586,12 +586,6 @@ mod tests {
 
     use super::*;
 
-    /// An empty index: taste search returns nothing and dispatch falls back to
-    /// a plain Spotify search, which is what these tests assert against.
-    fn test_taste() -> Arc<TasteIndex> {
-        Arc::new(TasteIndex::new("test-key", PathBuf::from("unused")))
-    }
-
     enum ModelResult {
         Pause,
         Fail,
@@ -658,12 +652,11 @@ mod tests {
 
     async fn voice_response(speech: Option<Speech>) -> Value {
         let spotify = mock_spotify(Arc::new(AtomicUsize::new(0)), false).await;
-        let app = routes::router(
+        let app = routes::test_router_with(
             spotify,
             "device-token".to_string(),
             Arc::new(StateHub::new()),
             Arc::new(SpeakingModel { speech }),
-            test_taste(),
         );
         let response = app
             .oneshot(
@@ -688,13 +681,12 @@ mod tests {
     async fn control_endpoint_drives_playback_without_the_model() {
         let pause_calls = Arc::new(AtomicUsize::new(0));
         let spotify = mock_spotify(pause_calls.clone(), false).await;
-        let app = routes::router(
+        let app = routes::test_router_with(
             spotify,
             "device-token".to_string(),
             Arc::new(StateHub::new()),
             // The model must never be consulted for a button press.
             Arc::new(FailingVoiceModel),
-            test_taste(),
         );
 
         let response = app
@@ -758,12 +750,11 @@ mod tests {
 
         let pause_calls = Arc::new(AtomicUsize::new(0));
         let spotify = mock_spotify(pause_calls.clone(), false).await;
-        let app = routes::router(
+        let app = routes::test_router_with(
             spotify,
             "device-token".to_string(),
             Arc::new(StateHub::new()),
             Arc::new(BystanderModel),
-            test_taste(),
         );
         let response = app
             .oneshot(
@@ -870,7 +861,7 @@ mod tests {
 
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let app = routes::router(
+        let app = routes::test_router_with(
             SpotifyClient::new(SpotifyConfig {
                 client_id: "client".to_string(),
                 client_secret: "secret".to_string(),
@@ -884,7 +875,6 @@ mod tests {
                 release,
                 result: ModelResult::Pause,
             }),
-            test_taste(),
         );
 
         let request = Request::builder()
@@ -970,7 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_rejects_auth_content_type_params_and_body_size_matrix() {
-        let app = routes::router(
+        let app = routes::test_router_with(
             SpotifyClient::new(SpotifyConfig {
                 client_id: "client".to_string(),
                 client_secret: "secret".to_string(),
@@ -980,7 +970,6 @@ mod tests {
             "device-token".to_string(),
             Arc::new(StateHub::new()),
             Arc::new(FailingVoiceModel),
-            test_taste(),
         );
         let cases = [
             (
@@ -1045,9 +1034,13 @@ mod tests {
             token_store_path: PathBuf::from("unused"),
         });
         assert_eq!(
-            dispatch_tool(&spotify, &test_taste(), &ToolCall::NowPlaying)
-                .await
-                .expect("query action"),
+            dispatch_tool(
+                &spotify,
+                &TasteIndex::new("test-key", PathBuf::from("unused")),
+                &ToolCall::NowPlaying
+            )
+            .await
+            .expect("query action"),
             "query:now_playing"
         );
     }
@@ -1113,9 +1106,13 @@ mod tests {
         let mut actions = Vec::new();
         for tool in &tools {
             actions.push(
-                dispatch_tool(&spotify, &test_taste(), tool)
-                    .await
-                    .expect("dispatch"),
+                dispatch_tool(
+                    &spotify,
+                    &TasteIndex::new("test-key", PathBuf::from("unused")),
+                    tool,
+                )
+                .await
+                .expect("dispatch"),
             );
         }
         assert_eq!(
@@ -1178,7 +1175,7 @@ mod tests {
         let hub = Arc::new(StateHub::new());
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let app = routes::router(
+        let app = routes::test_router_with(
             spotify,
             "device-token".to_string(),
             hub,
@@ -1187,7 +1184,6 @@ mod tests {
                 release: release.clone(),
                 result: ModelResult::Pause,
             }),
-            test_taste(),
         );
         let mut events = open_state_stream(&app).await;
         assert_eq!(next_state(&mut events).await["state"], "idle");
@@ -1223,7 +1219,7 @@ mod tests {
         let spotify = mock_spotify(Arc::new(AtomicUsize::new(0)), false).await;
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let app = routes::router(
+        let app = routes::test_router_with(
             spotify,
             "device-token".to_string(),
             Arc::new(StateHub::new()),
@@ -1232,7 +1228,6 @@ mod tests {
                 release: release.clone(),
                 result: ModelResult::Fail,
             }),
-            test_taste(),
         );
         let mut events = open_state_stream(&app).await;
         assert_eq!(next_state(&mut events).await["state"], "idle");
@@ -1265,7 +1260,7 @@ mod tests {
         let spotify = mock_spotify(Arc::new(AtomicUsize::new(0)), true).await;
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let app = routes::router(
+        let app = routes::test_router_with(
             spotify,
             "device-token".to_string(),
             Arc::new(StateHub::new()),
@@ -1274,7 +1269,6 @@ mod tests {
                 release: release.clone(),
                 result: ModelResult::Pause,
             }),
-            test_taste(),
         );
         let mut events = open_state_stream(&app).await;
         let _initial = next_state(&mut events).await;

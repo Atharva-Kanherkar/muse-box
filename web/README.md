@@ -49,16 +49,21 @@ world. Setup hides behind the gear until it is needed.
 
 ## Deploying
 
-`npm run build` then `npm start` — `server.mjs` is a dependency-free static
-server that reads `PORT`, answers `/healthz`, falls back to the shell for
-client-side routes, and refuses paths that escape `dist/`. On Railway it runs as
-its own service with root directory `web`.
+There is no separate frontend deployment. The Rust backend serves `dist/` from
+its own origin, which is what makes a plain `SameSite=Lax` session cookie work —
+a separate origin would be cross-site, and browsers are dropping those cookies.
+The root `Dockerfile` builds this client and the server into one image.
 
-`VITE_API_BASE_URL` is baked in at build time so the backend address never has
-to be typed. The device token is deliberately **not** baked in: `VITE_*` values
-land in the JS bundle, and the bundle is public, so anyone who opened the page
-would inherit control of the Spotify account. It is entered once and kept in
-`localStorage` instead.
+`server.mjs` remains for local static previews and is not used in production.
+
+## No setup, and no token in the browser
+
+There is nothing to configure. The client calls its own origin with relative
+URLs, the session cookie rides along automatically, and a `401` sends the
+browser into `/auth/spotify` — the Spotify authorization you already have to do
+once is the login. The device token never reaches page JavaScript; it exists for
+hardware, which carries it in an `Authorization` header because it cannot do
+OAuth or hold a cookie.
 
 ## Reconnect is still handled
 

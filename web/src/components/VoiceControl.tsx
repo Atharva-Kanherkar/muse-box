@@ -8,11 +8,7 @@ import {
 } from "../lib/voice";
 import { WakeWordListener, wakeWordSupported } from "../lib/wake";
 
-interface Props {
-  baseUrl: string;
-  token: string;
-  disabled: boolean;
-}
+
 
 /**
  * Muse sleeps until it hears its name.
@@ -23,7 +19,7 @@ interface Props {
  * talk button instead, which is honest about the limitation rather than
  * silently streaming the room.
  */
-export function VoiceControl({ baseUrl, token, disabled }: Props) {
+export function VoiceControl() {
   const [phase, setPhase] = useState<ListenerPhase>("stopped");
   const [level, setLevel] = useState(0);
   const [sending, setSending] = useState(false);
@@ -33,21 +29,15 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
 
   const listenerRef = useRef<VoiceListener | null>(null);
   const wakeRef = useRef<WakeWordListener | null>(null);
-  const connectionRef = useRef({ baseUrl, token });
   const inFlightRef = useRef(false);
   const supported = wakeWordSupported();
-
-  useEffect(() => {
-    connectionRef.current = { baseUrl, token };
-  }, [baseUrl, token]);
 
   const handleUtterance = useCallback((utterance: Utterance) => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
     setWoke(false);
     setSending(true);
-    const { baseUrl: url, token: key } = connectionRef.current;
-    void sendVoiceCommand(url, key, utterance)
+    void sendVoiceCommand(utterance)
       .then(async (result) => {
         setError(null);
         if (!result.speech) return;
@@ -74,7 +64,7 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
   }, []);
 
   const start = useCallback(async () => {
-    if (listenerRef.current || disabled) return;
+    if (listenerRef.current) return;
     setError(null);
     const listener = new VoiceListener({
       onUtterance: handleUtterance,
@@ -108,7 +98,7 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
       wake.start();
       wakeRef.current = wake;
     }
-  }, [disabled, handleUtterance, supported]);
+  }, [handleUtterance, supported]);
 
   const stop = useCallback(async () => {
     wakeRef.current?.stop();
@@ -156,7 +146,6 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
         type="button"
         className="controlish"
         data-armed={awake}
-        disabled={disabled}
         onClick={() => void (awake ? stop() : start())}
       >
         {awake ? "Stop" : "Wake on “Muse”"}
