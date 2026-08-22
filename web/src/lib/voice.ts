@@ -1,31 +1,69 @@
 import type { ApiError, RenderDoc } from "./types";
 
 /**
- * Microphone capture for `POST /voice`.
+ * Continuous microphone listening for `POST /voice`.
  *
- * The backend accepts only `audio/wav` and `audio/pcm` — webm/opus is refused
- * on purpose, so `MediaRecorder` is unusable here. We capture float samples
- * through an AudioWorklet, convert to PCM16, and post raw PCM with the mic's
- * own sample rate in the query string. Raw PCM accepts any positive rate, so
- * no client-side resampling is needed; the backend resamples to 24 kHz.
+ * There is no push-to-talk: the listener runs until stopped, segments speech
+ * with energy-based voice-activity detection, and posts each utterance. Muse
+ * decides whether an utterance was aimed at it — speech that was not resolves
+ * to the no-op `now_playing` tool.
+ *
+ * Two format constraints come from the backend: it accepts only `audio/wav` and
+ * `audio/pcm` (webm/opus is refused on purpose, so `MediaRecorder` is unusable),
+ * and raw PCM accepts any positive sample rate, so we send the microphone's own
+ * rate and let the backend resample to 24 kHz.
  */
 
-/** The backend rejects anything longer, so stop before it does. */
-export const MAX_RECORDING_SECONDS = 30;
+/** The backend rejects longer audio, so cut the utterance before it does. */
+export const MAX_UTTERANCE_SECONDS = 30;
+/**
+ * OpenAI's Realtime API refuses a buffer under 100 ms of audio. Sending a
+ * shorter clip produces "buffer too small" rather than anything useful, so
+ * short blips are dropped locally.
+ */
+export const MIN_UTTERANCE_SECONDS = 0.45;
+
+/** Silence needed to call an utterance finished. */
+const TRAILING_SILENCE_SECONDS = 0.8;
+/** Consecutive loud frames needed to open an utterance, to reject clicks. */
+const ONSET_FRAMES = 3;
+/** Speech has to exceed the running noise floor by this factor. */
+const SPEECH_OVER_NOISE = 2.5;
+/** Absolute floor, so a silent room cannot trigger on its own hiss. */
+const MIN_SPEECH_RMS = 0.012;
 
 const WORKLET_SOURCE = `
 class PcmCollector extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buffer = new Float32Array(1024);
+    this.filled = 0;
+  }
   process(inputs) {
     const channel = inputs[0] && inputs[0][0];
-    if (channel && channel.length > 0) {
-      // Copy: the render quantum buffer is reused after this returns.
-      this.port.postMessage(new Float32Array(channel));
+    if (!channel) return true;
+    for (let i = 0; i < channel.length; i += 1) {
+      this.buffer[this.filled++] = channel[i];
+      if (this.filled === this.buffer.length) {
+        // Batch ~21ms at 48kHz instead of posting every 128-sample quantum.
+        this.port.postMessage(this.buffer.slice(0));
+        this.filled = 0;
+      }
     }
     return true;
   }
 }
 registerProcessor("pcm-collector", PcmCollector);
 `;
+
+function rootMeanSquare(frame: Float32Array): number {
+  let sum = 0;
+  for (let index = 0; index < frame.length; index += 1) {
+    const sample = frame[index] ?? 0;
+    sum += sample * sample;
+  }
+  return Math.sqrt(sum / Math.max(frame.length, 1));
+}
 
 function floatToPcm16(chunks: Float32Array[], totalSamples: number): ArrayBuffer {
   const buffer = new ArrayBuffer(totalSamples * 2);
@@ -34,35 +72,48 @@ function floatToPcm16(chunks: Float32Array[], totalSamples: number): ArrayBuffer
   for (const chunk of chunks) {
     for (let index = 0; index < chunk.length; index += 1) {
       const sample = Math.max(-1, Math.min(1, chunk[index] ?? 0));
-      // Asymmetric scaling matches the i16 range without clipping at +1.0.
-      const value = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-      view.setInt16(offset, value, true);
+      // Asymmetric scaling covers the i16 range without clipping at +1.0.
+      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
       offset += 2;
     }
   }
   return buffer;
 }
 
-export interface Recording {
+export interface Utterance {
   pcm: ArrayBuffer;
   sampleRate: number;
   durationSeconds: number;
 }
 
-/**
- * A single push-to-talk session. `stop()` resolves with the captured audio;
- * `cancel()` discards it. Either one releases the microphone.
- */
-export class VoiceRecorder {
+export type ListenerPhase = "stopped" | "listening" | "speaking";
+
+export interface ListenerCallbacks {
+  onUtterance: (utterance: Utterance) => void;
+  onPhase: (phase: ListenerPhase) => void;
+  /** Normalised 0..1 level, for the meter. */
+  onLevel: (level: number) => void;
+  onError: (message: string) => void;
+}
+
+export class VoiceListener {
   private context: AudioContext | null = null;
   private stream: MediaStream | null = null;
   private node: AudioWorkletNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
-  private chunks: Float32Array[] = [];
-  private totalSamples = 0;
-  private stopped = false;
+
+  private speech: Float32Array[] = [];
+  private speechSamples = 0;
+  private silenceSamples = 0;
+  private loudFrames = 0;
+  private noiseFloor = MIN_SPEECH_RMS;
+  private speaking = false;
+  private running = false;
+
+  constructor(private readonly callbacks: ListenerCallbacks) {}
 
   async start(): Promise<void> {
+    if (this.running) return;
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
@@ -82,13 +133,8 @@ export class VoiceRecorder {
     }
 
     this.node = new AudioWorkletNode(context, "pcm-collector");
-    this.node.port.onmessage = (event: MessageEvent<Float32Array>) => {
-      if (this.stopped) return;
-      const maxSamples = context.sampleRate * MAX_RECORDING_SECONDS;
-      if (this.totalSamples >= maxSamples) return;
-      this.chunks.push(event.data);
-      this.totalSamples += event.data.length;
-    };
+    this.node.port.onmessage = (event: MessageEvent<Float32Array>) =>
+      this.consume(event.data, context.sampleRate);
     this.source = context.createMediaStreamSource(this.stream);
     this.source.connect(this.node);
     // The graph only pulls if it reaches the destination, but routing the mic
@@ -97,33 +143,68 @@ export class VoiceRecorder {
     silence.gain.value = 0;
     this.node.connect(silence);
     silence.connect(context.destination);
+
+    this.running = true;
+    this.callbacks.onPhase("listening");
   }
 
-  get elapsedSeconds(): number {
-    if (!this.context) return 0;
-    return this.totalSamples / this.context.sampleRate;
+  private consume(frame: Float32Array, sampleRate: number): void {
+    if (!this.running) return;
+    const level = rootMeanSquare(frame);
+    this.callbacks.onLevel(Math.min(1, level * 12));
+
+    const threshold = Math.max(this.noiseFloor * SPEECH_OVER_NOISE, MIN_SPEECH_RMS);
+    const loud = level > threshold;
+
+    if (!this.speaking) {
+      // Track the room's noise floor only while nobody is talking.
+      this.noiseFloor = this.noiseFloor * 0.95 + level * 0.05;
+      this.loudFrames = loud ? this.loudFrames + 1 : 0;
+      if (this.loudFrames >= ONSET_FRAMES) {
+        this.speaking = true;
+        this.speech = [];
+        this.speechSamples = 0;
+        this.silenceSamples = 0;
+        this.callbacks.onPhase("speaking");
+      } else {
+        return;
+      }
+    }
+
+    this.speech.push(frame);
+    this.speechSamples += frame.length;
+    this.silenceSamples = loud ? 0 : this.silenceSamples + frame.length;
+
+    const trailing = this.silenceSamples / sampleRate >= TRAILING_SILENCE_SECONDS;
+    const tooLong = this.speechSamples / sampleRate >= MAX_UTTERANCE_SECONDS;
+    if (trailing || tooLong) this.finishUtterance(sampleRate);
   }
 
-  async stop(): Promise<Recording | null> {
-    const sampleRate = this.context?.sampleRate ?? 0;
-    const samples = this.totalSamples;
-    const chunks = this.chunks;
-    await this.teardown();
-    if (!sampleRate || samples === 0) return null;
-    return {
+  private finishUtterance(sampleRate: number): void {
+    const chunks = this.speech;
+    const samples = this.speechSamples;
+    this.speaking = false;
+    this.loudFrames = 0;
+    this.speech = [];
+    this.speechSamples = 0;
+    this.silenceSamples = 0;
+    this.callbacks.onPhase("listening");
+
+    const duration = samples / sampleRate;
+    // Anything this short is a door closing or a cough, and the Realtime API
+    // would reject it as too small anyway.
+    if (duration < MIN_UTTERANCE_SECONDS) return;
+    this.callbacks.onUtterance({
       pcm: floatToPcm16(chunks, samples),
       sampleRate,
-      durationSeconds: samples / sampleRate,
-    };
+      durationSeconds: duration,
+    });
   }
 
-  async cancel(): Promise<void> {
-    await this.teardown();
-  }
-
-  private async teardown(): Promise<void> {
-    if (this.stopped) return;
-    this.stopped = true;
+  async stop(): Promise<void> {
+    if (!this.running) return;
+    this.running = false;
+    this.speaking = false;
     if (this.node) {
       this.node.port.onmessage = null;
       this.node.disconnect();
@@ -133,23 +214,25 @@ export class VoiceRecorder {
     if (this.context && this.context.state !== "closed") {
       await this.context.close();
     }
-    this.chunks = [];
+    this.speech = [];
     this.node = null;
     this.source = null;
     this.stream = null;
     this.context = null;
+    this.callbacks.onPhase("stopped");
+    this.callbacks.onLevel(0);
   }
 }
 
-/** Posts raw PCM16 to `/voice` and returns the document the backend rebuilt. */
+/** Posts one utterance as raw PCM16 and returns the rebuilt document. */
 export async function sendVoiceCommand(
   baseUrl: string,
   token: string,
-  recording: Recording,
+  utterance: Utterance,
   signal?: AbortSignal,
 ): Promise<RenderDoc> {
   const url = new URL("/voice", baseUrl);
-  url.searchParams.set("rate", String(Math.round(recording.sampleRate)));
+  url.searchParams.set("rate", String(Math.round(utterance.sampleRate)));
   url.searchParams.set("bits", "16");
   url.searchParams.set("ch", "1");
 
@@ -159,7 +242,7 @@ export async function sendVoiceCommand(
       Authorization: `Bearer ${token}`,
       "Content-Type": "audio/pcm",
     },
-    body: recording.pcm,
+    body: utterance.pcm,
     ...(signal ? { signal } : {}),
   });
 

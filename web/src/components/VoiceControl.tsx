@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  MAX_RECORDING_SECONDS,
-  VoiceRecorder,
+  MIN_UTTERANCE_SECONDS,
+  VoiceListener,
   sendVoiceCommand,
+  type ListenerPhase,
+  type Utterance,
 } from "../lib/voice";
 
 interface Props {
@@ -11,116 +13,126 @@ interface Props {
   disabled: boolean;
 }
 
-type Phase = "ready" | "recording" | "sending";
-
+/**
+ * Always-on listening. One click grants microphone access — browsers will not
+ * open a microphone without a gesture — and after that Muse listens
+ * continuously and decides for itself what was meant for it.
+ */
 export function VoiceControl({ baseUrl, token, disabled }: Props) {
-  const [phase, setPhase] = useState<Phase>("ready");
-  const [elapsed, setElapsed] = useState(0);
+  const [phase, setPhase] = useState<ListenerPhase>("stopped");
+  const [level, setLevel] = useState(0);
+  const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const recorderRef = useRef<VoiceRecorder | null>(null);
-  const timerRef = useRef<number | null>(null);
+  const [lastHeard, setLastHeard] = useState<string | null>(null);
 
-  const clearTimer = useCallback(() => {
-    if (timerRef.current !== null) {
-      window.clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
+  const listenerRef = useRef<VoiceListener | null>(null);
+  // Read inside the utterance handler, which is created once per listener.
+  const connectionRef = useRef({ baseUrl, token });
+  const inFlightRef = useRef(false);
+
+  useEffect(() => {
+    connectionRef.current = { baseUrl, token };
+  }, [baseUrl, token]);
+
+  const handleUtterance = useCallback((utterance: Utterance) => {
+    // The backend serialises voice commands anyway; dropping overlaps here
+    // keeps a burst of speech from queueing up behind a slow model round trip.
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    setSending(true);
+    setLastHeard(`${utterance.durationSeconds.toFixed(1)}s of speech`);
+    const { baseUrl: url, token: key } = connectionRef.current;
+    void sendVoiceCommand(url, key, utterance)
+      .then(() => setError(null))
+      .catch((cause: unknown) =>
+        setError(cause instanceof Error ? cause.message : "Voice command failed"),
+      )
+      .finally(() => {
+        inFlightRef.current = false;
+        setSending(false);
+      });
   }, []);
 
-  const finish = useCallback(async () => {
-    const recorder = recorderRef.current;
-    if (!recorder) return;
-    recorderRef.current = null;
-    clearTimer();
-
-    const recording = await recorder.stop();
-    if (!recording) {
-      setPhase("ready");
-      setError("Nothing was recorded. Hold the button while speaking.");
-      return;
-    }
-
-    setPhase("sending");
-    try {
-      await sendVoiceCommand(baseUrl, token, recording);
-      // The resulting document arrives over the stream, so nothing to apply
-      // here; the response is only useful for surfacing failures.
-      setError(null);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Voice command failed");
-    } finally {
-      setPhase("ready");
-      setElapsed(0);
-    }
-  }, [baseUrl, clearTimer, token]);
-
-  const begin = useCallback(async () => {
-    if (disabled || phase !== "ready") return;
+  const startListening = useCallback(async () => {
+    if (listenerRef.current || disabled) return;
     setError(null);
-    const recorder = new VoiceRecorder();
+    const listener = new VoiceListener({
+      onUtterance: handleUtterance,
+      onPhase: setPhase,
+      onLevel: setLevel,
+      onError: setError,
+    });
     try {
-      await recorder.start();
+      await listener.start();
+      listenerRef.current = listener;
     } catch (cause) {
       const message =
         cause instanceof Error ? cause.message : "Microphone unavailable";
       setError(
-        message.includes("denied") || message.includes("NotAllowed")
-          ? "Microphone permission denied."
+        /denied|NotAllowed/i.test(message)
+          ? "Microphone permission denied. Allow it to let Muse listen."
           : message,
       );
-      return;
     }
-    recorderRef.current = recorder;
-    setPhase("recording");
-    setElapsed(0);
-    timerRef.current = window.setInterval(() => {
-      const seconds = recorder.elapsedSeconds;
-      setElapsed(seconds);
-      // The backend rejects anything past the cap, so send at the boundary
-      // rather than letting the upload be refused.
-      if (seconds >= MAX_RECORDING_SECONDS) void finish();
-    }, 100);
-  }, [disabled, finish, phase]);
+  }, [disabled, handleUtterance]);
+
+  const stopListening = useCallback(async () => {
+    const listener = listenerRef.current;
+    listenerRef.current = null;
+    await listener?.stop();
+  }, []);
 
   useEffect(() => {
     return () => {
-      clearTimer();
-      void recorderRef.current?.cancel();
+      void listenerRef.current?.stop();
+      listenerRef.current = null;
     };
-  }, [clearTimer]);
+  }, []);
 
-  const label =
-    phase === "recording"
-      ? `Recording ${elapsed.toFixed(1)}s — release to send`
-      : phase === "sending"
-        ? "Thinking…"
-        : "Hold to talk";
+  const listening = phase !== "stopped";
+  const statusLine = sending
+    ? "Thinking…"
+    : phase === "speaking"
+      ? "Hearing you…"
+      : listening
+        ? "Listening"
+        : "Not listening";
 
   return (
     <section className="panel">
-      <h2 className="panel-title">Voice</h2>
-      <button
-        type="button"
-        className="talk"
-        data-recording={phase === "recording"}
-        disabled={disabled || phase === "sending"}
-        onPointerDown={(event) => {
-          event.preventDefault();
-          void begin();
-        }}
-        onPointerUp={() => void finish()}
-        onPointerLeave={() => {
-          if (phase === "recording") void finish();
-        }}
-        onPointerCancel={() => void finish()}
-      >
-        {label}
-      </button>
+      <h2 className="panel-title">Muse</h2>
+
+      <div className="listen-row">
+        <button
+          type="button"
+          className="talk"
+          data-recording={phase === "speaking"}
+          disabled={disabled}
+          onClick={() => void (listening ? stopListening() : startListening())}
+        >
+          {listening ? "Stop listening" : "Start listening"}
+        </button>
+      </div>
+
+      <div className="meter" aria-hidden="true">
+        <div
+          className="meter-fill"
+          data-speaking={phase === "speaking"}
+          style={{ width: `${Math.round(level * 100)}%` }}
+        />
+      </div>
+
       <p className="hint">
+        <strong>{statusLine}</strong>
         {disabled
-          ? "Set the backend URL and device token first."
-          : `Raw PCM16 mono, capped at ${MAX_RECORDING_SECONDS}s. Try “pause”, “next”, or “play something calm”.`}
+          ? " — set the backend URL and device token first."
+          : listening
+            ? ` — just talk. Say “Muse, play something calm”. Anything under ${MIN_UTTERANCE_SECONDS}s is ignored, and speech that was not meant for Muse changes nothing.`
+            : " — one click to grant the microphone, then it stays on."}
       </p>
+      {lastHeard && listening ? (
+        <p className="hint">Last sent: {lastHeard}</p>
+      ) : null}
       {error ? <p className="error">{error}</p> : null}
     </section>
   );
