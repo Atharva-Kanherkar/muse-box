@@ -116,10 +116,18 @@ muse-box/
 │       ├── state.rs   # SSE /state
 │       └── voice.rs   # POST /voice
 └── web/               # React/Vite client (phase 1)
+    ├── README.md       # client-specific constraints
     ├── src/
     ├── index.html
     └── package.json
 ```
+
+Run the client with `npm install && npm run dev` in `web/`, then set the backend
+URL and `DEVICE_API_TOKEN` in its Connection panel. Two constraints are
+documented in `web/README.md` and are easy to trip over: `EventSource` cannot
+send the bearer header, so `/state` is read with `fetch` and a `ReadableStream`;
+and `MediaRecorder` only produces webm/opus, which `/voice` rejects, so audio is
+captured through an `AudioWorklet` as PCM16.
 
 ---
 
