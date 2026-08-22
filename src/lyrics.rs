@@ -9,8 +9,18 @@
 //! Clients need no clock negotiation: each line carries an offset into the
 //! track, and the same `progress_ms + (now - server_ts)` that drives the
 //! progress bar picks the current line.
+//!
+//! Shared across every account rather than kept per-account: a track's lyrics
+//! do not depend on who is listening, so the first person to play a song
+//! looks it up for everyone after them. One file per track
+//! (`<store_dir>/<track_id>.json`) rather than one growing blob, so a cache
+//! miss writes a few hundred bytes instead of rewriting every track this
+//! process has ever looked up — the whole-file rewrite this replaced was fine
+//! at "one person's library" and a real write-amplification problem once many
+//! concurrent strangers are missing on many distinct tracks.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::path::{Path, PathBuf};
+use std::{collections::HashMap, ffi::OsString};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -29,8 +39,8 @@ const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (https://github.com/Atharva-Kanherkar/muse-box)"
 );
-/// Tracks to remember. A lookup is cheap but not free, and the same album gets
-/// played through repeatedly.
+/// Tracks to keep hot in memory. The disk store behind it is unbounded — this
+/// only bounds how many avoid a disk read for whatever is currently playing.
 const MAX_CACHED_TRACKS: usize = 256;
 
 /// One lyric line and where it falls in the track.
@@ -62,39 +72,61 @@ struct LrclibResponse {
 /// Looks up lyrics and remembers what it found, including the misses.
 pub struct LyricsIndex {
     http: reqwest::Client,
-    /// `None` marks a track we already know has no lyrics, so a track on repeat
-    /// does not re-ask on every play.
+    get_url: String,
+    search_url: String,
+    /// Hot cache only. `None` marks a track already known to have no lyrics,
+    /// so a track on repeat does not re-ask on every play. The durable copy
+    /// of both is on disk, one file per track, under `store_dir`.
     cache: RwLock<HashMap<String, Option<Lyrics>>>,
-    store_path: PathBuf,
+    store_dir: PathBuf,
 }
 
 impl LyricsIndex {
-    pub fn new(store_path: PathBuf) -> Self {
+    pub fn new(store_dir: PathBuf) -> Self {
         Self {
             http: crate::spotify::http_client(),
+            get_url: LRCLIB_GET_URL.to_string(),
+            search_url: LRCLIB_SEARCH_URL.to_string(),
             cache: RwLock::new(HashMap::new()),
-            store_path,
+            store_dir,
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_urls(store_dir: PathBuf, get_url: String, search_url: String) -> Self {
+        Self {
+            http: crate::spotify::http_client(),
+            get_url,
+            search_url,
+            cache: RwLock::new(HashMap::new()),
+            store_dir,
+        }
+    }
+
+    /// Count tracks already cached on disk, for the boot log. Nothing is read
+    /// into memory: the disk store is the durable copy, and the in-memory map
+    /// is only ever a hot cache for whatever is currently playing, so there is
+    /// nothing to gain by loading every track this process has ever seen.
     pub async fn load(&self) -> usize {
-        let Ok(bytes) = tokio::fs::read(&self.store_path).await else {
+        let Ok(mut entries) = tokio::fs::read_dir(&self.store_dir).await else {
             return 0;
         };
-        match serde_json::from_slice::<HashMap<String, Option<Lyrics>>>(&bytes) {
-            Ok(cache) => {
-                let count = cache.len();
-                *self.cache.write().await = cache;
-                count
-            }
-            Err(error) => {
-                tracing::warn!(%error, "lyrics cache is unreadable; starting empty");
-                0
+        let mut count = 0;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                count += 1;
             }
         }
+        count
     }
 
-    /// Lyrics for a track, from cache or LRCLIB. A miss is remembered as a miss.
+    /// Lyrics for a track, from the hot cache, then disk, then LRCLIB. A
+    /// confirmed miss is cached like a hit; a failed lookup is not, so the
+    /// next play tries again rather than remembering a blip forever.
     pub async fn for_track(
         &self,
         track_id: &str,
@@ -106,6 +138,10 @@ impl LyricsIndex {
         if let Some(cached) = self.cache.read().await.get(track_id) {
             return cached.clone();
         }
+        if let Some(found) = self.read_from_disk(track_id).await {
+            self.remember(track_id, found.clone()).await;
+            return found;
+        }
 
         let found = match self.fetch(track, artist, album, duration_ms).await {
             Ok(found) => found,
@@ -116,20 +152,39 @@ impl LyricsIndex {
                 return None;
             }
         };
+        self.remember(track_id, found.clone()).await;
+        self.persist(track_id, &found).await;
+        found
+    }
 
+    async fn read_from_disk(&self, track_id: &str) -> Option<Option<Lyrics>> {
+        let bytes = tokio::fs::read(self.track_path(track_id)).await.ok()?;
+        // A corrupt single-track file is cheap to lose: it is treated as a
+        // cache miss and looked up again, rather than logged as a failure.
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    async fn remember(&self, track_id: &str, found: Option<Lyrics>) {
         let mut cache = self.cache.write().await;
         if !cache.contains_key(track_id) && cache.len() >= MAX_CACHED_TRACKS {
             cache.clear();
         }
-        cache.insert(track_id.to_string(), found.clone());
-        let snapshot = cache.clone();
-        drop(cache);
+        cache.insert(track_id.to_string(), found);
+    }
 
-        // Best effort: losing the cache costs a lookup, not correctness.
-        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
-            let _ = tokio::fs::write(&self.store_path, bytes).await;
+    /// Best effort: losing this costs a disk read's worth of a re-lookup next
+    /// time this track plays, not correctness.
+    async fn persist(&self, track_id: &str, found: &Option<Lyrics>) {
+        let Ok(bytes) = serde_json::to_vec(found) else {
+            return;
+        };
+        if let Err(error) = write_track_file(&self.track_path(track_id), &bytes).await {
+            tracing::warn!(%error, track_id, "failed to cache lyrics to disk");
         }
-        found
+    }
+
+    fn track_path(&self, track_id: &str) -> PathBuf {
+        self.store_dir.join(format!("{track_id}.json"))
     }
 
     /// Exact lookup first, then fuzzy search.
@@ -160,7 +215,7 @@ impl LyricsIndex {
     ) -> Result<Option<Lyrics>, AppError> {
         let response = self
             .http
-            .get(LRCLIB_GET_URL)
+            .get(&self.get_url)
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .query(&[
                 ("track_name", track),
@@ -197,7 +252,7 @@ impl LyricsIndex {
     ) -> Result<Option<Lyrics>, AppError> {
         let response = self
             .http
-            .get(LRCLIB_SEARCH_URL)
+            .get(&self.search_url)
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .query(&[("track_name", track), ("artist_name", artist)])
             .send()
@@ -213,6 +268,34 @@ impl LyricsIndex {
 
         Ok(pick_best(&results, duration_ms).and_then(into_lyrics))
     }
+}
+
+/// Same discipline as the token store: a fresh sibling temp file is written,
+/// then renamed over the destination, so a crash mid-write leaves either the
+/// old file or the new one, never a half-written one.
+async fn write_track_file(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            AppError::Internal(anyhow::anyhow!(
+                "failed to create lyrics cache directory: {error}"
+            ))
+        })?;
+    }
+    let mut temporary: OsString = path.file_name().unwrap_or_default().to_os_string();
+    temporary.push(".tmp");
+    let temporary = path.with_file_name(temporary);
+    tokio::fs::write(&temporary, bytes).await.map_err(|error| {
+        AppError::Internal(anyhow::anyhow!(
+            "failed to write lyrics cache file: {error}"
+        ))
+    })?;
+    tokio::fs::rename(&temporary, path).await.map_err(|error| {
+        AppError::Internal(anyhow::anyhow!(
+            "failed to commit lyrics cache file: {error}"
+        ))
+    })
 }
 
 /// Prefer a synced result whose length matches the track, then any synced one,
@@ -324,6 +407,14 @@ fn parse_timestamp(stamp: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
+    use serde_json::json;
+
     use super::*;
 
     fn candidate(seconds: Option<f64>, synced: bool) -> LrclibResponse {
@@ -432,5 +523,182 @@ mod tests {
     fn untimed_junk_yields_nothing_rather_than_line_zero() {
         assert!(parse_lrc("just some words\nand more\n").is_empty());
         assert!(parse_lrc("").is_empty());
+    }
+
+    /// A mock LRCLIB: `/get` for the exact lookup, `/search` for the fallback.
+    /// `hits` counts every request either endpoint receives.
+    async fn spawn_lrclib(
+        get_status: StatusCode,
+        get_body: serde_json::Value,
+    ) -> (String, String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let app = Router::new()
+            .route(
+                "/get",
+                get(move || {
+                    let counted = counted.clone();
+                    let status = get_status;
+                    let body = get_body.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        (status, Json(body)).into_response()
+                    }
+                }),
+            )
+            .route("/search", get(|| async { Json(json!([])).into_response() }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock LRCLIB");
+        let address = listener.local_addr().expect("mock LRCLIB address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock LRCLIB");
+        });
+        (
+            format!("http://{address}/get"),
+            format!("http://{address}/search"),
+            hits,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_miss_that_finds_lyrics_writes_exactly_one_track_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (get_url, search_url, hits) = spawn_lrclib(
+            StatusCode::OK,
+            json!({ "plainLyrics": "one\ntwo", "syncedLyrics": null }),
+        )
+        .await;
+        let index =
+            LyricsIndex::with_test_urls(directory.path().to_path_buf(), get_url, search_url);
+
+        let found = index
+            .for_track("track-1", "Song", "Artist", "Album", 200_000)
+            .await
+            .expect("lyrics");
+        assert!(!found.synced);
+        assert_eq!(found.lines.len(), 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let files: Vec<_> = std::fs::read_dir(directory.path())
+            .expect("read cache dir")
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].file_name(), "track-1.json");
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_miss_is_cached_and_not_re_fetched() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (get_url, search_url, hits) = spawn_lrclib(StatusCode::NOT_FOUND, json!({})).await;
+        let index =
+            LyricsIndex::with_test_urls(directory.path().to_path_buf(), get_url, search_url);
+
+        let first = index
+            .for_track("track-2", "Song", "Artist", "Album", 200_000)
+            .await;
+        assert!(first.is_none());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+
+        // Same process, same in-memory cache: must not ask LRCLIB again.
+        let second = index
+            .for_track("track-2", "Song", "Artist", "Album", 200_000)
+            .await;
+        assert!(second.is_none());
+
+        // A fresh index (as if the process restarted), pointed at nothing
+        // reachable, must still find the miss on disk rather than dialing out.
+        let reloaded = LyricsIndex::with_test_urls(
+            directory.path().to_path_buf(),
+            "http://127.0.0.1:1/get".to_string(),
+            "http://127.0.0.1:1/search".to_string(),
+        );
+        let third = reloaded
+            .for_track("track-2", "Song", "Artist", "Album", 200_000)
+            .await;
+        assert!(third.is_none());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the confirmed miss must be served from disk, not looked up again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_network_failure_is_not_cached_so_the_next_play_retries() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        // Nothing is listening on this port, so every request fails.
+        let index = LyricsIndex::with_test_urls(
+            directory.path().to_path_buf(),
+            "http://127.0.0.1:1/get".to_string(),
+            "http://127.0.0.1:1/search".to_string(),
+        );
+
+        let found = index
+            .for_track("track-3", "Song", "Artist", "Album", 200_000)
+            .await;
+        assert!(found.is_none());
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            0,
+            "a failed lookup must not be cached as a confirmed miss"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_counts_track_files_without_populating_the_hot_cache() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        tokio::fs::write(
+            directory.path().join("track-a.json"),
+            serde_json::to_vec(&Some(Lyrics {
+                synced: false,
+                lines: vec![],
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(directory.path().join("track-b.json"), b"null")
+            .await
+            .unwrap();
+        // An orphaned temp file from a crash mid-write must not count.
+        tokio::fs::write(directory.path().join("track-c.json.tmp"), b"null")
+            .await
+            .unwrap();
+
+        let index = LyricsIndex::new(directory.path().to_path_buf());
+        assert_eq!(index.load().await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_pre_seeded_disk_entry_is_served_without_any_network_access() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        tokio::fs::write(
+            directory.path().join("track-a.json"),
+            serde_json::to_vec(&Some(Lyrics {
+                synced: true,
+                lines: vec![LyricLine {
+                    at_ms: 1_000,
+                    text: "hello".to_string(),
+                }],
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        // Points at nothing reachable: this must never be dialed.
+        let index = LyricsIndex::with_test_urls(
+            directory.path().to_path_buf(),
+            "http://127.0.0.1:1/get".to_string(),
+            "http://127.0.0.1:1/search".to_string(),
+        );
+
+        let found = index
+            .for_track("track-a", "Song", "Artist", "Album", 200_000)
+            .await
+            .expect("lyrics served from disk");
+        assert!(found.synced);
+        assert_eq!(found.lines[0].text, "hello");
     }
 }

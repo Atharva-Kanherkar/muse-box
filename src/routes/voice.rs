@@ -3,14 +3,14 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use axum::{
     Json,
     body::to_bytes,
-    extract::{Query, Request, State},
+    extract::{Extension, Query, Request, State},
     http::header,
 };
 use chrono::Utc;
 use serde::Serialize;
-use tokio::sync::Mutex;
 
 use crate::{
+    account::AccountRuntime,
     error::AppError,
     intent::IntentModel,
     realtime::{PlaybackContext, RealtimeManager, Speech, ToolCall, VoiceIntent},
@@ -141,18 +141,37 @@ impl VoiceModel for RealtimeManager {
 
 #[derive(Clone)]
 pub(crate) struct VoiceState {
+    pub(crate) id: crate::account::AccountId,
     pub(crate) taste: Arc<TasteIndex>,
     pub(crate) spotify: SpotifyClient,
     pub(crate) model: Arc<dyn VoiceModel>,
     pub(crate) hub: Arc<StateHub>,
-    pub(crate) guard: Arc<Mutex<()>>,
+    pub(crate) guard: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl VoiceState {
+    /// Everything a handler needs, for one request: the account's own
+    /// Spotify/hub/taste/command-guard, paired with the model, which is the
+    /// only piece every account shares.
+    fn from_runtime(runtime: &AccountRuntime, model: Arc<dyn VoiceModel>) -> Self {
+        Self {
+            id: runtime.id.clone(),
+            taste: runtime.taste.clone(),
+            spotify: runtime.spotify.clone(),
+            model,
+            hub: runtime.hub.clone(),
+            guard: runtime.voice_guard.clone(),
+        }
+    }
 }
 
 pub(crate) async fn post_voice(
-    State(state): State<VoiceState>,
+    State(model): State<Arc<dyn VoiceModel>>,
+    Extension(runtime): Extension<Arc<AccountRuntime>>,
     Query(query): Query<HashMap<String, String>>,
     request: Request,
 ) -> Result<Json<VoiceResponse>, AppError> {
+    let state = VoiceState::from_runtime(&runtime, model);
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -240,6 +259,16 @@ async fn finish_command(
         ToolCall::NowPlaying
     };
     let dispatched = dispatch_tool(&state.spotify, &state.taste, &tool).await?;
+    // The only new observability for the public launch: one line per
+    // command that actually reached the model, so usage against the shared
+    // OpenAI key can be watched per account without a spend cap enforcing
+    // anything on its own.
+    tracing::info!(
+        account = %state.id,
+        action = %dispatched.action,
+        transcript = %intent.transcript,
+        "voice command usage"
+    );
     state
         .hub
         .append_voice_log(VoiceLogEntry {
@@ -512,9 +541,11 @@ pub struct CommandRequest {
 /// again costs latency, money, and a class of audio bugs. Hardware keeps using
 /// `POST /voice`, which takes audio.
 pub(crate) async fn post_command(
-    State(state): State<VoiceState>,
+    State(model): State<Arc<dyn VoiceModel>>,
+    Extension(runtime): Extension<Arc<AccountRuntime>>,
     Json(body): Json<CommandRequest>,
 ) -> Result<Json<VoiceResponse>, AppError> {
+    let state = VoiceState::from_runtime(&runtime, model);
     let transcript = body.transcript.trim().to_string();
     if transcript.is_empty() {
         return Err(AppError::BadRequest(
@@ -559,9 +590,11 @@ pub struct ControlRequest {
 /// voice command, minus the model round trip and the voice log: pressing pause
 /// is not something anyone said.
 pub(crate) async fn post_control(
-    State(state): State<VoiceState>,
+    State(model): State<Arc<dyn VoiceModel>>,
+    Extension(runtime): Extension<Arc<AccountRuntime>>,
     Json(body): Json<ControlRequest>,
 ) -> Result<Json<RenderDoc>, AppError> {
+    let state = VoiceState::from_runtime(&runtime, model);
     let tool = match body.action.as_str() {
         "play" => ToolCall::Play,
         "pause" => ToolCall::Pause,
@@ -883,7 +916,8 @@ mod tests {
             "device-token".to_string(),
             Arc::new(StateHub::new()),
             Arc::new(SpeakingModel { speech }),
-        );
+        )
+        .await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -938,7 +972,8 @@ mod tests {
             "device-token",
             Arc::new(StateHub::new()),
             Arc::new(TextModel),
-        );
+        )
+        .await;
 
         let post = |body: &'static str| {
             let app = app.clone();
@@ -990,7 +1025,8 @@ mod tests {
             Arc::new(StateHub::new()),
             // The model must never be consulted for a button press.
             Arc::new(FailingVoiceModel),
-        );
+        )
+        .await;
 
         let response = app
             .clone()
@@ -1058,7 +1094,8 @@ mod tests {
             "device-token".to_string(),
             Arc::new(StateHub::new()),
             Arc::new(BystanderModel),
-        );
+        )
+        .await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -1226,7 +1263,8 @@ mod tests {
                 release,
                 result: ModelResult::Pause,
             }),
-        );
+        )
+        .await;
 
         let request = Request::builder()
             .method("POST")
@@ -1321,7 +1359,8 @@ mod tests {
             "device-token".to_string(),
             Arc::new(StateHub::new()),
             Arc::new(FailingVoiceModel),
-        );
+        )
+        .await;
         let cases = [
             (
                 Request::builder()
@@ -1538,7 +1577,8 @@ mod tests {
                 release: release.clone(),
                 result: ModelResult::Pause,
             }),
-        );
+        )
+        .await;
         let mut events = open_state_stream(&app).await;
         assert_eq!(next_state(&mut events).await["state"], "idle");
 
@@ -1582,7 +1622,8 @@ mod tests {
                 release: release.clone(),
                 result: ModelResult::Fail,
             }),
-        );
+        )
+        .await;
         let mut events = open_state_stream(&app).await;
         assert_eq!(next_state(&mut events).await["state"], "idle");
 
@@ -1623,7 +1664,8 @@ mod tests {
                 release: release.clone(),
                 result: ModelResult::Pause,
             }),
-        );
+        )
+        .await;
         let mut events = open_state_stream(&app).await;
         let _initial = next_state(&mut events).await;
 

@@ -384,6 +384,7 @@ body {
 .key:focus-visible,
 .ghost:focus-visible,
 .controlish:focus-visible,
+.connect:focus-visible,
 input:focus-visible {
   outline: 2px solid var(--album-accent);
   outline-offset: 2px;
@@ -424,6 +425,54 @@ input:focus-visible {
   margin: 0;
   color: var(--ink-muted);
   font-size: 0.9375rem;
+}
+
+/* ---------- sign-in pitch ---------- */
+
+.pitch {
+  display: grid;
+  gap: 20px;
+  justify-items: center;
+}
+
+.pitch .byline {
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+.connect {
+  border: 1px solid var(--album-accent);
+  border-radius: 999px;
+  padding: 13px 30px;
+  background: color-mix(in oklab, var(--album-accent) 22%, rgb(0 0 0 / 0.5));
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    transform 140ms ease;
+}
+
+.connect:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--album-accent) 34%, rgb(0 0 0 / 0.5));
+  transform: scale(1.03);
+}
+
+.connect:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.fineprint {
+  margin: 0;
+  max-width: 46ch;
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+  line-height: 1.5;
 }
 
 .times {

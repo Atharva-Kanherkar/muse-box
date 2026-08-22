@@ -9,7 +9,11 @@ pub struct Config {
     pub spotify_client_id: String,
     pub spotify_client_secret: String,
     pub spotify_redirect_uri: String,
-    pub spotify_token_store_path: PathBuf,
+    /// Where the single-tenant install used to keep its one Spotify token.
+    /// Read only once, at boot, to migrate that account into
+    /// `accounts_root`; every account's own client uses a path under
+    /// `accounts_root` instead.
+    pub legacy_token_store_path: PathBuf,
     pub openai_api_key: String,
     pub openai_realtime_model: String,
     /// Model that turns a transcript into one tool call. Stateless chat
@@ -26,18 +30,26 @@ pub struct Config {
     /// keeps idle goldens deterministic.
     pub idle_display_offset: FixedOffset,
     /// Browser origins allowed to call the API. Empty means any origin, which
-    /// is safe here because auth is a bearer token rather than a cookie, so
-    /// there is no ambient credential for another site to ride on.
+    /// is safe here because auth is a bearer token or session cookie rather
+    /// than an ambient credential another site could ride on.
     pub cors_allowed_origins: Vec<String>,
-    /// Where the embedded music-taste index lives. Belongs on the same volume
-    /// as the token store so a redeploy does not re-embed the whole library.
-    pub taste_index_path: PathBuf,
+    /// Where the single-tenant install used to keep its one taste index. Read
+    /// only once, at boot, alongside `legacy_token_store_path`.
+    pub legacy_taste_index_path: PathBuf,
+    /// Directory holding one subdirectory per account: that account's own
+    /// Spotify token and taste index. The only per-account state on disk.
+    pub accounts_root: PathBuf,
+    /// Which account the hardware bearer token resolves to. Whoever completes
+    /// OAuth first — or whoever the legacy install migrates in — keeps this
+    /// permanently.
+    pub owner_marker_path: PathBuf,
     /// Where browser sessions are persisted, so a redeploy does not sign anyone
-    /// out. Belongs on the same volume as the token store.
+    /// out. Shared across every account; a cookie's value now carries which
+    /// account signed it in.
     pub session_store_path: PathBuf,
-    /// Cached lyrics, including known misses, so a track on repeat is looked up
-    /// once. Belongs on the volume with everything else.
-    pub lyrics_cache_path: PathBuf,
+    /// Directory of cached lyrics, one file per track, shared across every
+    /// account: the first person to play a song looks it up for everyone.
+    pub lyrics_cache_dir: PathBuf,
     /// Directory of the built web client, served from this same origin.
     pub client_root: PathBuf,
 }
@@ -56,7 +68,7 @@ impl Config {
                 .context("SPOTIFY_CLIENT_SECRET is required")?,
             spotify_redirect_uri: std::env::var("SPOTIFY_REDIRECT_URI")
                 .unwrap_or_else(|_| "http://localhost:3000/auth/spotify/callback".to_string()),
-            spotify_token_store_path: std::env::var("TOKEN_STORE_PATH")
+            legacy_token_store_path: std::env::var("TOKEN_STORE_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("./data/spotify_token.json")),
             openai_api_key: std::env::var("OPENAI_API_KEY")
@@ -74,15 +86,21 @@ impl Config {
             device_api_token: std::env::var("DEVICE_API_TOKEN")
                 .unwrap_or_else(|_| "dev-token-change-me".to_string()),
             idle_display_offset: idle_display_offset()?,
-            taste_index_path: std::env::var("TASTE_INDEX_PATH")
+            legacy_taste_index_path: std::env::var("TASTE_INDEX_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("./data/taste_index.json")),
+            accounts_root: std::env::var("ACCOUNTS_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("./data/accounts")),
+            owner_marker_path: std::env::var("OWNER_MARKER_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("./data/owner_account_id.txt")),
             session_store_path: std::env::var("SESSION_STORE_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("./data/sessions.json")),
-            lyrics_cache_path: std::env::var("LYRICS_CACHE_PATH")
+            lyrics_cache_dir: std::env::var("LYRICS_CACHE_PATH")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("./data/lyrics.json")),
+                .unwrap_or_else(|_| PathBuf::from("./data/lyrics")),
             client_root: std::env::var("CLIENT_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("./web/dist")),

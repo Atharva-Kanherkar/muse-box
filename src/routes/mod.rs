@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::{FromRef, Query, Request, State},
+    extract::{Query, Request, State},
     http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -18,43 +18,47 @@ use tower_http::{
 };
 
 use crate::{
+    account::{AccountId, AccountRegistry, OwnerMarker},
     error::AppError,
     session::{self, SessionStore},
     spotify::SpotifyClient,
-    state::StateHub,
-    taste::TasteIndex,
 };
 
+/// Everything shared across every account, needed to run the OAuth entry
+/// points and resolve which account a request belongs to. Per-account state
+/// (`SpotifyClient`, `StateHub`, `TasteIndex`) lives behind `registry`
+/// instead, resolved per request — see [`AccountRuntime`].
 #[derive(Clone)]
 pub(crate) struct AppState {
-    spotify: SpotifyClient,
-    state_hub: Arc<StateHub>,
+    /// Runs the OAuth dance only: `authorization_url` and
+    /// `exchange_code_for_tokens`. Shared across every visitor signing in
+    /// concurrently, and deliberately never the thing that persists a token —
+    /// see that method's doc comment.
+    oauth: SpotifyClient,
+    registry: Arc<AccountRegistry>,
+    owner: Arc<OwnerMarker>,
     sessions: Arc<SessionStore>,
     /// False for local http development, where a Secure cookie would be dropped.
     secure_cookies: bool,
-}
-
-impl FromRef<AppState> for Arc<StateHub> {
-    fn from_ref(state: &AppState) -> Self {
-        state.state_hub.clone()
-    }
 }
 
 #[derive(Clone)]
 struct Credentials {
     device_api_token: String,
     sessions: Arc<SessionStore>,
+    registry: Arc<AccountRegistry>,
+    owner: Arc<OwnerMarker>,
 }
 
 /// Everything the router needs. A struct rather than a parameter list: eight
-/// positional arguments, three of them `Arc`s and one a bare `bool`, is a swap
-/// waiting to happen.
+/// positional arguments, several of them `Arc`s and one a bare `bool`, is a
+/// swap waiting to happen.
 pub struct RouterConfig {
-    pub spotify: SpotifyClient,
+    pub oauth: SpotifyClient,
     pub device_api_token: String,
-    pub state_hub: Arc<StateHub>,
+    pub registry: Arc<AccountRegistry>,
+    pub owner: Arc<OwnerMarker>,
     pub voice_model: Arc<dyn voice::VoiceModel>,
-    pub taste: Arc<TasteIndex>,
     pub sessions: Arc<SessionStore>,
     /// False for local http development, where a Secure cookie is dropped.
     pub secure_cookies: bool,
@@ -64,37 +68,36 @@ pub struct RouterConfig {
 
 pub fn router(config: RouterConfig) -> Router {
     let RouterConfig {
-        spotify,
+        oauth,
         device_api_token,
-        state_hub,
+        registry,
+        owner,
         voice_model,
-        taste,
         sessions,
         secure_cookies,
         client_root,
     } = config;
-    let voice_state = voice::VoiceState {
-        taste,
-        spotify: spotify.clone(),
-        model: voice_model,
-        hub: state_hub.clone(),
-        guard: Arc::new(tokio::sync::Mutex::new(())),
-    };
     let credentials = Credentials {
         device_api_token: device_api_token.clone(),
         sessions: sessions.clone(),
+        registry: registry.clone(),
+        owner: owner.clone(),
     };
     let state = AppState {
-        spotify,
-        state_hub,
+        oauth,
+        registry,
+        owner,
         sessions,
         secure_cookies,
     };
+    // The voice routes' only shared, router-level state is the model: every
+    // other piece they need (Spotify, the state hub, taste) comes from the
+    // account the auth middleware resolved, via the `Extension` it inserts.
     let voice_route = Router::new()
         .route("/voice", post(voice::post_voice))
         .route("/control", post(voice::post_control))
         .route("/command", post(voice::post_command))
-        .with_state(voice_state);
+        .with_state(voice_model);
     let protected = Router::new()
         .route("/health", get(health))
         .route("/state", get(state::get_state))
@@ -141,24 +144,39 @@ pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
-/// Router for tests: an empty taste index, a throwaway session store, and
-/// insecure cookies, so test sites only name what they actually vary.
+/// Router for tests: a single pre-warmed "test-owner" account already holding
+/// `spotify`/`state_hub`, an empty taste index, a throwaway session store, and
+/// insecure cookies — so test sites only name what they actually vary. The
+/// same `spotify` also backs the OAuth entry points, which no caller of this
+/// helper exercises.
 #[cfg(test)]
-pub(crate) fn test_router_with(
+pub(crate) async fn test_router_with(
     spotify: SpotifyClient,
     device_api_token: impl Into<String>,
-    state_hub: Arc<StateHub>,
+    state_hub: Arc<crate::state::StateHub>,
     voice_model: Arc<dyn voice::VoiceModel>,
 ) -> Router {
+    let owner_id = AccountId::new("test-owner");
+    let registry = Arc::new(AccountRegistry::new(
+        crate::account::RegistryConfig::for_test(),
+    ));
+    registry
+        .insert_for_test(crate::account::AccountRuntime::for_test(
+            owner_id.clone(),
+            spotify.clone(),
+            state_hub,
+            Arc::new(crate::taste::TasteIndex::new(
+                "test-key",
+                std::path::PathBuf::from("unused"),
+            )),
+        ))
+        .await;
     router(RouterConfig {
-        spotify,
+        oauth: spotify,
         device_api_token: device_api_token.into(),
-        state_hub,
+        registry,
+        owner: Arc::new(OwnerMarker::for_test(owner_id)),
         voice_model,
-        taste: Arc::new(TasteIndex::new(
-            "test-key",
-            std::path::PathBuf::from("unused"),
-        )),
         sessions: Arc::new(SessionStore::new(std::path::PathBuf::from("unused"))),
         secure_cookies: false,
         client_root: std::path::PathBuf::from("web/dist"),
@@ -166,7 +184,7 @@ pub(crate) fn test_router_with(
 }
 
 async fn start_spotify_auth(State(state): State<AppState>) -> Result<Response, AppError> {
-    let location = state.spotify.authorization_url().await?;
+    let location = state.oauth.authorization_url().await?;
     Ok((StatusCode::FOUND, [(header::LOCATION, location)]).into_response())
 }
 
@@ -181,16 +199,27 @@ async fn spotify_callback(
         .get("state")
         .ok_or_else(|| AppError::BadRequest("missing OAuth state".to_string()))?;
 
-    state
-        .spotify
-        .exchange_authorization_code(code, oauth_state)
+    let tokens = state
+        .oauth
+        .exchange_code_for_tokens(code, oauth_state)
         .await?;
+    let account_id = AccountId::new(
+        state
+            .oauth
+            .user_for_access_token(&tokens.access_token)
+            .await?,
+    );
+    let runtime = state.registry.get_or_create(&account_id).await;
+    runtime.spotify.adopt_tokens(tokens).await?;
+    // Whoever completes this first, on a fresh install, becomes the account
+    // the hardware bearer token resolves to. A no-op for every later login.
+    state.owner.claim(&account_id).await?;
 
     // The authorization a person already has to complete becomes the browser
     // login, so there is nothing else to set up. The device token is no longer
     // shown here: hardware reads it from configuration, and putting a secret on
     // a page invites it into screenshots and history.
-    let handle = state.sessions.issue().await?;
+    let handle = state.sessions.issue(account_id).await?;
     let cookie = session::set_cookie_value(&handle, state.secure_cookies);
     Ok((
         StatusCode::FOUND,
@@ -215,9 +244,15 @@ async fn healthz() -> Json<Value> {
 /// Hardware carries the device token in a header: it cannot do OAuth and has
 /// nowhere to keep a cookie. A browser carries an `HttpOnly` session cookie and
 /// must never hold the device token, since page JavaScript is public.
+///
+/// Either way, resolving *which* account the request belongs to happens here,
+/// once: the bearer path always resolves to the owner account, the cookie path
+/// to whichever account signed that session in. The resolved
+/// `Arc<AccountRuntime>` is stashed as a request extension so every downstream
+/// handler reads it without repeating this lookup.
 async fn require_credentials(
     State(credentials): State<Credentials>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
     let headers = request.headers();
@@ -230,22 +265,27 @@ async fn require_credentials(
             constant_time_eq(token.as_bytes(), credentials.device_api_token.as_bytes())
         });
 
-    let session_ok = if bearer_ok {
-        false
+    let account_id = if bearer_ok {
+        // Matches the device token but nobody has ever completed OAuth on
+        // this install yet: there is no account to serve state for.
+        credentials.owner.get().await
     } else {
         match headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok())
             .and_then(session::session_from_cookie_header)
         {
-            Some(handle) => credentials.sessions.is_valid(handle).await,
-            None => false,
+            Some(handle) => credentials.sessions.account_for(handle).await,
+            None => None,
         }
     };
 
-    if !bearer_ok && !session_ok {
+    let Some(account_id) = account_id else {
         return Err(AppError::Unauthorized);
-    }
+    };
+
+    let runtime = credentials.registry.get_or_create(&account_id).await;
+    request.extensions_mut().insert(runtime);
 
     Ok(next.run(request).await.into_response())
 }
@@ -288,7 +328,11 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use crate::spotify::SpotifyConfig;
+    use crate::{
+        account::{AccountRuntime, RegistryConfig},
+        spotify::SpotifyConfig,
+        state::StateHub,
+    };
 
     use super::*;
 
@@ -301,29 +345,43 @@ mod tests {
         })
     }
 
-    fn test_router(spotify: SpotifyClient, token: &str) -> Router {
+    async fn test_router(spotify: SpotifyClient, token: &str) -> Router {
         test_router_with(
             spotify,
             token,
             Arc::new(StateHub::new()),
             Arc::new(voice::FailingVoiceModel),
         )
+        .await
     }
 
     #[tokio::test]
     async fn either_a_session_cookie_or_the_device_token_gets_in() {
         // Two clients, two credentials: hardware carries the token in a header,
-        // a browser carries an HttpOnly cookie and never holds the token.
+        // a browser carries an HttpOnly cookie and never holds the token. The
+        // cookie names a different account than the bearer's owner, so this
+        // also proves the two paths resolve independently.
         let sessions = Arc::new(SessionStore::new(
             tempfile::tempdir().unwrap().path().join("sessions.json"),
         ));
-        let handle = sessions.issue().await.expect("session");
+        let owner_id = AccountId::new("owner-account");
+        let browser_id = AccountId::new("browser-account");
+        let handle = sessions.issue(browser_id).await.expect("session");
+        let registry = Arc::new(AccountRegistry::new(RegistryConfig::for_test()));
+        registry
+            .insert_for_test(AccountRuntime::for_test(
+                owner_id.clone(),
+                test_spotify(PathBuf::from("unused")),
+                Arc::new(StateHub::new()),
+                Arc::new(crate::taste::TasteIndex::new("k", PathBuf::from("unused"))),
+            ))
+            .await;
         let app = router(RouterConfig {
-            spotify: test_spotify(PathBuf::from("unused")),
+            oauth: test_spotify(PathBuf::from("unused")),
             device_api_token: "device-token".to_string(),
-            state_hub: Arc::new(StateHub::new()),
+            registry,
+            owner: Arc::new(OwnerMarker::for_test(owner_id)),
             voice_model: Arc::new(voice::FailingVoiceModel),
-            taste: Arc::new(crate::taste::TasteIndex::new("k", PathBuf::from("unused"))),
             sessions,
             secure_cookies: false,
             client_root: PathBuf::from("web/dist"),
@@ -374,6 +432,7 @@ mod tests {
         // A browser sends OPTIONS before any request carrying Authorization.
         // Without the layer this 405s and the real request is never sent.
         let app = test_router(test_spotify(PathBuf::from("unused")), "right-token")
+            .await
             .layer(cors_layer(&[]));
         let response = app
             .oneshot(
@@ -408,6 +467,7 @@ mod tests {
     #[tokio::test]
     async fn cors_restricts_to_configured_origins_when_set() {
         let app = test_router(test_spotify(PathBuf::from("unused")), "right-token")
+            .await
             .layer(cors_layer(&["https://box.example".to_string()]));
         let response = app
             .oneshot(
@@ -434,7 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_needs_no_token_but_health_still_does() {
-        let app = test_router(test_spotify(PathBuf::from("unused")), "right-token");
+        let app = test_router(test_spotify(PathBuf::from("unused")), "right-token").await;
 
         let open = app
             .clone()
@@ -463,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_middleware_rejects_missing_and_wrong_tokens() {
-        let app = test_router(test_spotify(PathBuf::from("unused")), "right-token");
+        let app = test_router(test_spotify(PathBuf::from("unused")), "right-token").await;
 
         for authorization in [None, Some("Bearer wrong-token")] {
             let mut request = Request::builder().uri("/health");
@@ -508,7 +568,7 @@ mod tests {
         assert!(!constant_time_eq(b"short", b"shorter"));
 
         // A lowercase scheme from a hand-rolled device client must be accepted.
-        let app = test_router(test_spotify(PathBuf::from("unused")), "right-token");
+        let app = test_router(test_spotify(PathBuf::from("unused")), "right-token").await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -523,10 +583,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bearer_resolves_to_the_owner_account_even_before_anyone_logs_in() {
+        // A fresh install: nobody has ever completed OAuth, so there is no
+        // owner yet. The device token still matches, but there is no account
+        // to serve, so this must 401 rather than panicking or inventing one.
+        let registry = Arc::new(AccountRegistry::new(RegistryConfig::for_test()));
+        let owner = Arc::new(OwnerMarker::for_test_unclaimed());
+        let app = router(RouterConfig {
+            oauth: test_spotify(PathBuf::from("unused")),
+            device_api_token: "device-token".to_string(),
+            registry,
+            owner,
+            voice_model: Arc::new(voice::FailingVoiceModel),
+            sessions: Arc::new(SessionStore::new(PathBuf::from("unused"))),
+            secure_cookies: false,
+            client_root: PathBuf::from("web/dist"),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::AUTHORIZATION, "Bearer device-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn callback_rejects_bad_state_without_token_request() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let token_url = spawn_token_server(calls.clone()).await;
-        let spotify = SpotifyClient::with_test_endpoints(
+        let (token_url, api_base_url) = spawn_token_server(calls.clone()).await;
+        let spotify = SpotifyClient::with_all_test_endpoints(
             SpotifyConfig {
                 client_id: "client-id".to_string(),
                 client_secret: "client-secret".to_string(),
@@ -535,8 +625,9 @@ mod tests {
             },
             "https://accounts.spotify.com/authorize".to_string(),
             token_url,
+            api_base_url,
         );
-        let app = test_router(spotify, "device-token");
+        let app = test_router(spotify, "device-token").await;
 
         for uri in [
             "/auth/spotify/callback?code=code",
@@ -566,8 +657,8 @@ mod tests {
     async fn callback_signs_the_browser_in_without_revealing_the_token() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let calls = Arc::new(AtomicUsize::new(0));
-        let token_url = spawn_token_server(calls.clone()).await;
-        let spotify = SpotifyClient::with_test_endpoints(
+        let (token_url, api_base_url) = spawn_token_server(calls.clone()).await;
+        let spotify = SpotifyClient::with_all_test_endpoints(
             SpotifyConfig {
                 client_id: "client-id".to_string(),
                 client_secret: "client-secret".to_string(),
@@ -576,8 +667,9 @@ mod tests {
             },
             "https://accounts.spotify.com/authorize".to_string(),
             token_url,
+            api_base_url,
         );
-        let app = test_router(spotify, "device-token");
+        let app = test_router(spotify, "device-token").await;
         let start = app
             .clone()
             .oneshot(
@@ -637,21 +729,25 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    async fn spawn_token_server(calls: Arc<AtomicUsize>) -> String {
-        let app = Router::new().route(
-            "/token",
-            post(move || {
-                let calls = calls.clone();
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Json(json!({
-                        "access_token": "access-token",
-                        "refresh_token": "refresh-token",
-                        "expires_in": 3600
-                    }))
-                }
-            }),
-        );
+    /// A mock Spotify: `/token` for the code exchange, `/me` for the identity
+    /// lookup the callback makes right after. Returns `(token_url, api_base_url)`.
+    async fn spawn_token_server(calls: Arc<AtomicUsize>) -> (String, String) {
+        let app = Router::new()
+            .route(
+                "/token",
+                post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "access_token": "access-token",
+                            "refresh_token": "refresh-token",
+                            "expires_in": 3600
+                        }))
+                    }
+                }),
+            )
+            .route("/me", get(|| async { Json(json!({ "id": "test-owner" })) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock token server");
@@ -659,6 +755,9 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("mock token server");
         });
-        format!("http://{address}/token")
+        (
+            format!("http://{address}/token"),
+            format!("http://{address}"),
+        )
     }
 }

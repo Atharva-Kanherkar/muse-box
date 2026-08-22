@@ -1,23 +1,20 @@
 use std::{collections::HashMap, convert::Infallible, pin::Pin, sync::Arc};
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query},
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures::{Stream, StreamExt, stream};
 
-use crate::{
-    error::AppError,
-    render::RenderDoc,
-    state::{RenderParams, StateHub},
-};
+use crate::{account::AccountRuntime, error::AppError, render::RenderDoc, state::RenderParams};
 
 type StateStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
 pub(crate) async fn get_state(
-    State(hub): State<Arc<StateHub>>,
+    Extension(runtime): Extension<Arc<AccountRuntime>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Sse<StateStream>, AppError> {
+    let hub = runtime.hub.clone();
     let params = RenderParams::from_query(&query)?;
     let keep_alive = hub.keep_alive();
     let receiver = hub.subscribe();
@@ -84,6 +81,7 @@ mod tests {
     use crate::{
         routes,
         spotify::{PlaybackObservation, SpotifyClient, SpotifyConfig},
+        state::StateHub,
     };
 
     use super::*;
@@ -93,7 +91,7 @@ mod tests {
         // Without this the connection is silent between changes, so any proxy
         // with an idle timeout drops it and the client reconnects forever.
         let hub = Arc::new(StateHub::new().with_keep_alive(Duration::from_millis(60)));
-        let app = test_router(hub.clone());
+        let app = test_router(hub.clone()).await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -137,7 +135,7 @@ mod tests {
     async fn sse_is_immediate_silent_for_steady_progress_then_emits_changes() {
         let art_url = spawn_art_server().await;
         let hub = Arc::new(StateHub::new());
-        let app = test_router(hub.clone());
+        let app = test_router(hub.clone()).await;
         let response = app
             .oneshot(
                 Request::builder()
@@ -200,7 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_route_rejects_auth_and_parameter_matrix() {
-        let app = test_router(Arc::new(StateHub::new()));
+        let app = test_router(Arc::new(StateHub::new())).await;
         for authorization in [None, Some("Bearer wrong")] {
             let mut request = Request::builder().uri("/state");
             if let Some(value) = authorization {
@@ -239,7 +237,7 @@ mod tests {
         }
     }
 
-    fn test_router(hub: Arc<StateHub>) -> Router {
+    async fn test_router(hub: Arc<StateHub>) -> Router {
         routes::test_router_with(
             SpotifyClient::new(SpotifyConfig {
                 client_id: "client".to_string(),
@@ -251,6 +249,7 @@ mod tests {
             hub,
             Arc::new(routes::voice::FailingVoiceModel),
         )
+        .await
     }
 
     fn observation(

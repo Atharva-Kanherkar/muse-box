@@ -104,6 +104,7 @@ muse-box/
 ├── src/
 │   ├── main.rs
 │   ├── config.rs
+│   ├── account.rs     # per-account isolation + the account registry
 │   ├── state.rs
 │   ├── error.rs
 │   ├── render.rs      # render document types
@@ -217,7 +218,7 @@ Browser-only helper. Redirects to Spotify. Includes a random `state` parameter, 
 
 ### 4. `GET /auth/spotify/callback`: OAuth callback
 
-Spotify redirects here. The backend verifies `state`, exchanges the code for refresh/access tokens, and stores them. On first auth it returns a simple HTML page that also prints the `DEVICE_API_TOKEN` for provisioning.
+Spotify redirects here. The backend verifies `state`, exchanges the code for refresh/access tokens, and calls `GET /v1/me` to learn whose account this is — that Spotify user id is the account's whole identity. It gets (or lazily creates) that account's own isolated runtime, persists the tokens there, and signs the browser in with an `HttpOnly` session cookie mapped to that account before redirecting to `/`. Whoever completes this first on a fresh install becomes the **owner** account, which is the only thing `DEVICE_API_TOKEN` (hardware) ever resolves to; everyone else is a cookie-only browser account.
 
 ---
 
@@ -392,15 +393,16 @@ There is no browser on the ESP32. LVGL is a C toolkit with a scene graph, not a 
 
 ## Security model
 
-Right-sized for one person's shelf. Not a product.
+Open to the public, but not a SaaS with a spend cap: every account shares one `OPENAI_API_KEY`, uncapped, watched manually via the per-account usage log line rather than enforced against. Spotify's own Development Mode ceiling (25 accounts) is the only hard limit right now.
 
 | Secret | Location | Reason |
 |--------|----------|--------|
-| Spotify refresh token | Backend env/storage | Never on device. ESP32 flash is dumpable. |
-| OpenAI API key | Backend env | Same reason. |
-| `DEVICE_API_TOKEN` | One static token, env var | The device holds only this. Revoke = change the env var. |
+| Spotify refresh token | One per account, under `ACCOUNTS_ROOT` | Never on device. ESP32 flash is dumpable. Never shared between accounts. |
+| OpenAI API key | Backend env | Same reason, shared: it is the one thing every account's requests spend against. |
+| `DEVICE_API_TOKEN` | One static token, env var | The device holds only this, and it always resolves to the owner account. Revoke = change the env var. |
+| Session cookie | `HttpOnly`, per browser | Maps to one account id, never the device token. Page JavaScript never sees it. |
 
-Every request carries `Authorization: Bearer <DEVICE_API_TOKEN>`. OAuth uses a `state` parameter. TLS in "production" (i.e., whenever the backend leaves localhost); local dev may use HTTP.
+Hardware carries `Authorization: Bearer <DEVICE_API_TOKEN>`, which always resolves to the owner account. A browser carries the session cookie instead, which resolves to whichever account signed it in — same-origin and `SameSite=Lax`, so it never rides along on a cross-origin request. OAuth uses a `state` parameter. TLS in "production" (i.e., whenever the backend leaves localhost); local dev may use HTTP.
 
 ---
 
@@ -419,7 +421,6 @@ See `.env.example` for the full list. Required for first boot:
 - `SPOTIFY_CLIENT_ID`
 - `SPOTIFY_CLIENT_SECRET`
 - `SPOTIFY_REDIRECT_URI`
-- `TOKEN_STORE_PATH` — persisted Spotify token file; defaults to `./data/spotify_token.json`. Mount its parent directory as a Railway volume so authorization survives redeploys.
 - `OPENAI_API_KEY`
 - `DEVICE_API_TOKEN`
 
@@ -428,6 +429,9 @@ Optional:
 - `HOST` (default `0.0.0.0`)
 - `PORT` (default `3000`)
 - `OPENAI_REALTIME_MODEL` (default: the mini realtime model, e.g. `gpt-realtime-mini`; set to `gpt-realtime` for the flagship)
+- `ACCOUNTS_ROOT` (default `./data/accounts`) — one subdirectory per account that has completed OAuth, each holding that account's own Spotify token and taste index. Mount its parent as a Railway volume so every account's authorization survives a redeploy.
+- `OWNER_MARKER_PATH` (default `./data/owner_account_id.txt`) — which account the hardware `DEVICE_API_TOKEN` resolves to. Set once, by whoever completes OAuth first, and never overwritten by a later login.
+- `TOKEN_STORE_PATH` / `TASTE_INDEX_PATH` (defaults `./data/spotify_token.json` / `./data/taste_index.json`) — read only once, at boot, to migrate a pre-multi-tenant install into `ACCOUNTS_ROOT`. Irrelevant on a fresh install.
 
 ---
 
@@ -486,7 +490,7 @@ Settled (so future sessions do not relitigate):
 - **No `fft_bands` in the contract.** Beat reactivity is device-local from the device's own mic; the server only supplies the palette.
 - **Progress is interpolated client-side.** No per-second SSE pushes.
 - **One packed-bit art encoding for hardware; the web UI renders a nice full-color UI** from `art_url`, with a 1-bit panel-preview toggle as the reference renderer.
-- **Single Spotify account, single user, static device token.** This is furniture, not a product.
+- **Multi-tenant: any Spotify account can sign in, up to Spotify's own 25-account Development Mode ceiling.** `SpotifyClient`, `StateHub` and `TasteIndex` are per-account, built lazily behind an `AccountRegistry` and reaped after 10 minutes of no SSE subscriber; `LyricsIndex` and the tempo cache stay shared, since a track's lyrics do not depend on who is listening. `DEVICE_API_TOKEN` (hardware) always resolves to whichever account completed OAuth first — the "owner" — recorded in `OWNER_MARKER_PATH`; a static device token was never going to be multi-tenant. No cost cap: the shared `OPENAI_API_KEY` is watched manually via a per-account log line, not enforced against, and nothing here works toward Spotify's Extended Quota Mode — that is filed only once the 25-account ceiling is actually hit.
 - **Backend hosted on Railway.** TLS terminated by Railway; secrets live in Railway service variables; the refresh-token store path points at a Railway volume.
 - **Backend is built first.** All open issues are backend-only until phase 1 item 8 (web client).
 

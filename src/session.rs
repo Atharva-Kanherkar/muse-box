@@ -7,7 +7,9 @@
 //!
 //! So: the Spotify authorization a person already has to complete once doubles
 //! as the browser login. Finishing it mints a session, and the cookie carries
-//! only an opaque handle. Sessions are persisted beside the token store so a
+//! only an opaque handle — the handle maps to *which account* signed in, not
+//! merely "signed in or not," so two different people's cookies resolve to two
+//! different accounts. Sessions are persisted beside the token store so a
 //! redeploy does not sign anyone out.
 
 use std::{
@@ -21,7 +23,7 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::error::AppError;
+use crate::{account::AccountId, error::AppError};
 
 /// Name of the session cookie.
 pub const COOKIE_NAME: &str = "muse_session";
@@ -31,16 +33,22 @@ const SESSION_DAYS: i64 = 365;
 /// Ceiling on stored sessions, so repeated logins cannot grow the file forever.
 const MAX_SESSIONS: usize = 32;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionRecord {
+    account_id: AccountId,
+    expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StoredSessions {
-    /// Session handle to its expiry.
-    sessions: HashMap<String, DateTime<Utc>>,
+    /// Session handle to the account it signs in and when that expires.
+    sessions: HashMap<String, SessionRecord>,
 }
 
 /// Issues and checks browser sessions.
 pub struct SessionStore {
     path: PathBuf,
-    sessions: RwLock<HashMap<String, DateTime<Utc>>>,
+    sessions: RwLock<HashMap<String, SessionRecord>>,
 }
 
 impl SessionStore {
@@ -73,28 +81,28 @@ impl SessionStore {
         let live: HashMap<_, _> = stored
             .sessions
             .into_iter()
-            .filter(|(_, expiry)| *expiry > now)
+            .filter(|(_, record)| record.expires_at > now)
             .collect();
         let count = live.len();
         *self.sessions.write().await = live;
         Ok(count)
     }
 
-    /// Mint a session and return the cookie value to set.
-    pub async fn issue(&self) -> Result<String, AppError> {
+    /// Mint a session for `account_id` and return the cookie value to set.
+    pub async fn issue(&self, account_id: AccountId) -> Result<String, AppError> {
         let mut random = [0_u8; 32];
         OsRng.fill_bytes(&mut random);
         let handle = general_purpose::URL_SAFE_NO_PAD.encode(random);
-        let expiry = Utc::now() + Duration::days(SESSION_DAYS);
+        let expires_at = Utc::now() + Duration::days(SESSION_DAYS);
 
         {
             let mut sessions = self.sessions.write().await;
             let now = Utc::now();
-            sessions.retain(|_, expires| *expires > now);
+            sessions.retain(|_, record| record.expires_at > now);
             while sessions.len() >= MAX_SESSIONS {
                 let oldest = sessions
                     .iter()
-                    .min_by_key(|(_, expires)| **expires)
+                    .min_by_key(|(_, record)| record.expires_at)
                     .map(|(handle, _)| handle.clone());
                 match oldest {
                     Some(handle) => {
@@ -103,22 +111,29 @@ impl SessionStore {
                     None => break,
                 }
             }
-            sessions.insert(handle.clone(), expiry);
+            sessions.insert(
+                handle.clone(),
+                SessionRecord {
+                    account_id,
+                    expires_at,
+                },
+            );
         }
         self.persist().await?;
         Ok(handle)
     }
 
-    /// Whether a cookie value names a live session.
-    pub async fn is_valid(&self, handle: &str) -> bool {
+    /// The account a cookie value signs in, if the session is live.
+    pub async fn account_for(&self, handle: &str) -> Option<AccountId> {
         if handle.is_empty() {
-            return false;
+            return None;
         }
         self.sessions
             .read()
             .await
             .get(handle)
-            .is_some_and(|expiry| *expiry > Utc::now())
+            .filter(|record| record.expires_at > Utc::now())
+            .map(|record| record.account_id.clone())
     }
 
     pub async fn count(&self) -> usize {
@@ -218,23 +233,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_session_survives_a_restart() {
+    async fn a_session_survives_a_restart_and_remembers_its_account() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sessions.json");
+        let account_id = AccountId::new("listener-1");
 
         let handle = {
             let store = SessionStore::new(path.clone());
-            let handle = store.issue().await.unwrap();
-            assert!(store.is_valid(&handle).await);
+            let handle = store.issue(account_id.clone()).await.unwrap();
+            assert_eq!(store.account_for(&handle).await, Some(account_id.clone()));
             handle
         };
 
         // A redeploy must not sign anyone out.
         let reloaded = SessionStore::new(path);
         assert_eq!(reloaded.load().await.unwrap(), 1);
-        assert!(reloaded.is_valid(&handle).await);
-        assert!(!reloaded.is_valid("some-other-handle").await);
-        assert!(!reloaded.is_valid("").await);
+        assert_eq!(reloaded.account_for(&handle).await, Some(account_id));
+        assert_eq!(reloaded.account_for("some-other-handle").await, None);
+        assert_eq!(reloaded.account_for("").await, None);
+    }
+
+    #[tokio::test]
+    async fn two_browsers_signing_in_as_different_accounts_stay_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions.json"));
+
+        let alice = store.issue(AccountId::new("alice")).await.unwrap();
+        let bob = store.issue(AccountId::new("bob")).await.unwrap();
+
+        assert_eq!(
+            store.account_for(&alice).await,
+            Some(AccountId::new("alice"))
+        );
+        assert_eq!(store.account_for(&bob).await, Some(AccountId::new("bob")));
     }
 
     #[tokio::test]
@@ -242,7 +273,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::new(directory.path().join("sessions.json"));
         for _ in 0..(MAX_SESSIONS * 2) {
-            store.issue().await.unwrap();
+            store.issue(AccountId::new("listener")).await.unwrap();
         }
         assert_eq!(store.count().await, MAX_SESSIONS);
     }
