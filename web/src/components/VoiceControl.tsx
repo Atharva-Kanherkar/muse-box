@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   MIN_UTTERANCE_SECONDS,
   VoiceListener,
+  playSpeech,
   sendVoiceCommand,
   type ListenerPhase,
   type Utterance,
@@ -22,6 +23,7 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
   const [phase, setPhase] = useState<ListenerPhase>("stopped");
   const [level, setLevel] = useState(0);
   const [sending, setSending] = useState(false);
+  const [replying, setReplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastHeard, setLastHeard] = useState<string | null>(null);
 
@@ -43,7 +45,20 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
     setLastHeard(`${utterance.durationSeconds.toFixed(1)}s of speech`);
     const { baseUrl: url, token: key } = connectionRef.current;
     void sendVoiceCommand(url, key, utterance)
-      .then(() => setError(null))
+      .then(async (result) => {
+        setError(null);
+        if (!result.speech) return;
+        // Deafen the listener first, or Muse's own voice becomes the next
+        // utterance and it answers itself.
+        listenerRef.current?.setMuted(true);
+        setReplying(true);
+        try {
+          await playSpeech(result.speech);
+        } finally {
+          setReplying(false);
+          listenerRef.current?.setMuted(false);
+        }
+      })
       .catch((cause: unknown) =>
         setError(cause instanceof Error ? cause.message : "Voice command failed"),
       )
@@ -90,13 +105,15 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
   }, []);
 
   const listening = phase !== "stopped";
-  const statusLine = sending
-    ? "Thinking…"
-    : phase === "speaking"
-      ? "Hearing you…"
-      : listening
-        ? "Listening"
-        : "Not listening";
+  const statusLine = replying
+    ? "Muse is speaking…"
+    : sending
+      ? "Thinking…"
+      : phase === "speaking"
+        ? "Hearing you…"
+        : listening
+          ? "Listening"
+          : "Not listening";
 
   return (
     <section className="panel">

@@ -23,6 +23,7 @@ const AUDIO_CHUNK_SAMPLES: usize = 4_800;
 const COMMAND_DEADLINE: Duration = Duration::from_secs(10);
 const DEFAULT_REALTIME_ENDPOINT: &str = "wss://api.openai.com/v1/realtime";
 const TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
+const MUSE_VOICE: &str = "marin";
 
 /// Session instructions for Muse.
 ///
@@ -140,6 +141,118 @@ impl RealtimeManager {
             *session = None;
         }
         result
+    }
+
+    /// Ask Muse to say one line about what it just did.
+    ///
+    /// Deliberately a second exchange rather than part of the command: the
+    /// command response is forced to a tool call, and this runs only after the
+    /// action has really succeeded, so Muse never narrates something that then
+    /// failed.
+    pub async fn say(&self, situation: &str) -> Result<Speech, AppError> {
+        let mut session = self.session.lock().await;
+        let exchange = async {
+            if session.is_none() {
+                *session = Some(self.connect().await?);
+            }
+            let Some(socket) = session.as_mut() else {
+                return Err(AppError::Voice(
+                    "realtime session was not available".to_string(),
+                ));
+            };
+            send_json(
+                socket,
+                &json!({
+                    "type": "response.create",
+                    "response": {
+                        "output_modalities": ["audio"],
+                        "tool_choice": "none",
+                        "instructions": format!(
+                            "Say one short spoken line, at most twelve words, confirming this \
+                             with personality and no emoji or markup. Do not ask a question. \
+                             What happened: {situation}"
+                        )
+                    }
+                }),
+            )
+            .await?;
+            Self::receive_speech(socket).await
+        };
+        let result = match tokio::time::timeout(self.command_deadline, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(AppError::Voice("model timeout".to_string())),
+        };
+        if let Err(error) = &result {
+            tracing::warn!(%error, "realtime speech failed; resetting session");
+            *session = None;
+        }
+        result
+    }
+
+    async fn receive_speech(socket: &mut RealtimeSocket) -> Result<Speech, AppError> {
+        let mut audio = Vec::<u8>::new();
+        loop {
+            let message = socket
+                .next()
+                .await
+                .ok_or_else(|| AppError::Voice("realtime connection dropped".to_string()))?;
+            match message {
+                Ok(Message::Text(text)) => {
+                    let event: Value = serde_json::from_str(&text).map_err(|_| {
+                        AppError::Voice("realtime service returned invalid JSON".to_string())
+                    })?;
+                    match event.get("type").and_then(Value::as_str) {
+                        Some("response.output_audio.delta") => {
+                            let delta = required_string(&event, "delta")?;
+                            let mut chunk =
+                                general_purpose::STANDARD.decode(delta).map_err(|_| {
+                                    AppError::Voice(
+                                        "realtime audio delta was not base64".to_string(),
+                                    )
+                                })?;
+                            audio.append(&mut chunk);
+                        }
+                        Some("response.done") => {
+                            if audio.is_empty() {
+                                return Err(AppError::Voice(
+                                    "realtime response carried no audio".to_string(),
+                                ));
+                            }
+                            return Ok(Speech {
+                                format: "pcm16".to_string(),
+                                rate: REALTIME_SAMPLE_RATE,
+                                audio: general_purpose::STANDARD.encode(&audio),
+                            });
+                        }
+                        Some("error") => {
+                            let message = event
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown realtime service error");
+                            return Err(AppError::Voice(format!(
+                                "realtime service error: {message}"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Message::Ping(payload)) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|_| AppError::Voice("realtime connection dropped".to_string()))?;
+                }
+                Ok(Message::Close(_)) | Err(_) => {
+                    return Err(AppError::Voice("realtime connection dropped".to_string()));
+                }
+                Ok(Message::Binary(_)) => {
+                    return Err(AppError::Voice(
+                        "realtime service returned an unexpected binary event".to_string(),
+                    ));
+                }
+                Ok(Message::Pong(_) | Message::Frame(_)) => {}
+            }
+        }
     }
 
     async fn connect(&self) -> Result<RealtimeSocket, AppError> {
@@ -343,6 +456,13 @@ fn session_update() -> Value {
             "type": "realtime",
             "output_modalities": ["text"],
             "audio": {
+                "output": {
+                    "format": {
+                        "type": "audio/pcm",
+                        "rate": REALTIME_SAMPLE_RATE
+                    },
+                    "voice": MUSE_VOICE
+                },
                 "input": {
                     "format": {
                         "type": "audio/pcm",
@@ -387,6 +507,15 @@ pub enum ToolCall {
     QueueSearch { query: String },
     SetVolume { percent: u8 },
     NowPlaying,
+}
+
+/// Spoken reply from Muse: PCM16 mono, little-endian, at the rate in `rate`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Speech {
+    pub format: String,
+    pub rate: u32,
+    /// Base64 of the raw samples.
+    pub audio: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -80,6 +80,13 @@ function floatToPcm16(chunks: Float32Array[], totalSamples: number): ArrayBuffer
   return buffer;
 }
 
+/** Spoken reply from Muse: base64 PCM16 mono at `rate`. */
+export interface Speech {
+  format: string;
+  rate: number;
+  audio: string;
+}
+
 export interface Utterance {
   pcm: ArrayBuffer;
   sampleRate: number;
@@ -109,6 +116,7 @@ export class VoiceListener {
   private noiseFloor = MIN_SPEECH_RMS;
   private speaking = false;
   private running = false;
+  private muted = false;
 
   constructor(private readonly callbacks: ListenerCallbacks) {}
 
@@ -148,8 +156,21 @@ export class VoiceListener {
     this.callbacks.onPhase("listening");
   }
 
+  /** Ignore input without tearing the graph down, so Muse cannot hear itself. */
+  setMuted(muted: boolean): void {
+    this.muted = muted;
+    if (muted && this.speaking) {
+      this.speaking = false;
+      this.speech = [];
+      this.speechSamples = 0;
+      this.silenceSamples = 0;
+      this.loudFrames = 0;
+      this.callbacks.onPhase("listening");
+    }
+  }
+
   private consume(frame: Float32Array, sampleRate: number): void {
-    if (!this.running) return;
+    if (!this.running || this.muted) return;
     const level = rootMeanSquare(frame);
     this.callbacks.onLevel(Math.min(1, level * 12));
 
@@ -224,13 +245,50 @@ export class VoiceListener {
   }
 }
 
+/**
+ * Plays a spoken reply and resolves when it finishes.
+ *
+ * The music itself plays on a Spotify device rather than in this tab, so there
+ * is nothing to duck; the only conflict is the microphone hearing Muse, which
+ * the caller avoids by pausing the listener until this resolves.
+ */
+export async function playSpeech(speech: Speech): Promise<void> {
+  if (speech.format !== "pcm16" || !speech.audio) return;
+  const binary = atob(speech.audio);
+  const samples = Math.floor(binary.length / 2);
+  if (samples === 0) return;
+
+  const context = new AudioContext();
+  try {
+    const buffer = context.createBuffer(1, samples, speech.rate);
+    const channel = buffer.getChannelData(0);
+    for (let index = 0; index < samples; index += 1) {
+      const low = binary.charCodeAt(index * 2);
+      const high = binary.charCodeAt(index * 2 + 1);
+      // Little-endian signed 16-bit into the -1..1 float range.
+      const value = (high << 8) | low;
+      const signed = value >= 0x8000 ? value - 0x10000 : value;
+      channel[index] = signed / 0x8000;
+    }
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(context.destination);
+    await new Promise<void>((resolve) => {
+      source.onended = () => resolve();
+      source.start();
+    });
+  } finally {
+    await context.close();
+  }
+}
+
 /** Posts one utterance as raw PCM16 and returns the rebuilt document. */
 export async function sendVoiceCommand(
   baseUrl: string,
   token: string,
   utterance: Utterance,
   signal?: AbortSignal,
-): Promise<RenderDoc> {
+): Promise<RenderDoc & { speech?: Speech }> {
   const url = new URL("/voice", baseUrl);
   url.searchParams.set("rate", String(Math.round(utterance.sampleRate)));
   url.searchParams.set("bits", "16");
@@ -256,5 +314,5 @@ export async function sendVoiceCommand(
     }
     throw new Error(message);
   }
-  return (await response.json()) as RenderDoc;
+  return (await response.json()) as RenderDoc & { speech?: Speech };
 }

@@ -7,11 +7,12 @@ use axum::{
     http::header,
 };
 use chrono::Utc;
+use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::{
     error::AppError,
-    realtime::{PlaybackContext, RealtimeManager, ToolCall, VoiceIntent},
+    realtime::{PlaybackContext, RealtimeManager, Speech, ToolCall, VoiceIntent},
     render::{PlaybackState, RenderDoc, VoiceLogEntry},
     spotify::{PlaybackFetchError, PlaybackObservation, SpotifyClient},
     state::{RenderParams, StateHub},
@@ -21,6 +22,7 @@ const MAX_AUDIO_SECONDS: u64 = 30;
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 pub type VoiceFuture<'a> = Pin<Box<dyn Future<Output = Result<VoiceIntent, AppError>> + Send + 'a>>;
+pub type SpeechFuture<'a> = Pin<Box<dyn Future<Output = Result<Speech, AppError>> + Send + 'a>>;
 
 pub trait VoiceModel: Send + Sync {
     fn command<'a>(
@@ -29,6 +31,12 @@ pub trait VoiceModel: Send + Sync {
         rate: u32,
         context: PlaybackContext,
     ) -> VoiceFuture<'a>;
+
+    /// Spoken confirmation of what just happened. Defaults to staying quiet so
+    /// a model that cannot speak simply does not.
+    fn say<'a>(&'a self, _situation: &'a str) -> Option<SpeechFuture<'a>> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -51,6 +59,12 @@ impl VoiceModel for FailingVoiceModel {
 }
 
 impl VoiceModel for RealtimeManager {
+    fn say<'a>(&'a self, situation: &'a str) -> Option<SpeechFuture<'a>> {
+        Some(Box::pin(async move {
+            RealtimeManager::say(self, situation).await
+        }))
+    }
+
     fn command<'a>(
         &'a self,
         samples: &'a [i16],
@@ -73,7 +87,7 @@ pub(crate) async fn post_voice(
     State(state): State<VoiceState>,
     Query(query): Query<HashMap<String, String>>,
     request: Request,
-) -> Result<Json<RenderDoc>, AppError> {
+) -> Result<Json<VoiceResponse>, AppError> {
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -101,10 +115,28 @@ pub(crate) async fn post_voice(
         recover_document(&state.hub).await;
     }
     thinking.settle();
-    outcome.map(Json)
+    let (document, situation) = outcome?;
+
+    // Spoken after the action landed, so Muse never narrates something that
+    // then failed. A model that cannot speak, or a failure here, simply leaves
+    // the reply out rather than failing a command that already succeeded.
+    let speech = match state.model.say(&situation) {
+        Some(future) => match future.await {
+            Ok(speech) => Some(speech),
+            Err(error) => {
+                tracing::warn!(%error, "Muse could not speak its reply");
+                None
+            }
+        },
+        None => None,
+    };
+    Ok(Json(VoiceResponse { document, speech }))
 }
 
-async fn run_voice_command(state: &VoiceState, audio: &AudioInput) -> Result<RenderDoc, AppError> {
+async fn run_voice_command(
+    state: &VoiceState,
+    audio: &AudioInput,
+) -> Result<(RenderDoc, String), AppError> {
     let observation = state.hub.published_observation().await;
     let context = PlaybackContext {
         track: observation.track.clone(),
@@ -120,7 +152,7 @@ async fn run_voice_command(state: &VoiceState, audio: &AudioInput) -> Result<Ren
         .hub
         .append_voice_log(VoiceLogEntry {
             transcript: intent.transcript,
-            action,
+            action: action.clone(),
             timestamp: Utc::now(),
         })
         .await;
@@ -131,7 +163,22 @@ async fn run_voice_command(state: &VoiceState, audio: &AudioInput) -> Result<Ren
         .map_err(playback_error)?;
     state.hub.force_publish(fresh).await?;
     let document = state.hub.current_document(RenderParams::default()).await?;
-    Ok(document.as_ref().clone())
+    let situation = describe(&action, &document);
+    Ok((document.as_ref().clone(), situation))
+}
+
+/// One line of ground truth for Muse to speak from, so the reply matches what
+/// actually happened rather than what was asked for.
+fn describe(action: &str, document: &RenderDoc) -> String {
+    let track = document.track.as_deref().unwrap_or("nothing");
+    let artist = document.artist.as_deref().unwrap_or("unknown artist");
+    match document.state {
+        PlaybackState::Playing => {
+            format!("action {action}; now playing {track} by {artist}")
+        }
+        PlaybackState::Paused => format!("action {action}; paused on {track} by {artist}"),
+        _ => format!("action {action}; nothing is playing"),
+    }
 }
 
 /// Restores a real document if a voice request never finishes.
@@ -231,6 +278,17 @@ fn playback_error(error: PlaybackFetchError) -> AppError {
         PlaybackFetchError::Spotify(error) => error,
         other => AppError::Spotify(other.to_string()),
     }
+}
+
+/// `/voice` response: the render document plus, when Muse had something to say,
+/// its spoken reply. Flattened, so existing clients see an unchanged document
+/// with one extra optional field.
+#[derive(Debug, Serialize)]
+pub struct VoiceResponse {
+    #[serde(flatten)]
+    pub document: RenderDoc,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speech: Option<Speech>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -470,6 +528,93 @@ mod tests {
                 }
             })
         }
+    }
+
+    struct SpeakingModel {
+        speech: Option<Speech>,
+    }
+
+    impl VoiceModel for SpeakingModel {
+        fn command<'a>(
+            &'a self,
+            _samples: &'a [i16],
+            _rate: u32,
+            _context: PlaybackContext,
+        ) -> VoiceFuture<'a> {
+            Box::pin(async {
+                Ok(VoiceIntent {
+                    transcript: "pause".to_string(),
+                    tool: ToolCall::Pause,
+                })
+            })
+        }
+
+        fn say<'a>(&'a self, situation: &'a str) -> Option<SpeechFuture<'a>> {
+            let speech = self.speech.clone();
+            let situation = situation.to_string();
+            Some(Box::pin(async move {
+                // Muse speaks from what actually happened, not from the request.
+                assert!(situation.contains("action spotify:pause"), "{situation}");
+                speech.ok_or_else(|| AppError::Voice("no voice today".to_string()))
+            }))
+        }
+    }
+
+    async fn voice_response(speech: Option<Speech>) -> Value {
+        let spotify = mock_spotify(Arc::new(AtomicUsize::new(0)), false).await;
+        let app = routes::router(
+            spotify,
+            "device-token".to_string(),
+            Arc::new(StateHub::new()),
+            Arc::new(SpeakingModel { speech }),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/voice?rate=16000&bits=16&ch=1")
+                    .header(header::CONTENT_TYPE, "audio/pcm")
+                    .header(header::AUTHORIZATION, "Bearer device-token")
+                    .body(Body::from(vec![120, 0, 136, 255]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("body");
+        serde_json::from_slice(&body).expect("json")
+    }
+
+    #[tokio::test]
+    async fn spoken_reply_rides_alongside_an_unchanged_document() {
+        let body = voice_response(Some(Speech {
+            format: "pcm16".to_string(),
+            rate: 24_000,
+            audio: "AAEC".to_string(),
+        }))
+        .await;
+
+        // Flattened: every document field stays exactly where it was.
+        assert_eq!(body["version"], 1);
+        assert_eq!(body["state"], "paused");
+        assert!(body["voice_log"].is_array());
+        assert_eq!(body["speech"]["format"], "pcm16");
+        assert_eq!(body["speech"]["rate"], 24_000);
+        assert_eq!(body["speech"]["audio"], "AAEC");
+    }
+
+    #[tokio::test]
+    async fn a_silent_muse_still_completes_the_command() {
+        // Speech is a flourish on top of an action that already succeeded, so
+        // failing to speak must not turn a working command into an error.
+        let body = voice_response(None).await;
+        assert_eq!(body["state"], "paused");
+        assert!(
+            body.get("speech").is_none(),
+            "absent speech must be omitted, not null: {body}"
+        );
     }
 
     #[tokio::test]
