@@ -650,9 +650,16 @@ input:focus-visible {
   position: fixed;
   left: clamp(14px, 3vw, 40px);
   bottom: clamp(76px, 12vh, 110px);
-  width: clamp(84px, 9vw, 128px);
-  pointer-events: none;
+  width: clamp(96px, 10vw, 140px);
   z-index: 3;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.mascot:active {
+  cursor: grabbing;
 }
 
 .mascot-pix {
@@ -692,6 +699,50 @@ input:focus-visible {
   }
   50% {
     transform: translateY(2px) scale(1, 0.985);
+  }
+}
+
+/* Petted: a happy wiggle, ^ ^ eyes, and a heart. */
+.mascot[data-mood="petted"] .mascot-pix {
+  animation: wiggle 320ms steps(2, jump-none) 3;
+}
+
+@keyframes wiggle {
+  0%,
+  100% {
+    transform: rotate(-4deg);
+  }
+  50% {
+    transform: rotate(4deg);
+  }
+}
+
+.mascot-heart {
+  position: absolute;
+  top: -16px;
+  left: 30%;
+  width: 22px;
+  animation: heart-up 1.5s ease-out both;
+}
+
+.mascot-heart svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+@keyframes heart-up {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.6);
+  }
+  20% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-18px) scale(1);
   }
 }
 
