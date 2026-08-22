@@ -28,6 +28,9 @@ const BROADCAST_CAPACITY: usize = 32;
 const MAX_RENDER_VARIANTS: usize = 32;
 const DEFAULT_PALETTE: [&str; 2] = ["#1a1a1a", "#e0e0e0"];
 const NORMAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often the SSE stream sends a comment to hold the socket open. Well under
+/// the idle timeout of any proxy likely to sit in front of this.
+pub const DEFAULT_SSE_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(15);
 const MIN_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 const IDLE_THRESHOLD_SECONDS: i64 = 30;
@@ -90,6 +93,7 @@ pub struct StateHub {
     voice_log: Mutex<VecDeque<VoiceLogEntry>>,
     playback_activity: watch::Sender<PlaybackActivity>,
     display_offset: FixedOffset,
+    keep_alive: std::time::Duration,
     changes: broadcast::Sender<u64>,
     generation: AtomicU64,
     http: reqwest::Client,
@@ -135,10 +139,24 @@ impl StateHub {
             voice_log: Mutex::new(VecDeque::with_capacity(VOICE_LOG_CAPACITY)),
             playback_activity,
             display_offset: Utc.fix(),
+            keep_alive: DEFAULT_SSE_KEEP_ALIVE,
             changes,
             generation: AtomicU64::new(0),
             http,
         }
+    }
+
+    /// How often the SSE stream should send a keep-alive comment.
+    pub fn keep_alive(&self) -> std::time::Duration {
+        self.keep_alive
+    }
+
+    /// Shorten the keep-alive. Tests use this so proving the comment arrives
+    /// does not cost the real interval in wall-clock time.
+    #[must_use]
+    pub fn with_keep_alive(mut self, interval: std::time::Duration) -> Self {
+        self.keep_alive = interval;
+        self
     }
 
     /// Localize the idle clock's digits. Scheduling stays on UTC boundaries.

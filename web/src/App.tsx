@@ -39,14 +39,17 @@ function loadConnection(): Connection {
   }
 }
 
-function statusText(status: ConnectionStatus): string {
+/**
+ * Only trouble gets words. A working stream needs no narration, and labelling
+ * it "connecting" every time the page loads made a healthy system look flaky.
+ */
+function statusText(status: ConnectionStatus): string | null {
   switch (status.kind) {
-    case "idle":
-      return "Not connected";
-    case "connecting":
-      return "Connecting";
     case "open":
-      return "Live";
+      return null;
+    case "idle":
+    case "connecting":
+      return null;
     case "retrying":
       return "Reconnecting";
     case "failed":
@@ -209,10 +212,12 @@ export default function App() {
     <div className="scene">
       <header className="rail">
         <span className="wordmark">muse&#8209;box</span>
-        <span className="rail-status">
-          <span className="beacon" data-kind={status.kind} />
-          {statusText(status)}
-        </span>
+        {statusText(status) ? (
+          <span className="rail-status">
+            <span className="beacon" data-kind={status.kind} />
+            {statusText(status)}
+          </span>
+        ) : null}
         <button
           type="button"
           className="ghost"
@@ -235,7 +240,7 @@ export default function App() {
             />
           ) : (
             <div className="cover-art cover-empty">
-              {configured ? "quiet" : "connect"}
+              {configured ? "quiet" : "setup"}
             </div>
           )}
 
@@ -279,7 +284,8 @@ export default function App() {
         <div className="titles">
           <h1 className="title">{doc?.track ?? "Nothing playing"}</h1>
           <p className="byline">
-            {doc?.artist ?? (configured ? "say “Muse” to begin" : "")}
+            {doc?.artist ??
+              (configured ? "say “Muse” to begin" : "add your backend to begin")}
           </p>
           {doc && doc.duration_ms > 0 ? (
             <p className="times">
@@ -336,7 +342,7 @@ export default function App() {
               />
             </label>
             <button className="controlish" type="submit">
-              Connect
+              Save
             </button>
           </form>
         </div>

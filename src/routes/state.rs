@@ -2,7 +2,7 @@ use std::{collections::HashMap, convert::Infallible, pin::Pin, sync::Arc};
 
 use axum::{
     extract::{Query, State},
-    response::sse::{Event, Sse},
+    response::sse::{Event, KeepAlive, Sse},
 };
 use futures::{Stream, StreamExt, stream};
 
@@ -19,6 +19,7 @@ pub(crate) async fn get_state(
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Sse<StateStream>, AppError> {
     let params = RenderParams::from_query(&query)?;
+    let keep_alive = hub.keep_alive();
     let receiver = hub.subscribe();
     let document = hub.current_document(params).await?;
     let initial_event = state_event(&document)?;
@@ -49,7 +50,11 @@ pub(crate) async fn get_state(
         },
     );
     let events: StateStream = Box::pin(initial.chain(updates));
-    Ok(Sse::new(events))
+    // A stream that sends nothing between meaningful changes gets reaped by any
+    // proxy with an idle timeout, and neither end learns why: the client just
+    // reconnects, forever. An SSE comment keeps the socket warm without being an
+    // event — clients skip it, so the "zero events in steady state" rule holds.
+    Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(keep_alive).text("")))
 }
 
 fn state_event(document: &RenderDoc) -> Result<Event, AppError> {
@@ -88,6 +93,51 @@ mod tests {
     /// a plain Spotify search, which is what these tests assert against.
     fn test_taste() -> Arc<TasteIndex> {
         Arc::new(TasteIndex::new("test-key", PathBuf::from("unused")))
+    }
+
+    #[tokio::test]
+    async fn the_stream_is_kept_warm_without_emitting_state_events() {
+        // Without this the connection is silent between changes, so any proxy
+        // with an idle timeout drops it and the client reconnects forever.
+        let hub = Arc::new(StateHub::new().with_keep_alive(Duration::from_millis(60)));
+        let app = test_router(hub.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/state?w=16&h=16")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let mut stream = response.into_body().into_data_stream();
+
+        // The initial document, then nothing but comments.
+        let initial = next_event(&mut stream).await.expect("initial event");
+        assert!(initial.contains("data:"));
+
+        let mut raw = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    raw.push_str(&String::from_utf8_lossy(&chunk));
+                    if raw.contains("\n\n") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            raw.starts_with(':'),
+            "expected an SSE comment to hold the socket open, got {raw:?}"
+        );
+        assert!(
+            !raw.contains("data:"),
+            "a keep-alive must not carry a state document: {raw:?}"
+        );
     }
 
     #[tokio::test]
@@ -236,7 +286,12 @@ mod tests {
             let chunk = chunk.ok()?;
             event.push_str(&String::from_utf8_lossy(&chunk));
             if event.contains("\n\n") {
-                return Some(event);
+                // Keep-alive comments are not events; skip them so silence
+                // assertions still measure real state traffic.
+                if event.lines().any(|line| line.starts_with("data:")) {
+                    return Some(event);
+                }
+                event.clear();
             }
         }
         None

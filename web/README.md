@@ -47,12 +47,27 @@ world. Setup hides behind the gear until it is needed.
 | `lib/voice.ts` | Mic capture → PCM16 → `POST /voice` |
 | `lib/art.ts` | Unpacks the 1-bit device frame for the preview canvas |
 
-## Reconnect is not optional
+## Deploying
 
-The stream is deliberately silent between meaningful changes, so an idle
-connection carries no traffic and proxies will reap it with no error the server
-knows about. The client reconnects with jittered backoff; the first event after
-connect is always a complete document, so reconnecting is lossless.
+`npm run build` then `npm start` — `server.mjs` is a dependency-free static
+server that reads `PORT`, answers `/healthz`, falls back to the shell for
+client-side routes, and refuses paths that escape `dist/`. On Railway it runs as
+its own service with root directory `web`.
+
+`VITE_API_BASE_URL` is baked in at build time so the backend address never has
+to be typed. The device token is deliberately **not** baked in: `VITE_*` values
+land in the JS bundle, and the bundle is public, so anyone who opened the page
+would inherit control of the Spotify account. It is entered once and kept in
+`localStorage` instead.
+
+## Reconnect is still handled
+
+The backend now holds the stream open with SSE comments, so a healthy connection
+stays up instead of being reaped by a proxy every minute. Reconnect logic
+remains for genuine drops — laptop sleep, network changes, a backend redeploy —
+with jittered backoff, and the first event after connect is always a complete
+document, so reconnecting is lossless. The UI says nothing while the stream is
+healthy; only trouble gets words.
 
 ## Device frame preview
 
