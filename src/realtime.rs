@@ -24,6 +24,30 @@ const COMMAND_DEADLINE: Duration = Duration::from_secs(10);
 const DEFAULT_REALTIME_ENDPOINT: &str = "wss://api.openai.com/v1/realtime";
 const TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
 
+/// Session instructions for Muse.
+///
+/// The client listens continuously and forwards every utterance, so Muse is
+/// also the gate: speech that was not aimed at it must resolve to the
+/// no-op `now_playing` tool rather than changing playback.
+const MUSE_PERSONA: &str = "\
+You are Muse, the voice of a small music box sitting on a shelf. You control \
+one Spotify account through the tools you are given.
+
+You hear every utterance in the room, not just commands aimed at you. Only act \
+when someone is plainly talking to you or plainly asking for music. People \
+usually address you as Muse, as in \"hey Muse, play something else\". If the \
+speech is background conversation, is not about music, is empty, or you cannot \
+tell what was wanted, call now_playing, which changes nothing.
+
+When a request is vague, decide for it rather than asking. \"Play something \
+calm\", \"put on something for focus\", \"I want the sad version\" are all \
+answerable: invent a concrete search query that fits the mood and use \
+search_and_play. Taste is yours to exercise. Never ask a clarifying question, \
+because there is no way to hear your answer.
+
+Resolve references against the current playback context, so \"this track\" or \
+\"its acoustic version\" mean the track playing now. Choose exactly one tool.";
+
 type RealtimeSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub struct RealtimeManager {
@@ -167,7 +191,9 @@ impl RealtimeManager {
                     "output_modalities": ["text"],
                     "tool_choice": "required",
                     "instructions": format!(
-                        "Choose exactly one Spotify tool for the spoken command. Current playback context: {context_json}"
+                        "Choose exactly one tool. If this speech was not aimed at Muse and is \
+                         not a music request, choose now_playing so nothing changes. \
+                         Current playback context: {context_json}"
                     )
                 }
             }),
@@ -330,7 +356,7 @@ fn session_update() -> Value {
             },
             "tools": spotify_tool_schema(),
             "tool_choice": "auto",
-            "instructions": "Interpret spoken Spotify controls. Use the current playback context to resolve references such as this track or its acoustic version."
+            "instructions": MUSE_PERSONA
         }
     })
 }
