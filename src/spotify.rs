@@ -160,6 +160,17 @@ struct SpotifyImage {
 }
 
 #[derive(Debug, Deserialize)]
+struct DevicesResponse {
+    devices: Vec<SpotifyDevice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotifyDevice {
+    id: String,
+    is_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct SearchResponse {
     tracks: SearchTracks,
 }
@@ -507,26 +518,81 @@ impl SpotifyClient {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<(), AppError> {
+        let response = self
+            .player_request(method.clone(), path, query, None)
+            .await?;
+        if response.status() != reqwest::StatusCode::NOT_FOUND {
+            return player_response_error(response);
+        }
+
+        // Spotify answers 404 NO_ACTIVE_DEVICE when no device currently holds
+        // playback, which is the normal state for a box that has been idle.
+        // Naming a device explicitly transfers playback to it, so the shelf can
+        // start music without someone first opening Spotify by hand.
+        let Some(device_id) = self.first_available_device().await? else {
+            return Err(AppError::Spotify(
+                "no Spotify device is available; open Spotify on a phone, desktop or speaker once so it can be targeted".to_string(),
+            ));
+        };
+        let response = self
+            .player_request(method, path, query, Some(&device_id))
+            .await?;
+        player_response_error(response)
+    }
+
+    async fn player_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        device_id: Option<&str>,
+    ) -> Result<reqwest::Response, AppError> {
         let access_token = self.access_token().await?;
         let url = format!(
             "{}/{}",
             self.endpoints.api_base_url.trim_end_matches('/'),
             path
         );
-        self.http
+        let mut request = self
+            .http
             .request(method, url)
             .bearer_auth(access_token)
             .query(query)
             // Spotify answers 411 Length Required for a body-less PUT/POST.
             // reqwest omits Content-Length when there is no body, and an empty
             // Vec body is not enough either, so set the header outright.
-            .header(reqwest::header::CONTENT_LENGTH, "0")
+            .header(reqwest::header::CONTENT_LENGTH, "0");
+        if let Some(device_id) = device_id {
+            request = request.query(&[("device_id", device_id)]);
+        }
+        request.send().await.map_err(spotify_api_error)
+    }
+
+    /// Pick a device to target, preferring one Spotify already calls active.
+    async fn first_available_device(&self) -> Result<Option<String>, AppError> {
+        let access_token = self.access_token().await?;
+        let url = format!(
+            "{}/me/player/devices",
+            self.endpoints.api_base_url.trim_end_matches('/')
+        );
+        let devices = self
+            .http
+            .get(url)
+            .bearer_auth(access_token)
             .send()
             .await
             .map_err(spotify_api_error)?
             .error_for_status()
-            .map_err(spotify_api_error)?;
-        Ok(())
+            .map_err(spotify_api_error)?
+            .json::<DevicesResponse>()
+            .await
+            .map_err(spotify_api_error)?
+            .devices;
+        Ok(devices
+            .iter()
+            .find(|device| device.is_active)
+            .or_else(|| devices.first())
+            .map(|device| device.id.clone()))
     }
 
     async fn consume_state(&self, state: &str) -> bool {
@@ -644,6 +710,22 @@ async fn persist_token(path: &Path, token: &StoredToken) -> Result<(), AppError>
 
 fn spotify_request_error(error: reqwest::Error) -> AppError {
     AppError::Spotify(format!("Spotify token request failed: {error}"))
+}
+
+/// Turn a player response into a typed error, keeping Spotify's own reason.
+fn player_response_error(response: reqwest::Response) -> Result<(), AppError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return Err(AppError::Spotify(
+            "Spotify refused the command; playback control requires a Premium account".to_string(),
+        ));
+    }
+    Err(AppError::Spotify(format!(
+        "Spotify Web API request failed with {status}"
+    )))
 }
 
 fn spotify_api_error(error: reqwest::Error) -> AppError {
@@ -1011,6 +1093,88 @@ mod tests {
             requests
                 .iter()
                 .all(|request| request.2 == "Bearer test-access-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn player_command_retries_with_a_device_when_none_is_active() {
+        // Spotify answers 404 NO_ACTIVE_DEVICE for an idle account, which is the
+        // normal state for a shelf box. The client must find a device and retry.
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = seen.clone();
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |request: axum::extract::Request| {
+                let observed = observed.clone();
+                async move {
+                    let uri = request.uri().to_string();
+                    observed.lock().await.push(uri.clone());
+                    if uri.starts_with("/v1/me/player/devices") {
+                        return axum::Json(serde_json::json!({
+                            "devices": [
+                                { "id": "inactive-speaker", "is_active": false },
+                                { "id": "active-phone", "is_active": true }
+                            ]
+                        }))
+                        .into_response();
+                    }
+                    if uri.contains("device_id=active-phone") {
+                        return StatusCode::NO_CONTENT.into_response();
+                    }
+                    StatusCode::NOT_FOUND.into_response()
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = SpotifyClient::with_test_api_url(
+            test_config(PathBuf::from("unused")),
+            format!("http://{address}/v1"),
+        );
+        client.authorize_for_test().await;
+        client.resume_playback().await.expect("retry must succeed");
+
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(seen[0].starts_with("/v1/me/player/play"));
+        assert!(seen[1].starts_with("/v1/me/player/devices"));
+        // The active device wins over the one merely listed first.
+        assert!(seen[2].contains("device_id=active-phone"), "{:?}", seen[2]);
+    }
+
+    #[tokio::test]
+    async fn player_command_reports_clearly_when_no_device_exists() {
+        // Signed in, but nothing to play on.
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |request: axum::extract::Request| async move {
+                if request
+                    .uri()
+                    .to_string()
+                    .starts_with("/v1/me/player/devices")
+                {
+                    return axum::Json(serde_json::json!({ "devices": [] })).into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = SpotifyClient::with_test_api_url(
+            test_config(PathBuf::from("unused")),
+            format!("http://{address}/v1"),
+        );
+        client.authorize_for_test().await;
+        let error = client
+            .pause_playback()
+            .await
+            .expect_err("no device means no playback");
+        let message = error.to_string();
+        assert!(
+            message.contains("no Spotify device is available"),
+            "the caller needs the reason, not a bare 404: {message}"
         );
     }
 
