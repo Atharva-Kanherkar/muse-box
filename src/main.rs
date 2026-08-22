@@ -70,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
     let voice_model = Arc::new(IntentModel::new(
         openai_api_key.clone(),
         config.openai_intent_model.clone(),
+        config.openai_reasoning_effort.clone(),
         config.openai_speech_model.clone(),
         config.openai_speech_voice.clone(),
     ));

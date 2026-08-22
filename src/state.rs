@@ -379,8 +379,10 @@ impl StateHub {
             .build_document_without_voice_log(observation, params)
             .await?;
         document.voice_log = self.voice_log.lock().await.iter().cloned().collect();
-        document.lyrics = self.lyrics_for(observation).await;
-        if let Some((tempo, energy)) = self.beat_for(observation).await {
+        // Two independent lookups; serializing them doubled the cold-track cost.
+        let (lyrics, beat) = tokio::join!(self.lyrics_for(observation), self.beat_for(observation));
+        document.lyrics = lyrics;
+        if let Some((tempo, energy)) = beat {
             document.tempo_bpm = Some(tempo);
             document.energy = Some(energy);
         }

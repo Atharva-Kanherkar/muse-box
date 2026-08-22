@@ -15,6 +15,8 @@ pub struct Config {
     /// Model that turns a transcript into one tool call. Stateless chat
     /// completions, so this is the reliable path; Realtime is only for audio.
     pub openai_intent_model: String,
+    /// Reasoning effort for the intent model. Empty disables the field.
+    pub openai_reasoning_effort: String,
     /// Text-to-speech model and voice for Muse's replies.
     pub openai_speech_model: String,
     pub openai_speech_voice: String,
@@ -62,7 +64,9 @@ impl Config {
             openai_realtime_model: std::env::var("OPENAI_REALTIME_MODEL")
                 .unwrap_or_else(|_| "gpt-realtime-2.1".to_string()),
             openai_intent_model: std::env::var("OPENAI_INTENT_MODEL")
-                .unwrap_or_else(|_| "gpt-5.6-terra".to_string()),
+                .unwrap_or_else(|_| "gpt-5.6-luna".to_string()),
+            openai_reasoning_effort: std::env::var("OPENAI_REASONING_EFFORT")
+                .unwrap_or_else(|_| "low".to_string()),
             openai_speech_model: std::env::var("OPENAI_SPEECH_MODEL")
                 .unwrap_or_else(|_| "gpt-4o-mini-tts".to_string()),
             openai_speech_voice: std::env::var("OPENAI_SPEECH_VOICE")

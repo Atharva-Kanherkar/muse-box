@@ -34,6 +34,9 @@ pub struct IntentModel {
     http: reqwest::Client,
     api_key: String,
     model: String,
+    /// Reasoning effort. Picking one of nine tools needs no deliberation, and
+    /// reasoning tokens were most of the wait, so this defaults low.
+    effort: String,
     speech_model: String,
     voice: String,
 }
@@ -42,6 +45,7 @@ impl IntentModel {
     pub fn new(
         api_key: impl Into<String>,
         model: impl Into<String>,
+        effort: impl Into<String>,
         speech_model: impl Into<String>,
         voice: impl Into<String>,
     ) -> Self {
@@ -49,6 +53,7 @@ impl IntentModel {
             http: crate::spotify::http_client(),
             api_key: api_key.into(),
             model: model.into(),
+            effort: effort.into(),
             speech_model: speech_model.into(),
             voice: voice.into(),
         }
@@ -71,7 +76,7 @@ impl IntentModel {
 
         // The Responses API takes tools in the same flat shape the Realtime
         // schema already uses, so there is nothing to translate.
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "tool_choice": "required",
             "parallel_tool_calls": false,
@@ -81,6 +86,10 @@ impl IntentModel {
                 { "role": "user", "content": transcript }
             ]
         });
+
+        if !self.effort.is_empty() {
+            body["reasoning"] = json!({ "effort": self.effort });
+        }
 
         let response = self.post_with_retries(RESPONSES_URL, &body).await?;
         let call = first_tool_call(&response)?;

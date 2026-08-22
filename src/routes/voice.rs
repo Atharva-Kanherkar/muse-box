@@ -180,28 +180,14 @@ pub(crate) async fn post_voice(
         recover_document(&state.hub).await;
     }
     thinking.settle();
-    let (document, situation) = outcome?;
-
-    // Spoken after the action landed, so Muse never narrates something that
-    // then failed. A model that cannot speak, or a failure here, simply leaves
-    // the reply out rather than failing a command that already succeeded.
-    let speech = match state.model.say(&situation) {
-        Some(future) => match future.await {
-            Ok(speech) => Some(speech),
-            Err(error) => {
-                tracing::warn!(%error, "Muse could not speak its reply");
-                None
-            }
-        },
-        None => None,
-    };
+    let (document, speech) = outcome?;
     Ok(Json(VoiceResponse { document, speech }))
 }
 
 async fn run_voice_command(
     state: &VoiceState,
     audio: &AudioInput,
-) -> Result<(RenderDoc, String), AppError> {
+) -> Result<(RenderDoc, Option<Speech>), AppError> {
     let observation = state.hub.published_observation().await;
     let context = PlaybackContext {
         track: observation.track.clone(),
@@ -242,7 +228,7 @@ async fn run_voice_command(
 async fn finish_command(
     state: &VoiceState,
     intent: VoiceIntent,
-) -> Result<(RenderDoc, String), AppError> {
+) -> Result<(RenderDoc, Option<Speech>), AppError> {
     let tool = if addressed_to_muse(&intent.transcript) {
         intent.tool.clone()
     } else {
@@ -253,24 +239,67 @@ async fn finish_command(
         );
         ToolCall::NowPlaying
     };
-    let action = dispatch_tool(&state.spotify, &state.taste, &tool).await?;
+    let dispatched = dispatch_tool(&state.spotify, &state.taste, &tool).await?;
     state
         .hub
         .append_voice_log(VoiceLogEntry {
             transcript: intent.transcript,
-            action: action.clone(),
+            action: dispatched.action,
             timestamp: Utc::now(),
         })
         .await;
-    let fresh = state
-        .spotify
-        .currently_playing()
-        .await
-        .map_err(playback_error)?;
-    state.hub.force_publish(fresh).await?;
-    let document = state.hub.current_document(RenderParams::default()).await?;
-    let situation = describe(&document);
-    Ok((document.as_ref().clone(), situation))
+
+    // Only the hub knows what is playing when nothing was changed.
+    let spoken = match dispatched.spoken {
+        Some(spoken) => spoken,
+        None => now_playing_line(&state.hub.published_observation().await),
+    };
+
+    // Speech and the playback refresh run together: the sentence is already
+    // known, so waiting for the refresh before synthesizing was a full TTS
+    // round trip of pure added latency on every command.
+    let refresh = async {
+        let fresh = state
+            .spotify
+            .currently_playing()
+            .await
+            .map_err(playback_error)?;
+        state.hub.force_publish(fresh).await?;
+        let document = state.hub.current_document(RenderParams::default()).await?;
+        Ok::<_, AppError>(document.as_ref().clone())
+    };
+
+    let (document, speech) = match state.model.say(&spoken) {
+        Some(say) => {
+            let (document, speech) = tokio::join!(refresh, say);
+            let speech = match speech {
+                Ok(speech) => Some(speech),
+                Err(error) => {
+                    // A silent Muse must never fail a command that worked.
+                    tracing::warn!(%error, "Muse could not speak its reply");
+                    None
+                }
+            };
+            (document?, speech)
+        }
+        None => (refresh.await?, None),
+    };
+    Ok((document, speech))
+}
+
+/// The sentence for a request that changed nothing. Spoken verbatim, so it must
+/// never contain an action string, tool name or id.
+fn now_playing_line(observation: &PlaybackObservation) -> String {
+    match (
+        observation.track.as_deref(),
+        observation.artist.as_deref(),
+        observation.is_playing,
+    ) {
+        (Some(track), Some(artist), true) => format!("Playing {track}, by {artist}."),
+        (Some(track), _, true) => format!("Playing {track}."),
+        (Some(track), _, false) => format!("Paused on {track}."),
+        _ => "Nothing is playing.".to_string(),
+    }
 }
 
 /// Whether an utterance was actually aimed at Muse.
@@ -295,28 +324,6 @@ fn addressed_to_muse(transcript: &str) -> bool {
     lowered
         .split(|character: char| !character.is_ascii_alphanumeric())
         .any(|word| NAMES.contains(&word))
-}
-
-/// One line of ground truth for Muse to speak from, so the reply matches what
-/// actually happened rather than what was asked for.
-/// The sentence Muse says out loud.
-///
-/// Built in code, not by a model, and it must never contain an action string,
-/// a tool name or an id: speech is now synthesized from this text verbatim, so
-/// anything internal in here gets read aloud. That is exactly what happened when
-/// this returned "action spotify:play:track:3QJs...".
-fn describe(document: &RenderDoc) -> String {
-    let track = document.track.as_deref();
-    let artist = document.artist.as_deref();
-    match (&document.state, track, artist) {
-        (PlaybackState::Playing, Some(track), Some(artist)) => {
-            format!("Playing {track}, by {artist}.")
-        }
-        (PlaybackState::Playing, Some(track), None) => format!("Playing {track}."),
-        (PlaybackState::Paused, Some(track), _) => format!("Paused {track}."),
-        (PlaybackState::Playing | PlaybackState::Paused, None, _) => "Done.".to_string(),
-        _ => "Nothing is playing.".to_string(),
-    }
 }
 
 /// Restores a real document if a voice request never finishes.
@@ -360,11 +367,25 @@ impl Drop for ThinkingGuard {
     }
 }
 
+/// What a dispatch did: the log entry's action string, and the sentence Muse
+/// speaks. The sentence is composed here, at dispatch time, so synthesis can
+/// run in parallel with the playback refresh instead of after it — that
+/// serialization was a full TTS round trip of added latency on every command.
+struct Dispatched {
+    action: String,
+    /// `None` means "say what is currently playing", which only the hub knows.
+    spoken: Option<String>,
+}
+
 async fn dispatch_tool(
     spotify: &SpotifyClient,
     taste: &TasteIndex,
     tool: &ToolCall,
-) -> Result<String, AppError> {
+) -> Result<Dispatched, AppError> {
+    let done = |action: String, spoken: &str| Dispatched {
+        action,
+        spoken: Some(spoken.to_string()),
+    };
     match tool {
         ToolCall::PlayFromTaste { description } => {
             let matches = taste.search(description, 1).await?;
@@ -376,7 +397,10 @@ async fn dispatch_tool(
                         "play_from_taste matched a library track"
                     );
                     spotify.play_track(&track.id).await?;
-                    Ok(format!("taste:play:track:{}", track.id))
+                    Ok(done(
+                        format!("taste:play:track:{}", track.id),
+                        &format!("Playing {}, by {}.", track.name, track.artists),
+                    ))
                 }
                 // An empty index is the normal state before the first build, and
                 // a blind Spotify search is a better answer than nothing.
@@ -385,46 +409,72 @@ async fn dispatch_tool(
                         %description,
                         "taste index had no match; falling back to Spotify search"
                     );
-                    let track_id = spotify.search_top_track(description).await?;
-                    spotify.play_track(&track_id).await?;
-                    Ok(format!("spotify:play:track:{track_id}"))
+                    let track = spotify.search_top_track(description).await?;
+                    spotify.play_track(&track.id).await?;
+                    Ok(done(
+                        format!("spotify:play:track:{}", track.id),
+                        &spoken_for_track("Playing", &track),
+                    ))
                 }
             }
         }
         ToolCall::Play => {
             spotify.resume_playback().await?;
-            Ok("spotify:play".to_string())
+            Ok(done("spotify:play".to_string(), "Resumed."))
         }
         ToolCall::Pause => {
             spotify.pause_playback().await?;
-            Ok("spotify:pause".to_string())
+            Ok(done("spotify:pause".to_string(), "Paused."))
         }
         ToolCall::Next => {
             spotify.skip_next().await?;
-            Ok("spotify:next".to_string())
+            Ok(done("spotify:next".to_string(), "Next one."))
         }
         ToolCall::Previous => {
             spotify.skip_previous().await?;
-            Ok("spotify:previous".to_string())
+            Ok(done("spotify:previous".to_string(), "Going back."))
         }
         ToolCall::SearchAndPlay { query } => {
-            let track_id = spotify.search_top_track(query).await?;
+            let track = spotify.search_top_track(query).await?;
             // The query is the model's, the result is Spotify's ranking; when
             // the wrong song plays, this line says which of them to blame.
-            tracing::info!(%query, track_id = %track_id, "search_and_play resolved");
-            spotify.play_track(&track_id).await?;
-            Ok(format!("spotify:play:track:{track_id}"))
+            tracing::info!(%query, track_id = %track.id, track = %track.name, "search_and_play resolved");
+            spotify.play_track(&track.id).await?;
+            Ok(done(
+                format!("spotify:play:track:{}", track.id),
+                &spoken_for_track("Playing", &track),
+            ))
         }
         ToolCall::QueueSearch { query } => {
-            let track_id = spotify.search_top_track(query).await?;
-            spotify.queue_track(&track_id).await?;
-            Ok(format!("queue:search:{query}"))
+            let track = spotify.search_top_track(query).await?;
+            spotify.queue_track(&track.id).await?;
+            Ok(done(
+                format!("queue:search:{query}"),
+                &spoken_for_track("Queued", &track),
+            ))
         }
         ToolCall::SetVolume { percent } => {
             spotify.set_volume(*percent).await?;
-            Ok(format!("spotify:volume:{percent}"))
+            Ok(done(
+                format!("spotify:volume:{percent}"),
+                &format!("Volume {percent} percent."),
+            ))
         }
-        ToolCall::NowPlaying => Ok("query:now_playing".to_string()),
+        ToolCall::NowPlaying => Ok(Dispatched {
+            action: "query:now_playing".to_string(),
+            spoken: None,
+        }),
+    }
+}
+
+/// "Playing Thunderstruck, by AC/DC." — with graceful degradation when search
+/// returned no name, which older mocks and odd catalogue entries do.
+fn spoken_for_track(verb: &str, track: &crate::spotify::FoundTrack) -> String {
+    let artists = track.artist_line();
+    match (track.name.is_empty(), artists.is_empty()) {
+        (false, false) => format!("{verb} {}, by {artists}.", track.name),
+        (false, true) => format!("{verb} {}.", track.name),
+        _ => format!("{verb} it now."),
     }
 }
 
@@ -481,25 +531,14 @@ pub(crate) async fn post_command(
         recover_document(&state.hub).await;
     }
     thinking.settle();
-    let (document, situation) = outcome?;
-
-    let speech = match state.model.say(&situation) {
-        Some(future) => match future.await {
-            Ok(speech) => Some(speech),
-            Err(error) => {
-                tracing::warn!(%error, "Muse could not speak its reply");
-                None
-            }
-        },
-        None => None,
-    };
+    let (document, speech) = outcome?;
     Ok(Json(VoiceResponse { document, speech }))
 }
 
 async fn run_transcript_command(
     state: &VoiceState,
     transcript: &str,
-) -> Result<(RenderDoc, String), AppError> {
+) -> Result<(RenderDoc, Option<Speech>), AppError> {
     let observation = state.hub.published_observation().await;
     let context = PlaybackContext {
         track: observation.track.clone(),
@@ -1048,24 +1087,46 @@ mod tests {
 
     #[test]
     fn what_muse_says_never_leaks_internals() {
-        // Speech is synthesized from this text verbatim, so an action string or
-        // a track id in here gets read out loud. That really happened.
-        let mut document = RenderDoc::idle();
-        document.state = PlaybackState::Playing;
-        document.track = Some("I Like The Way You Kiss Me".to_string());
-        document.artist = Some("Artemas".to_string());
-
-        let said = describe(&document);
-        assert_eq!(said, "Playing I Like The Way You Kiss Me, by Artemas.");
-        for forbidden in ["spotify:", "taste:", "query:", "track:", "action"] {
-            assert!(!said.contains(forbidden), "leaked {forbidden:?}: {said}");
+        // These sentences are synthesized verbatim, so an action string, tool
+        // name or id in them gets read out loud. That really happened.
+        let mut observation = PlaybackObservation::idle(Utc::now());
+        observation.track = Some("I Like The Way You Kiss Me".to_string());
+        observation.artist = Some("Artemas".to_string());
+        observation.is_playing = true;
+        let lines = [
+            now_playing_line(&observation),
+            spoken_for_track(
+                "Playing",
+                &serde_json::from_value(serde_json::json!({
+                    "id": "x", "name": "Thunderstruck",
+                    "artists": [{ "name": "AC/DC" }]
+                }))
+                .expect("track"),
+            ),
+            spoken_for_track(
+                "Queued",
+                &serde_json::from_value(serde_json::json!({ "id": "x" })).expect("track"),
+            ),
+        ];
+        assert_eq!(lines[0], "Playing I Like The Way You Kiss Me, by Artemas.");
+        assert_eq!(lines[1], "Playing Thunderstruck, by AC/DC.");
+        // A nameless search result degrades to a sentence, not to emptiness.
+        assert_eq!(lines[2], "Queued it now.");
+        for line in &lines {
+            for forbidden in ["spotify:", "taste:", "query:", "track:", "action"] {
+                assert!(!line.contains(forbidden), "leaked {forbidden:?}: {line}");
+            }
         }
 
-        document.state = PlaybackState::Paused;
-        assert_eq!(describe(&document), "Paused I Like The Way You Kiss Me.");
-
-        document.state = PlaybackState::Idle;
-        assert_eq!(describe(&document), "Nothing is playing.");
+        observation.is_playing = false;
+        assert_eq!(
+            now_playing_line(&observation),
+            "Paused on I Like The Way You Kiss Me."
+        );
+        assert_eq!(
+            now_playing_line(&PlaybackObservation::idle(Utc::now())),
+            "Nothing is playing."
+        );
     }
 
     #[test]
@@ -1323,15 +1384,17 @@ mod tests {
             redirect_uri: "http://localhost/callback".to_string(),
             token_store_path: PathBuf::from("unused"),
         });
-        assert_eq!(
-            dispatch_tool(
-                &spotify,
-                &TasteIndex::new("test-key", PathBuf::from("unused")),
-                &ToolCall::NowPlaying
-            )
-            .await
-            .expect("query action"),
-            "query:now_playing"
+        let dispatched = dispatch_tool(
+            &spotify,
+            &TasteIndex::new("test-key", PathBuf::from("unused")),
+            &ToolCall::NowPlaying,
+        )
+        .await
+        .expect("query action");
+        assert_eq!(dispatched.action, "query:now_playing");
+        assert!(
+            dispatched.spoken.is_none(),
+            "only the hub knows what is playing"
         );
     }
 
@@ -1402,7 +1465,8 @@ mod tests {
                     tool,
                 )
                 .await
-                .expect("dispatch"),
+                .expect("dispatch")
+                .action,
             );
         }
         assert_eq!(

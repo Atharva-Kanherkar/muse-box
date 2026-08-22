@@ -251,12 +251,33 @@ struct SearchResponse {
 
 #[derive(Debug, Deserialize)]
 struct SearchTracks {
-    items: Vec<SearchTrack>,
+    items: Vec<FoundTrack>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SearchTrack {
-    id: String,
+/// What a search resolves to: enough to play it and to say what it is, so
+/// speech need not wait for a playback refresh.
+#[derive(Clone, Debug, Deserialize)]
+pub struct FoundTrack {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub artists: Vec<FoundArtist>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct FoundArtist {
+    pub name: String,
+}
+
+impl FoundTrack {
+    pub fn artist_line(&self) -> String {
+        self.artists
+            .iter()
+            .map(|artist| artist.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// Build an HTTP client that cannot hang indefinitely.
@@ -529,7 +550,7 @@ impl SpotifyClient {
         .await
     }
 
-    pub async fn search_top_track(&self, query: &str) -> Result<String, AppError> {
+    pub async fn search_top_track(&self, query: &str) -> Result<FoundTrack, AppError> {
         let access_token = self.access_token().await?;
         let url = format!(
             "{}/search",
@@ -553,7 +574,6 @@ impl SpotifyClient {
             .items
             .into_iter()
             .next()
-            .map(|track| track.id)
             .ok_or_else(|| AppError::Spotify(format!("no Spotify track matched: {query}")))
     }
 
@@ -1327,9 +1347,9 @@ mod tests {
         client.skip_previous().await.expect("previous");
         client.set_volume(73).await.expect("volume");
         let track_id = client.search_top_track("Teardrop").await.expect("search");
-        assert_eq!(track_id, "top-track");
-        client.play_track(&track_id).await.expect("play track");
-        client.queue_track(&track_id).await.expect("queue track");
+        assert_eq!(track_id.id, "top-track");
+        client.play_track(&track_id.id).await.expect("play track");
+        client.queue_track(&track_id.id).await.expect("queue track");
 
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 8);
