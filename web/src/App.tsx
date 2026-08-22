@@ -23,7 +23,7 @@ interface Connection {
 
 function loadConnection(): Connection {
   const fallback: Connection = {
-    baseUrl: import.meta.env.VITE_API_BASE_URL ?? "http://localhost:3000",
+    baseUrl: import.meta.env.VITE_API_BASE_URL ?? "",
     token: import.meta.env.VITE_DEVICE_TOKEN ?? "",
   };
   try {
@@ -36,6 +36,23 @@ function loadConnection(): Connection {
     };
   } catch {
     return fallback;
+  }
+}
+
+/**
+ * The deployed backend address, served by this app's own host at runtime, so
+ * repointing it is a variable change rather than a rebuild. Never the token:
+ * anything served here is public.
+ */
+async function fetchServedBaseUrl(): Promise<string> {
+  try {
+    const response = await fetch("/config.json", { cache: "no-store" });
+    if (!response.ok) return "";
+    const body = (await response.json()) as { apiBaseUrl?: string };
+    return body.apiBaseUrl?.trim() ?? "";
+  } catch {
+    // Dev server, or no config route: fall back to whatever was compiled in.
+    return "";
   }
 }
 
@@ -105,6 +122,9 @@ function Icon({ shape }: { shape: "prev" | "next" | "play" | "pause" | "gear" })
 export default function App() {
   const [connection, setConnection] = useState<Connection>(loadConnection);
   const [draft, setDraft] = useState<Connection>(connection);
+  // Undefined until the host has been asked; prevents a flash of the setup
+  // sheet before the served address is known.
+  const [servedBaseUrl, setServedBaseUrl] = useState<string | undefined>(undefined);
   const [doc, setDoc] = useState<RenderDoc | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>({ kind: "idle" });
   const [setupOpen, setSetupOpen] = useState(false);
@@ -113,6 +133,28 @@ export default function App() {
   const [controlError, setControlError] = useState<string | null>(null);
   const idleCanvasRef = useRef<HTMLCanvasElement>(null);
 
+  useEffect(() => {
+    let cancelled = false;
+    void fetchServedBaseUrl().then((url) => {
+      if (cancelled) return;
+      setServedBaseUrl(url);
+      // Only adopt it when nothing was chosen here, so an explicit override
+      // from the setup sheet still wins.
+      if (url) {
+        setConnection((current) =>
+          current.baseUrl.trim() === "" ? { ...current, baseUrl: url } : current,
+        );
+        setDraft((current) =>
+          current.baseUrl.trim() === "" ? { ...current, baseUrl: url } : current,
+        );
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const ready = servedBaseUrl !== undefined;
   const configured = connection.baseUrl.trim() !== "" && connection.token !== "";
 
   useEffect(() => {
@@ -305,7 +347,7 @@ export default function App() {
         />
       </footer>
 
-      {setupOpen || !configured ? (
+      {setupOpen || (ready && !configured) ? (
         <div
           className="veil-screen"
           role="dialog"

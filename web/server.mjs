@@ -42,6 +42,20 @@ createServer((request, response) => {
   }
 
   const path = (request.url ?? "/").split("?")[0] ?? "/";
+
+  // Runtime configuration: the client asks for this on boot, so the backend
+  // address is a variable on this service rather than something compiled in.
+  // Only the address — never the device token, which would be public here.
+  if (path === "/config.json") {
+    response
+      .writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+      })
+      .end(JSON.stringify({ apiBaseUrl: process.env.API_BASE_URL ?? "" }));
+    return;
+  }
+
   if (path === "/healthz") {
     response
       .writeHead(200, { "content-type": "application/json; charset=utf-8" })
