@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     error::AppError,
+    intent::IntentModel,
     realtime::{PlaybackContext, RealtimeManager, Speech, ToolCall, VoiceIntent},
     render::{PlaybackState, RenderDoc, VoiceLogEntry},
     spotify::{PlaybackFetchError, PlaybackObservation, SpotifyClient},
@@ -70,6 +71,46 @@ impl VoiceModel for FailingVoiceModel {
                 "voice model is not configured for this test".to_string(),
             ))
         })
+    }
+}
+
+/// Text in, tool out, over stateless HTTP — plus speech from the same client.
+///
+/// This is what the browser uses. It has no session to drop and no socket to
+/// reconnect, so a failure is one retryable request rather than a pipeline to
+/// rebuild.
+impl VoiceModel for IntentModel {
+    fn command<'a>(
+        &'a self,
+        _samples: &'a [i16],
+        _rate: u32,
+        _context: PlaybackContext,
+    ) -> VoiceFuture<'a> {
+        Box::pin(async {
+            Err(AppError::Voice(
+                "this model takes transcripts, not audio".to_string(),
+            ))
+        })
+    }
+
+    fn command_text<'a>(
+        &'a self,
+        transcript: &'a str,
+        context: PlaybackContext,
+    ) -> VoiceFuture<'a> {
+        Box::pin(async move {
+            self.intent(
+                transcript,
+                &context,
+                crate::realtime::MUSE_PERSONA,
+                &crate::intent::spotify_tools(),
+            )
+            .await
+        })
+    }
+
+    fn say<'a>(&'a self, situation: &'a str) -> Option<SpeechFuture<'a>> {
+        Some(Box::pin(async move { self.speak(situation).await }))
     }
 }
 

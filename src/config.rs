@@ -12,6 +12,12 @@ pub struct Config {
     pub spotify_token_store_path: PathBuf,
     pub openai_api_key: String,
     pub openai_realtime_model: String,
+    /// Model that turns a transcript into one tool call. Stateless chat
+    /// completions, so this is the reliable path; Realtime is only for audio.
+    pub openai_intent_model: String,
+    /// Text-to-speech model and voice for Muse's replies.
+    pub openai_speech_model: String,
+    pub openai_speech_voice: String,
     pub device_api_token: String,
     /// Offset applied to the idle clock's displayed digits. Scheduling stays on
     /// UTC minute boundaries; only the rendered `HH:MM` is localized, which
@@ -55,6 +61,12 @@ impl Config {
                 .context("OPENAI_API_KEY is required")?,
             openai_realtime_model: std::env::var("OPENAI_REALTIME_MODEL")
                 .unwrap_or_else(|_| "gpt-realtime".to_string()),
+            openai_intent_model: std::env::var("OPENAI_INTENT_MODEL")
+                .unwrap_or_else(|_| "gpt-4o".to_string()),
+            openai_speech_model: std::env::var("OPENAI_SPEECH_MODEL")
+                .unwrap_or_else(|_| "tts-1-hd".to_string()),
+            openai_speech_voice: std::env::var("OPENAI_SPEECH_VOICE")
+                .unwrap_or_else(|_| "alloy".to_string()),
             device_api_token: std::env::var("DEVICE_API_TOKEN")
                 .unwrap_or_else(|_| "dev-token-change-me".to_string()),
             idle_display_offset: idle_display_offset()?,

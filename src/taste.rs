@@ -28,6 +28,15 @@ const EMBEDDING_BATCH: usize = 96;
 /// Ceiling on how much library to index, so a listener with a huge account does
 /// not turn startup into a long job.
 pub const MAX_INDEXED_TRACKS: usize = 3_000;
+/// Cosine floor for calling a library track a match.
+///
+/// Without this, the nearest neighbour was returned however far away it was, so
+/// naming a song the listener does not own played whatever in their library
+/// happened to sit closest in embedding space — "I like the way you kiss me"
+/// became a different pop song entirely. Below the floor the caller gets nothing
+/// and falls back to a real Spotify search, which is the right answer for a
+/// track they do not have.
+const MIN_MATCH_SCORE: f32 = 0.42;
 
 /// One indexed track and its embedding.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,9 +170,18 @@ impl TasteIndex {
             .map(|entry| (dot(&query, &entry.embedding), entry))
             .collect();
         scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+        if let Some((best, entry)) = scored.first() {
+            tracing::debug!(
+                score = best,
+                track = %entry.track.name,
+                accepted = *best >= MIN_MATCH_SCORE,
+                "closest library match"
+            );
+        }
         Ok(scored
             .into_iter()
             .take(limit)
+            .filter(|(score, _)| *score >= MIN_MATCH_SCORE)
             .map(|(_, entry)| entry.track.clone())
             .collect())
     }

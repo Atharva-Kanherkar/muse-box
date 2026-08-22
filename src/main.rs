@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use muse_box::{
     config::Config,
+    intent::IntentModel,
     lyrics::LyricsIndex,
     realtime::RealtimeManager,
     routes,
@@ -58,11 +59,19 @@ async fn main() -> anyhow::Result<()> {
             .with_display_offset(config.idle_display_offset)
             .with_lyrics(lyrics),
     );
-    // Shared by the Realtime session and the embeddings used for taste search.
+    // Shared by the models and the embeddings used for taste search.
     let openai_api_key = config.openai_api_key.clone();
-    let realtime = Arc::new(RealtimeManager::new(
-        config.openai_api_key,
-        config.openai_realtime_model,
+    // Realtime is built but currently only serves the audio path, which hardware
+    // uses; the browser sends transcripts, which go through plain HTTP.
+    let _realtime = Arc::new(RealtimeManager::new(
+        config.openai_api_key.clone(),
+        config.openai_realtime_model.clone(),
+    ));
+    let voice_model = Arc::new(IntentModel::new(
+        openai_api_key.clone(),
+        config.openai_intent_model.clone(),
+        config.openai_speech_model.clone(),
+        config.openai_speech_voice.clone(),
     ));
     let (_background_shutdown, poll_shutdown_rx) = tokio::sync::watch::channel(false);
     let idle_shutdown_rx = poll_shutdown_rx.clone();
@@ -125,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
         spotify,
         device_api_token: config.device_api_token,
         state_hub,
-        voice_model: realtime,
+        voice_model,
         taste,
         sessions,
         secure_cookies,

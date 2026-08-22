@@ -30,7 +30,7 @@ const MUSE_VOICE: &str = "marin";
 /// The client listens continuously and forwards every utterance, so Muse is
 /// also the gate: speech that was not aimed at it must resolve to the
 /// no-op `now_playing` tool rather than changing playback.
-const MUSE_PERSONA: &str = "\
+pub const MUSE_PERSONA: &str = "\
 You are Muse, the voice of a small music box sitting on a shelf. You control \
 one Spotify account through the tools you are given.
 
@@ -727,11 +727,13 @@ pub fn spotify_tool_schema() -> Value {
         json!({
             "type": "function",
             "name": "play_from_taste",
-            "description": "Play something from this listener's own music: their \
-                            playlists, saved tracks, top tracks and recent plays, \
-                            matched semantically. Prefer this for any request about \
-                            mood, vibe, an artist or language they listen to, or \
-                            anything phrased as what they like.",
+            "description": "Play something from this listener's own music by \
+                            description, matched semantically against their \
+                            playlists, saved tracks, top tracks and recent plays. \
+                            Only for requests with NO specific title: a mood, a \
+                            vibe, an occasion, a language, or \"something I like\". \
+                            If the request names a song or an artist, however \
+                            loosely, use search_and_play instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -749,12 +751,12 @@ pub fn spotify_tool_schema() -> Value {
         }),
         search(
             "search_and_play",
-            "Search Spotify and start playing the best match right now, replacing \
-             whatever is playing. This is the default for any request to hear \
-             something, including corrections such as wanting a different version \
-             of the current track. Use this only when a specific track or artist \
-             is named that play_from_taste did not find, or that is plainly not \
-             theirs."
+            "Search all of Spotify and start playing the best match right now, \
+             replacing whatever is playing. Use this whenever a song title or an \
+             artist is named, even partially, even if it sounds like a phrase \
+             rather than a title — most requests naming words from a song belong \
+             here, not in play_from_taste. Also for corrections such as wanting a \
+             different version of the current track."
         ),
         search(
             "queue_search",
