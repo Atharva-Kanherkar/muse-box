@@ -269,7 +269,7 @@ async fn finish_command(
         .map_err(playback_error)?;
     state.hub.force_publish(fresh).await?;
     let document = state.hub.current_document(RenderParams::default()).await?;
-    let situation = describe(&action, &document);
+    let situation = describe(&document);
     Ok((document.as_ref().clone(), situation))
 }
 
@@ -299,15 +299,23 @@ fn addressed_to_muse(transcript: &str) -> bool {
 
 /// One line of ground truth for Muse to speak from, so the reply matches what
 /// actually happened rather than what was asked for.
-fn describe(action: &str, document: &RenderDoc) -> String {
-    let track = document.track.as_deref().unwrap_or("nothing");
-    let artist = document.artist.as_deref().unwrap_or("unknown artist");
-    match document.state {
-        PlaybackState::Playing => {
-            format!("action {action}; now playing {track} by {artist}")
+/// The sentence Muse says out loud.
+///
+/// Built in code, not by a model, and it must never contain an action string,
+/// a tool name or an id: speech is now synthesized from this text verbatim, so
+/// anything internal in here gets read aloud. That is exactly what happened when
+/// this returned "action spotify:play:track:3QJs...".
+fn describe(document: &RenderDoc) -> String {
+    let track = document.track.as_deref();
+    let artist = document.artist.as_deref();
+    match (&document.state, track, artist) {
+        (PlaybackState::Playing, Some(track), Some(artist)) => {
+            format!("Playing {track}, by {artist}.")
         }
-        PlaybackState::Paused => format!("action {action}; paused on {track} by {artist}"),
-        _ => format!("action {action}; nothing is playing"),
+        (PlaybackState::Playing, Some(track), None) => format!("Playing {track}."),
+        (PlaybackState::Paused, Some(track), _) => format!("Paused {track}."),
+        (PlaybackState::Playing | PlaybackState::Paused, None, _) => "Done.".to_string(),
+        _ => "Nothing is playing.".to_string(),
     }
 }
 
@@ -362,6 +370,11 @@ async fn dispatch_tool(
             let matches = taste.search(description, 1).await?;
             match matches.first() {
                 Some(track) => {
+                    tracing::info!(
+                        %description,
+                        matched = %track.name,
+                        "play_from_taste matched a library track"
+                    );
                     spotify.play_track(&track.id).await?;
                     Ok(format!("taste:play:track:{}", track.id))
                 }
@@ -396,6 +409,9 @@ async fn dispatch_tool(
         }
         ToolCall::SearchAndPlay { query } => {
             let track_id = spotify.search_top_track(query).await?;
+            // The query is the model's, the result is Spotify's ranking; when
+            // the wrong song plays, this line says which of them to blame.
+            tracing::info!(%query, track_id = %track_id, "search_and_play resolved");
             spotify.play_track(&track_id).await?;
             Ok(format!("spotify:play:track:{track_id}"))
         }
@@ -803,8 +819,19 @@ mod tests {
             let speech = self.speech.clone();
             let situation = situation.to_string();
             Some(Box::pin(async move {
-                // Muse speaks from what actually happened, not from the request.
-                assert!(situation.contains("action spotify:pause"), "{situation}");
+                // Muse speaks from what actually happened, and it must be a
+                // sentence: this text is synthesized verbatim, so anything
+                // internal in it would be read out loud.
+                assert!(
+                    situation.starts_with("Paused") || situation == "Nothing is playing.",
+                    "{situation}"
+                );
+                for internal in ["spotify:", "taste:", "query:", "action"] {
+                    assert!(
+                        !situation.contains(internal),
+                        "leaked {internal:?}: {situation}"
+                    );
+                }
                 speech.ok_or_else(|| AppError::Voice("no voice today".to_string()))
             }))
         }
@@ -1017,6 +1044,28 @@ mod tests {
             .expect("body");
         let document: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(document["voice_log"][0]["action"], "query:now_playing");
+    }
+
+    #[test]
+    fn what_muse_says_never_leaks_internals() {
+        // Speech is synthesized from this text verbatim, so an action string or
+        // a track id in here gets read out loud. That really happened.
+        let mut document = RenderDoc::idle();
+        document.state = PlaybackState::Playing;
+        document.track = Some("I Like The Way You Kiss Me".to_string());
+        document.artist = Some("Artemas".to_string());
+
+        let said = describe(&document);
+        assert_eq!(said, "Playing I Like The Way You Kiss Me, by Artemas.");
+        for forbidden in ["spotify:", "taste:", "query:", "track:", "action"] {
+            assert!(!said.contains(forbidden), "leaked {forbidden:?}: {said}");
+        }
+
+        document.state = PlaybackState::Paused;
+        assert_eq!(describe(&document), "Paused I Like The Way You Kiss Me.");
+
+        document.state = PlaybackState::Idle;
+        assert_eq!(describe(&document), "Nothing is playing.");
     }
 
     #[test]

@@ -60,13 +60,13 @@ impl Config {
             openai_api_key: std::env::var("OPENAI_API_KEY")
                 .context("OPENAI_API_KEY is required")?,
             openai_realtime_model: std::env::var("OPENAI_REALTIME_MODEL")
-                .unwrap_or_else(|_| "gpt-realtime".to_string()),
+                .unwrap_or_else(|_| "gpt-realtime-2.1".to_string()),
             openai_intent_model: std::env::var("OPENAI_INTENT_MODEL")
-                .unwrap_or_else(|_| "gpt-4o".to_string()),
+                .unwrap_or_else(|_| "gpt-5.6-terra".to_string()),
             openai_speech_model: std::env::var("OPENAI_SPEECH_MODEL")
-                .unwrap_or_else(|_| "tts-1-hd".to_string()),
+                .unwrap_or_else(|_| "gpt-4o-mini-tts".to_string()),
             openai_speech_voice: std::env::var("OPENAI_SPEECH_VOICE")
-                .unwrap_or_else(|_| "alloy".to_string()),
+                .unwrap_or_else(|_| "cedar".to_string()),
             device_api_token: std::env::var("DEVICE_API_TOKEN")
                 .unwrap_or_else(|_| "dev-token-change-me".to_string()),
             idle_display_offset: idle_display_offset()?,

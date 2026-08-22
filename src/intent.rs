@@ -21,7 +21,7 @@ use crate::{
     realtime::{PlaybackContext, Speech, ToolCall, VoiceIntent, parse_realtime_tool_call},
 };
 
-const CHAT_URL: &str = "https://api.openai.com/v1/chat/completions";
+const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 const SPEECH_URL: &str = "https://api.openai.com/v1/audio/speech";
 /// Muse's replies come back as raw PCM16 at this rate, matching what the
 /// hardware and the browser already play.
@@ -69,18 +69,20 @@ impl IntentModel {
         let context_json = serde_json::to_string(context)
             .map_err(|_| AppError::Voice("failed to serialize playback context".to_string()))?;
 
+        // The Responses API takes tools in the same flat shape the Realtime
+        // schema already uses, so there is nothing to translate.
         let body = json!({
             "model": self.model,
             "tool_choice": "required",
             "parallel_tool_calls": false,
-            "tools": chat_tools(tools),
-            "messages": [
-                { "role": "system", "content": format!("{instructions}\n\nCurrent playback context: {context_json}") },
+            "tools": tools,
+            "instructions": format!("{instructions}\n\nCurrent playback context: {context_json}"),
+            "input": [
                 { "role": "user", "content": transcript }
             ]
         });
 
-        let response = self.post_with_retries(CHAT_URL, &body).await?;
+        let response = self.post_with_retries(RESPONSES_URL, &body).await?;
         let call = first_tool_call(&response)?;
         let tool = parse_realtime_tool_call(&call.name, &call.arguments)?;
         Ok(VoiceIntent {
@@ -216,48 +218,31 @@ struct NamedCall {
     arguments: String,
 }
 
+/// Pull the tool call out of a Responses `output` array.
+///
+/// The array can also carry reasoning items, so the call is searched for by
+/// type rather than assumed to be first.
 fn first_tool_call(response: &Value) -> Result<NamedCall, AppError> {
     #[derive(Deserialize)]
-    struct Function {
+    struct Call {
         name: String,
         arguments: String,
     }
-    #[derive(Deserialize)]
-    struct Call {
-        function: Function,
-    }
 
-    let call = response
-        .pointer("/choices/0/message/tool_calls/0")
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::Voice("model response had no output".to_string()))?;
+    let call = output
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
         .ok_or_else(|| AppError::Voice("model chose no tool".to_string()))?;
     let call: Call = serde_json::from_value(call.clone())
         .map_err(|error| AppError::Voice(format!("model tool call was malformed: {error}")))?;
     Ok(NamedCall {
-        name: call.function.name,
-        arguments: call.function.arguments,
+        name: call.name,
+        arguments: call.arguments,
     })
-}
-
-/// The Realtime schema lists tools flat; chat completions nests them under
-/// `function`. Same definitions either way, so there is one source of truth.
-fn chat_tools(tools: &Value) -> Value {
-    let Some(list) = tools.as_array() else {
-        return json!([]);
-    };
-    Value::Array(
-        list.iter()
-            .filter_map(|tool| {
-                Some(json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name")?,
-                        "description": tool.get("description")?,
-                        "parameters": tool.get("parameters")?,
-                    }
-                }))
-            })
-            .collect(),
-    )
 }
 
 /// Convenience so callers do not have to know the tool shape.
@@ -273,37 +258,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn realtime_tools_translate_into_chat_tools() {
-        let chat = chat_tools(&spotify_tools());
-        let list = chat.as_array().expect("an array");
+    fn the_tool_schema_is_already_in_the_shape_responses_wants() {
+        // Responses takes tools flat, which is what the Realtime schema emits,
+        // so there is one source of truth and no translation to drift.
+        let tools = spotify_tools();
+        let list = tools.as_array().expect("an array");
         assert_eq!(list.len(), 9);
         for tool in list {
             assert_eq!(tool["type"], "function");
-            // Chat completions nests what Realtime lists flat; losing either the
-            // name or the parameters would silently disable a tool.
-            assert!(tool["function"]["name"].is_string(), "{tool}");
-            assert!(tool["function"]["parameters"].is_object(), "{tool}");
+            assert!(tool["name"].is_string(), "{tool}");
+            assert!(tool["parameters"].is_object(), "{tool}");
         }
-        let names: Vec<_> = list
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str())
-            .collect();
-        assert!(names.contains(&"play_from_taste"), "{names:?}");
-        assert!(names.contains(&"search_and_play"), "{names:?}");
     }
 
     #[test]
-    fn a_tool_call_is_read_out_of_a_real_response_shape() {
+    fn a_tool_call_is_found_past_any_reasoning_items() {
+        // Reasoning models put a reasoning item in the output first, so the call
+        // cannot be assumed to be at index zero.
         let response = json!({
-            "choices": [{
-                "message": {
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": { "name": "pause", "arguments": "{}" }
-                    }]
-                }
-            }]
+            "output": [
+                { "type": "reasoning", "summary": [] },
+                { "type": "function_call", "call_id": "call_1",
+                  "name": "pause", "arguments": "{}" }
+            ]
         });
         let call = first_tool_call(&response).expect("a call");
         assert_eq!(call.name, "pause");
@@ -312,8 +289,12 @@ mod tests {
 
     #[test]
     fn a_response_without_a_tool_call_is_an_error_not_a_silent_no_op() {
-        let response = json!({ "choices": [{ "message": { "content": "sure" } }] });
-        assert!(first_tool_call(&response).is_err());
+        let spoke_instead = json!({
+            "output": [{ "type": "message", "content": [{ "type": "output_text",
+                         "text": "sure" }] }]
+        });
+        assert!(first_tool_call(&spoke_instead).is_err());
+        assert!(first_tool_call(&json!({ "output": [] })).is_err());
         assert!(first_tool_call(&json!({})).is_err());
     }
 
