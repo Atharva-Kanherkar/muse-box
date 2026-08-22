@@ -16,6 +16,7 @@ use crate::{
     render::{PlaybackState, RenderDoc, VoiceLogEntry},
     spotify::{PlaybackFetchError, PlaybackObservation, SpotifyClient},
     state::{RenderParams, StateHub},
+    taste::TasteIndex,
 };
 
 const MAX_AUDIO_SECONDS: u64 = 30;
@@ -77,6 +78,7 @@ impl VoiceModel for RealtimeManager {
 
 #[derive(Clone)]
 pub(crate) struct VoiceState {
+    pub(crate) taste: Arc<TasteIndex>,
     pub(crate) spotify: SpotifyClient,
     pub(crate) model: Arc<dyn VoiceModel>,
     pub(crate) hub: Arc<StateHub>,
@@ -147,7 +149,7 @@ async fn run_voice_command(
         .model
         .command(&audio.samples, audio.rate, context)
         .await?;
-    let action = dispatch_tool(&state.spotify, &intent.tool).await?;
+    let action = dispatch_tool(&state.spotify, &state.taste, &intent.tool).await?;
     state
         .hub
         .append_voice_log(VoiceLogEntry {
@@ -222,8 +224,32 @@ impl Drop for ThinkingGuard {
     }
 }
 
-async fn dispatch_tool(spotify: &SpotifyClient, tool: &ToolCall) -> Result<String, AppError> {
+async fn dispatch_tool(
+    spotify: &SpotifyClient,
+    taste: &TasteIndex,
+    tool: &ToolCall,
+) -> Result<String, AppError> {
     match tool {
+        ToolCall::PlayFromTaste { description } => {
+            let matches = taste.search(description, 1).await?;
+            match matches.first() {
+                Some(track) => {
+                    spotify.play_track(&track.id).await?;
+                    Ok(format!("taste:play:track:{}", track.id))
+                }
+                // An empty index is the normal state before the first build, and
+                // a blind Spotify search is a better answer than nothing.
+                None => {
+                    tracing::info!(
+                        %description,
+                        "taste index had no match; falling back to Spotify search"
+                    );
+                    let track_id = spotify.search_top_track(description).await?;
+                    spotify.play_track(&track_id).await?;
+                    Ok(format!("spotify:play:track:{track_id}"))
+                }
+            }
+        }
         ToolCall::Play => {
             spotify.resume_playback().await?;
             Ok("spotify:play".to_string())
@@ -496,6 +522,12 @@ mod tests {
 
     use super::*;
 
+    /// An empty index: taste search returns nothing and dispatch falls back to
+    /// a plain Spotify search, which is what these tests assert against.
+    fn test_taste() -> Arc<TasteIndex> {
+        Arc::new(TasteIndex::new("test-key", PathBuf::from("unused")))
+    }
+
     enum ModelResult {
         Pause,
         Fail,
@@ -567,6 +599,7 @@ mod tests {
             "device-token".to_string(),
             Arc::new(StateHub::new()),
             Arc::new(SpeakingModel { speech }),
+            test_taste(),
         );
         let response = app
             .oneshot(
@@ -652,6 +685,7 @@ mod tests {
                 release,
                 result: ModelResult::Pause,
             }),
+            test_taste(),
         );
 
         let request = Request::builder()
@@ -747,6 +781,7 @@ mod tests {
             "device-token".to_string(),
             Arc::new(StateHub::new()),
             Arc::new(FailingVoiceModel),
+            test_taste(),
         );
         let cases = [
             (
@@ -811,7 +846,7 @@ mod tests {
             token_store_path: PathBuf::from("unused"),
         });
         assert_eq!(
-            dispatch_tool(&spotify, &ToolCall::NowPlaying)
+            dispatch_tool(&spotify, &test_taste(), &ToolCall::NowPlaying)
                 .await
                 .expect("query action"),
             "query:now_playing"
@@ -878,7 +913,11 @@ mod tests {
         ];
         let mut actions = Vec::new();
         for tool in &tools {
-            actions.push(dispatch_tool(&spotify, tool).await.expect("dispatch"));
+            actions.push(
+                dispatch_tool(&spotify, &test_taste(), tool)
+                    .await
+                    .expect("dispatch"),
+            );
         }
         assert_eq!(
             actions,
@@ -949,6 +988,7 @@ mod tests {
                 release: release.clone(),
                 result: ModelResult::Pause,
             }),
+            test_taste(),
         );
         let mut events = open_state_stream(&app).await;
         assert_eq!(next_state(&mut events).await["state"], "idle");
@@ -993,6 +1033,7 @@ mod tests {
                 release: release.clone(),
                 result: ModelResult::Fail,
             }),
+            test_taste(),
         );
         let mut events = open_state_stream(&app).await;
         assert_eq!(next_state(&mut events).await["state"], "idle");
@@ -1034,6 +1075,7 @@ mod tests {
                 release: release.clone(),
                 result: ModelResult::Pause,
             }),
+            test_taste(),
         );
         let mut events = open_state_stream(&app).await;
         let _initial = next_state(&mut events).await;

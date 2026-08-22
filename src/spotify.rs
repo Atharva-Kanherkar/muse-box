@@ -18,7 +18,12 @@ use crate::error::AppError;
 const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const SPOTIFY_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const SPOTIFY_API_BASE_URL: &str = "https://api.spotify.com/v1";
-const SPOTIFY_SCOPES: &str = "user-read-playback-state user-modify-playback-state";
+/// Playback control plus everything needed to learn the listener's taste.
+/// Changing this requires re-authorizing at `/auth/spotify`: a stored refresh
+/// token only carries the scopes it was granted.
+const SPOTIFY_SCOPES: &str = "user-read-playback-state user-modify-playback-state \
+user-top-read user-read-recently-played user-library-read \
+playlist-read-private playlist-read-collaborative";
 const REFRESH_WINDOW_SECONDS: i64 = 60;
 /// Whole-request budget for every Spotify call. reqwest sets no timeout by
 /// default, and an accepted-but-silent connection would otherwise hang the poll
@@ -136,7 +141,7 @@ struct CurrentlyPlayingResponse {
 
 #[derive(Debug, Deserialize)]
 struct SpotifyTrack {
-    id: String,
+    id: Option<String>,
     name: String,
     duration_ms: u64,
     artists: Vec<SpotifyArtist>,
@@ -157,6 +162,57 @@ struct SpotifyAlbum {
 #[derive(Debug, Deserialize)]
 struct SpotifyImage {
     url: String,
+}
+
+/// One track from the listener's own library, with where it was found.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryTrack {
+    pub id: String,
+    pub name: String,
+    pub artists: String,
+    pub album: String,
+    /// Playlist names, "saved", "top tracks", "recently played".
+    pub sources: Vec<String>,
+}
+
+impl LibraryTrack {
+    /// The text that gets embedded. Artists first: taste requests name artists
+    /// far more often than albums.
+    pub fn embedding_text(&self) -> String {
+        let sources = self.sources.join(", ");
+        format!(
+            "{} by {} — album {} — appears in: {}",
+            self.name, self.artists, self.album, sources
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PagedTracks {
+    items: Vec<PagedTrackItem>,
+    next: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PagedTrackItem {
+    track: Option<SpotifyTrack>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopTracks {
+    items: Vec<SpotifyTrack>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaylistPage {
+    items: Vec<PlaylistSummary>,
+    next: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaylistSummary {
+    id: String,
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -408,7 +464,7 @@ impl SpotifyClient {
         };
         Ok(PlaybackObservation {
             observed_at,
-            track_id: Some(track.id),
+            track_id: track.id,
             track: Some(track.name),
             artist: Some(
                 track
@@ -481,6 +537,95 @@ impl SpotifyClient {
             .next()
             .map(|track| track.id)
             .ok_or_else(|| AppError::Spotify(format!("no Spotify track matched: {query}")))
+    }
+
+    /// Fetch the listener's library: what they saved, what they play most, what
+    /// they played lately, and everything in their playlists.
+    ///
+    /// Deduplicated by track id, so a song in three playlists becomes one entry
+    /// listing all three, which is exactly the signal a taste query wants.
+    pub async fn library_tracks(&self, max_tracks: usize) -> Result<Vec<LibraryTrack>, AppError> {
+        let mut collected: HashMap<String, LibraryTrack> = HashMap::new();
+
+        for term in ["short_term", "medium_term", "long_term"] {
+            let top: TopTracks = self
+                .api_get(&format!("me/top/tracks?limit=50&time_range={term}"))
+                .await?;
+            for track in top.items {
+                merge_track(&mut collected, track, "top tracks");
+            }
+        }
+
+        let recent: PagedTracks = self.api_get("me/player/recently-played?limit=50").await?;
+        for item in recent.items {
+            if let Some(track) = item.track {
+                merge_track(&mut collected, track, "recently played");
+            }
+        }
+
+        let mut next = Some("me/tracks?limit=50".to_string());
+        while let Some(path) = next.take() {
+            if collected.len() >= max_tracks {
+                break;
+            }
+            let page: PagedTracks = self.api_get(&path).await?;
+            for item in page.items {
+                if let Some(track) = item.track {
+                    merge_track(&mut collected, track, "saved");
+                }
+            }
+            next = page.next.and_then(absolute_to_path);
+        }
+
+        let mut next = Some("me/playlists?limit=50".to_string());
+        while let Some(path) = next.take() {
+            let page: PlaylistPage = self.api_get(&path).await?;
+            for playlist in page.items {
+                if collected.len() >= max_tracks {
+                    break;
+                }
+                let mut tracks = Some(format!("playlists/{}/tracks?limit=100", playlist.id));
+                while let Some(track_path) = tracks.take() {
+                    if collected.len() >= max_tracks {
+                        break;
+                    }
+                    let page: PagedTracks = self.api_get(&track_path).await?;
+                    for item in page.items {
+                        if let Some(track) = item.track {
+                            merge_track(&mut collected, track, &playlist.name);
+                        }
+                    }
+                    tracks = page.next.and_then(absolute_to_path);
+                }
+            }
+            next = page.next.and_then(absolute_to_path);
+        }
+
+        let mut tracks: Vec<_> = collected.into_values().collect();
+        // Stable order so a rebuilt index is comparable to the last one.
+        tracks.sort_by(|left, right| left.id.cmp(&right.id));
+        tracks.truncate(max_tracks);
+        Ok(tracks)
+    }
+
+    async fn api_get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, AppError> {
+        let access_token = self.access_token().await?;
+        let url = format!(
+            "{}/{}",
+            self.endpoints.api_base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        );
+        self.http
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(spotify_api_error)?
+            .error_for_status()
+            .map_err(spotify_api_error)?
+            .json::<T>()
+            .await
+            .map_err(spotify_api_error)
     }
 
     pub async fn play_track(&self, track_id: &str) -> Result<(), AppError> {
@@ -734,6 +879,38 @@ fn player_response_error(response: reqwest::Response) -> Result<(), AppError> {
     Err(AppError::Spotify(format!(
         "Spotify Web API request failed with {status}"
     )))
+}
+
+/// Add a track to the set, or note one more place an existing one appears.
+fn merge_track(collected: &mut HashMap<String, LibraryTrack>, track: SpotifyTrack, source: &str) {
+    // Local files have no id, so they can never be played back by id.
+    let Some(id) = track.id else {
+        return;
+    };
+    let artists = track
+        .artists
+        .into_iter()
+        .map(|artist| artist.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let entry = collected.entry(id.clone()).or_insert_with(|| LibraryTrack {
+        id,
+        name: track.name,
+        artists,
+        album: track.album.name,
+        sources: Vec::new(),
+    });
+    if !entry.sources.iter().any(|existing| existing == source) {
+        entry.sources.push(source.to_string());
+    }
+}
+
+/// Spotify pages with absolute `next` URLs; keep only the part after `/v1/` so
+/// the configured base URL still applies (which is what the tests point at).
+fn absolute_to_path(next: String) -> Option<String> {
+    next.split_once("/v1/")
+        .map(|(_, path)| path.to_string())
+        .or(Some(next))
 }
 
 fn spotify_api_error(error: reqwest::Error) -> AppError {

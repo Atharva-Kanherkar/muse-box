@@ -14,7 +14,7 @@ use axum::{
 use serde_json::{Value, json};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use crate::{error::AppError, spotify::SpotifyClient, state::StateHub};
+use crate::{error::AppError, spotify::SpotifyClient, state::StateHub, taste::TasteIndex};
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -34,8 +34,10 @@ pub fn router(
     device_api_token: String,
     state_hub: Arc<StateHub>,
     voice_model: Arc<dyn voice::VoiceModel>,
+    taste: Arc<TasteIndex>,
 ) -> Router {
     let voice_state = voice::VoiceState {
+        taste,
         spotify: spotify.clone(),
         model: voice_model,
         hub: state_hub.clone(),
@@ -193,6 +195,12 @@ mod tests {
 
     use super::*;
 
+    /// An empty index: taste search returns nothing and dispatch falls back to
+    /// a plain Spotify search, which is what these tests assert against.
+    fn test_taste() -> Arc<TasteIndex> {
+        Arc::new(TasteIndex::new("test-key", PathBuf::from("unused")))
+    }
+
     fn test_spotify(path: PathBuf) -> SpotifyClient {
         SpotifyClient::new(SpotifyConfig {
             client_id: "client-id".to_string(),
@@ -208,6 +216,7 @@ mod tests {
             token.to_string(),
             Arc::new(StateHub::new()),
             Arc::new(voice::FailingVoiceModel),
+            test_taste(),
         )
     }
 

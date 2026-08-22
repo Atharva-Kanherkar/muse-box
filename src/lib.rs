@@ -13,3 +13,4 @@ pub mod render;
 pub mod routes;
 pub mod spotify;
 pub mod state;
+pub mod taste;

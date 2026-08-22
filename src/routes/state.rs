@@ -82,6 +82,13 @@ mod tests {
     };
 
     use super::*;
+    use crate::taste::TasteIndex;
+
+    /// An empty index: taste search returns nothing and dispatch falls back to
+    /// a plain Spotify search, which is what these tests assert against.
+    fn test_taste() -> Arc<TasteIndex> {
+        Arc::new(TasteIndex::new("test-key", PathBuf::from("unused")))
+    }
 
     #[tokio::test]
     async fn sse_is_immediate_silent_for_steady_progress_then_emits_changes() {
@@ -200,6 +207,7 @@ mod tests {
             "test-token".to_string(),
             hub,
             Arc::new(routes::voice::FailingVoiceModel),
+            test_taste(),
         )
     }
 

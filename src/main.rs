@@ -7,6 +7,7 @@ use muse_box::{
     routes,
     spotify::{SpotifyClient, SpotifyConfig},
     state::{StateHub, run_idle_scheduler, run_poll_loop},
+    taste::{MAX_INDEXED_TRACKS, TasteIndex},
 };
 
 #[tokio::main]
@@ -45,6 +46,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state_hub = Arc::new(StateHub::new().with_display_offset(config.idle_display_offset));
+    // Shared by the Realtime session and the embeddings used for taste search.
+    let openai_api_key = config.openai_api_key.clone();
     let realtime = Arc::new(RealtimeManager::new(
         config.openai_api_key,
         config.openai_realtime_model,
@@ -63,7 +66,39 @@ async fn main() -> anyhow::Result<()> {
     ));
     let _idle_task = tokio::spawn(run_idle_scheduler(state_hub.clone(), idle_shutdown_rx));
 
-    let app = routes::router(spotify, config.device_api_token, state_hub, realtime)
+    // Built in the background: embedding a whole library takes a while, and the
+    // box should be listening and rendering long before it finishes. Until it
+    // does, taste requests fall back to a plain Spotify search.
+    let taste = Arc::new(TasteIndex::new(
+        openai_api_key.clone(),
+        config.taste_index_path.clone(),
+    ));
+    let taste_builder = taste.clone();
+    let taste_spotify = spotify.clone();
+    let _taste_task = tokio::spawn(async move {
+        match taste_builder.load().await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "could not load taste index"),
+        }
+        match taste_spotify.library_tracks(MAX_INDEXED_TRACKS).await {
+            Ok(library) if library.is_empty() => {
+                tracing::info!("Spotify returned no library to index");
+            }
+            Ok(library) => {
+                tracing::info!(tracks = library.len(), "embedding music library");
+                if let Err(error) = taste_builder.rebuild(library).await {
+                    tracing::warn!(%error, "could not build taste index");
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "could not read Spotify library; re-authorize at /auth/spotify if the scopes changed"
+            ),
+        }
+    });
+
+    let app = routes::router(spotify, config.device_api_token, state_hub, realtime, taste)
         .layer(routes::cors_layer(&config.cors_allowed_origins));
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await

@@ -21,6 +21,9 @@ pub struct Config {
     /// is safe here because auth is a bearer token rather than a cookie, so
     /// there is no ambient credential for another site to ride on.
     pub cors_allowed_origins: Vec<String>,
+    /// Where the embedded music-taste index lives. Belongs on the same volume
+    /// as the token store so a redeploy does not re-embed the whole library.
+    pub taste_index_path: PathBuf,
 }
 
 impl Config {
@@ -47,6 +50,9 @@ impl Config {
             device_api_token: std::env::var("DEVICE_API_TOKEN")
                 .unwrap_or_else(|_| "dev-token-change-me".to_string()),
             idle_display_offset: idle_display_offset()?,
+            taste_index_path: std::env::var("TASTE_INDEX_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("./data/taste_index.json")),
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')

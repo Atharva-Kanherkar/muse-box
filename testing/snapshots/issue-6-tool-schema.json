@@ -40,7 +40,26 @@
     "type": "function"
   },
   {
-    "description": "Search Spotify and start playing the best match right now, replacing whatever is playing. This is the default for any request to hear something, including corrections such as wanting a different version of the current track.",
+    "description": "Play something from this listener's own music: their playlists, saved tracks, top tracks and recent plays, matched semantically. Prefer this for any request about mood, vibe, an artist or language they listen to, or anything phrased as what they like.",
+    "name": "play_from_taste",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "query": {
+          "description": "What the listener wants, in their own words: a mood, an artist, a language, an occasion. Not a Spotify search string.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "type": "function"
+  },
+  {
+    "description": "Search Spotify and start playing the best match right now, replacing whatever is playing. This is the default for any request to hear something, including corrections such as wanting a different version of the current track. Use this only when a specific track or artist is named that play_from_taste did not find, or that is plainly not theirs.",
     "name": "search_and_play",
     "parameters": {
       "additionalProperties": false,

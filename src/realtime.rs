@@ -503,9 +503,19 @@ pub enum ToolCall {
     Pause,
     Next,
     Previous,
-    SearchAndPlay { query: String },
-    QueueSearch { query: String },
-    SetVolume { percent: u8 },
+    /// Play from the listener's own library, matched semantically.
+    PlayFromTaste {
+        description: String,
+    },
+    SearchAndPlay {
+        query: String,
+    },
+    QueueSearch {
+        query: String,
+    },
+    SetVolume {
+        percent: u8,
+    },
     NowPlaying,
 }
 
@@ -602,12 +612,37 @@ pub fn spotify_tool_schema() -> Value {
         simple("pause", "Pause the current Spotify playback."),
         simple("next", "Skip to the next Spotify track."),
         simple("previous", "Return to the previous Spotify track."),
+        json!({
+            "type": "function",
+            "name": "play_from_taste",
+            "description": "Play something from this listener's own music: their \
+                            playlists, saved tracks, top tracks and recent plays, \
+                            matched semantically. Prefer this for any request about \
+                            mood, vibe, an artist or language they listen to, or \
+                            anything phrased as what they like.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What the listener wants, in their own words: \
+                                        a mood, an artist, a language, an occasion. \
+                                        Not a Spotify search string.",
+                        "minLength": 1
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }),
         search(
             "search_and_play",
             "Search Spotify and start playing the best match right now, replacing \
              whatever is playing. This is the default for any request to hear \
              something, including corrections such as wanting a different version \
-             of the current track."
+             of the current track. Use this only when a specific track or artist \
+             is named that play_from_taste did not find, or that is plainly not \
+             theirs."
         ),
         search(
             "queue_search",
@@ -648,6 +683,9 @@ pub fn parse_realtime_tool_call(name: &str, arguments: &str) -> Result<ToolCall,
         "next" => parse_empty(arguments, ToolCall::Next),
         "previous" => parse_empty(arguments, ToolCall::Previous),
         "now_playing" => parse_empty(arguments, ToolCall::NowPlaying),
+        "play_from_taste" => {
+            parse_query(arguments).map(|description| ToolCall::PlayFromTaste { description })
+        }
         "search_and_play" => parse_query(arguments).map(|query| ToolCall::SearchAndPlay { query }),
         "queue_search" => parse_query(arguments).map(|query| ToolCall::QueueSearch { query }),
         "set_volume" => {
