@@ -1,0 +1,13 @@
+# Railway deployment config. Kept in the repo so the deploy is reproducible
+# rather than configured by hand in the dashboard.
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+# /health is bearer-protected by design, so a platform probe pointed at it
+# would 401 and fail every deploy. /healthz is the unauthenticated probe.
+healthcheckPath = "/healthz"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
