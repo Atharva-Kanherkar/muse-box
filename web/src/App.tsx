@@ -205,9 +205,11 @@ export default function App() {
               {signingIn ? "Redirecting…" : "Connect Spotify"}
             </button>
             <p className="fineprint">
-              Uses Spotify&rsquo;s own sign-in. muse&#8209;box only reads
-              what&rsquo;s currently playing and controls playback — nothing
-              is posted or shared anywhere else.
+              Uses Spotify&rsquo;s own sign-in, with access to your playback,
+              library, and playlists so it can find music you already like.
+              Voice commands and what&rsquo;s playing are sent to OpenAI to
+              understand them. Nothing here is posted publicly or shared with
+              anyone else.
             </p>
           </div>
         </main>

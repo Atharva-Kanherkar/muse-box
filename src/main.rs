@@ -38,20 +38,27 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(tracks = cached_lyrics, "loaded cached lyrics");
     }
 
-    let owner = Arc::new(OwnerMarker::load(config.owner_marker_path.clone()).await);
+    // A read failure here is fatal rather than "start unclaimed": silently
+    // treating a permissions problem or a transient volume glitch as "no
+    // owner yet" would let the very next login permanently take the hardware
+    // bearer token away from whoever the real owner already is.
+    let owner = Arc::new(
+        OwnerMarker::load(config.owner_marker_path.clone())
+            .await
+            .context("failed to load the owner marker")?,
+    );
+    let legacy_spotify = SpotifyClient::new(SpotifyConfig {
+        client_id: spotify_client_id.clone(),
+        client_secret: spotify_client_secret.clone(),
+        redirect_uri: spotify_redirect_uri.clone(),
+        token_store_path: config.legacy_token_store_path.clone(),
+    });
     if let Err(error) = account::migrate_legacy_install(
+        &legacy_spotify,
         &config.legacy_token_store_path,
         &config.legacy_taste_index_path,
         &config.accounts_root,
         &owner,
-        SpotifyConfig {
-            client_id: spotify_client_id.clone(),
-            client_secret: spotify_client_secret.clone(),
-            redirect_uri: spotify_redirect_uri.clone(),
-            // migrate_legacy_install substitutes the legacy path for this
-            // before it is ever used.
-            token_store_path: config.legacy_token_store_path.clone(),
-        },
     )
     .await
     {

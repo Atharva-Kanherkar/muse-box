@@ -211,6 +211,11 @@ async fn spotify_callback(
     );
     let runtime = state.registry.get_or_create(&account_id).await;
     runtime.spotify.adopt_tokens(tokens).await?;
+    // Only safe to start now that tokens are adopted: a brand new account's
+    // runtime was resolved above with no token yet, so kicking this off any
+    // earlier would race this adoption and, since it never retries, could
+    // leave the taste index permanently empty for the account's whole life.
+    runtime.kick_off_taste_build();
     // Whoever completes this first, on a fresh install, becomes the account
     // the hardware bearer token resolves to. A no-op for every later login.
     state.owner.claim(&account_id).await?;

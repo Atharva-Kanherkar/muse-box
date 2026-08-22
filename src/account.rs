@@ -80,15 +80,25 @@ impl AccountRuntime {
             redirect_uri: config.spotify_redirect_uri.clone(),
             token_store_path: token_path(&config.accounts_root, &id),
         });
-        match spotify.initialize_from_store().await {
-            Ok(true) => tracing::info!(account = %id, "restored Spotify authorization"),
-            Ok(false) => {
-                tracing::warn!(account = %id, "no persisted Spotify authorization for account");
+        // Whether a token was already on disk matters below: a brand new
+        // account (created by the OAuth callback for the very first time)
+        // has none yet, and starting the one-shot taste build before the
+        // callback adopts its tokens would race it — see
+        // `kick_off_taste_build`'s doc comment.
+        let had_stored_token = match spotify.initialize_from_store().await {
+            Ok(had_token) => {
+                if had_token {
+                    tracing::info!(account = %id, "restored Spotify authorization");
+                } else {
+                    tracing::warn!(account = %id, "no persisted Spotify authorization for account");
+                }
+                had_token
             }
             Err(error) => {
                 tracing::warn!(%error, account = %id, "could not restore Spotify authorization");
+                false
             }
-        }
+        };
 
         let hub = Arc::new(
             StateHub::new()
@@ -117,9 +127,41 @@ impl AccountRuntime {
         ));
         tokio::spawn(run_idle_scheduler(hub.clone(), idle_shutdown_rx));
 
-        let taste_builder = taste.clone();
-        let taste_spotify = spotify.clone();
-        let taste_id = id.clone();
+        let runtime = Arc::new(Self {
+            id,
+            spotify,
+            hub,
+            taste,
+            voice_guard: Arc::new(Mutex::new(())),
+            last_active: RwLock::new(Utc::now()),
+            shutdown,
+        });
+        // A brand new account has nothing to embed yet: the OAuth callback
+        // that is about to adopt its tokens calls `kick_off_taste_build`
+        // itself once that finishes. Only an account that already had a
+        // persisted token gets this for free here.
+        if had_stored_token {
+            runtime.kick_off_taste_build();
+        }
+        runtime
+    }
+
+    /// Build (or rebuild) the taste index from this account's Spotify
+    /// library, in the background.
+    ///
+    /// Called automatically by `spawn` for an account that already had a
+    /// persisted token. A brand new account has none at construction time —
+    /// the OAuth callback derives the account id, resolves (constructs) its
+    /// runtime, *then* adopts its tokens — so `spawn` cannot safely start
+    /// this for a new account: it would race the callback's token adoption,
+    /// almost always lose (library_tracks needs a token that does not exist
+    /// yet), and, since this only ever runs once, leave the taste index
+    /// permanently empty. The callback calls this explicitly right after
+    /// adopting a new account's tokens instead.
+    pub(crate) fn kick_off_taste_build(&self) {
+        let taste_builder = self.taste.clone();
+        let taste_spotify = self.spotify.clone();
+        let taste_id = self.id.clone();
         tokio::spawn(async move {
             match taste_builder.load().await {
                 Ok(true) => return,
@@ -146,16 +188,6 @@ impl AccountRuntime {
                 }
             }
         });
-
-        Arc::new(Self {
-            id,
-            spotify,
-            hub,
-            taste,
-            voice_guard: Arc::new(Mutex::new(())),
-            last_active: RwLock::new(Utc::now()),
-            shutdown,
-        })
     }
 
     async fn touch(&self, now: DateTime<Utc>) {
@@ -254,15 +286,26 @@ impl AccountRegistry {
             existing.touch(Utc::now()).await;
             return existing.clone();
         }
-        let mut accounts = self.accounts.write().await;
-        // Another request may have built it while this one waited for the
-        // write lock.
-        if let Some(existing) = accounts.get(id) {
-            existing.touch(Utc::now()).await;
-            return existing.clone();
-        }
+
+        // Built with no lock held: this does real disk I/O and, when a
+        // stored token is near expiry, a Spotify token-refresh network call.
+        // Holding the registry's write lock across that would stall every
+        // other account's credential resolution — including ones with an
+        // already-warm runtime, since a queued writer blocks new readers too
+        // — for up to the HTTP timeout.
         tracing::info!(account = %id, "warming account runtime");
         let runtime = AccountRuntime::spawn(id.clone(), &self.config).await;
+
+        let mut accounts = self.accounts.write().await;
+        // Another request may have built and inserted the same account while
+        // this one was still resolving. Keep whichever got there first and
+        // shut down the loser's just-spawned poll/idle loops rather than
+        // leaking a second, orphaned pair of them for the same account.
+        if let Some(existing) = accounts.get(id) {
+            existing.touch(Utc::now()).await;
+            let _ = runtime.shutdown.send(true);
+            return existing.clone();
+        }
         accounts.insert(runtime.id.clone(), runtime.clone());
         runtime
     }
@@ -354,17 +397,34 @@ pub struct OwnerMarker {
 }
 
 impl OwnerMarker {
-    pub async fn load(path: PathBuf) -> Self {
-        let current = tokio::fs::read_to_string(&path)
-            .await
-            .ok()
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-            .map(AccountId::new);
-        Self {
+    /// Load the owner marker. A missing file means a fresh install with no
+    /// owner yet — the only condition that may read as "unclaimed". Any
+    /// other read failure (permissions, a transient volume glitch) must not
+    /// collapse to the same thing: that would let the very next login
+    /// permanently take the hardware bearer token away from whoever the real
+    /// owner already is, on nothing more than a hiccup.
+    pub async fn load(path: PathBuf) -> Result<Self, AppError> {
+        let current = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(AccountId::new(trimmed))
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(AppError::Internal(anyhow::anyhow!(
+                    "failed to read owner marker at {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        Ok(Self {
             path,
             current: RwLock::new(current),
-        }
+        })
     }
 
     pub async fn get(&self) -> Option<AccountId> {
@@ -403,6 +463,9 @@ impl OwnerMarker {
     }
 }
 
+/// Same temp-file-and-rename discipline as the token and session stores: a
+/// half-written marker must never read back as "unclaimed" — that is
+/// exactly the state that lets the next login take over permanently.
 async fn write_owner_marker(path: &Path, id: &AccountId) -> Result<(), AppError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -413,33 +476,43 @@ async fn write_owner_marker(path: &Path, id: &AccountId) -> Result<(), AppError>
             ))
         })?;
     }
-    tokio::fs::write(path, id.as_str().as_bytes())
+    let mut temporary = path.file_name().unwrap_or_default().to_os_string();
+    temporary.push(".tmp");
+    let temporary = path.with_file_name(temporary);
+    tokio::fs::write(&temporary, id.as_str().as_bytes())
         .await
         .map_err(|error| {
             AppError::Internal(anyhow::anyhow!("failed to write owner marker: {error}"))
-        })
+        })?;
+    tokio::fs::rename(&temporary, path).await.map_err(|error| {
+        AppError::Internal(anyhow::anyhow!("failed to commit owner marker: {error}"))
+    })
 }
 
 /// One-time move from the single-tenant layout to `data/accounts/<id>/`.
 ///
-/// A no-op once `accounts_root` exists, so a redeploy never repeats it and
-/// never re-derives an id from a file that has already moved. `oauth`'s
-/// `token_store_path` is ignored; the legacy path is used in its place.
+/// A no-op once the legacy token is gone — moved by an earlier successful
+/// run, or never there to begin with — which is what actually marks this
+/// done. `accounts_root` existing is deliberately *not* that signal: a
+/// volume mount can pre-create its mount point, and a prior attempt that
+/// created the directory but died before the rename below would otherwise
+/// look "migrated" forever while the legacy token sits unmoved. Retrying on
+/// every boot until the rename actually succeeds is the safe default; the
+/// rename is what stops it, by making the legacy path disappear. `legacy`
+/// must already be pointed at `legacy_token_path` — the caller owns
+/// constructing it, which is what makes this testable against a mock
+/// Spotify server instead of the real one.
 pub async fn migrate_legacy_install(
+    legacy: &SpotifyClient,
     legacy_token_path: &Path,
     legacy_taste_path: &Path,
     accounts_root: &Path,
     owner: &OwnerMarker,
-    oauth: SpotifyConfig,
 ) -> Result<Option<AccountId>, AppError> {
-    if accounts_root.exists() || !legacy_token_path.exists() {
+    if !legacy_token_path.exists() {
         return Ok(None);
     }
 
-    let legacy = SpotifyClient::new(SpotifyConfig {
-        token_store_path: legacy_token_path.to_path_buf(),
-        ..oauth
-    });
     if !legacy.initialize_from_store().await? {
         return Ok(None);
     }
@@ -512,6 +585,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_first_resolution_of_the_same_account_converges_on_one_runtime() {
+        // get_or_create builds a runtime with no lock held (so one cold
+        // account can't stall everyone else's credential resolution), then
+        // re-checks under the write lock before inserting. This is what
+        // proves that double-check-then-discard path is actually correct,
+        // not just fast: every concurrent caller for a never-before-seen
+        // account must still converge on exactly one runtime.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let registry = Arc::new(AccountRegistry::new(test_registry_config(
+            directory.path().to_path_buf(),
+        )));
+        let id = AccountId::new("listener-1");
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let registry = registry.clone();
+            let id = id.clone();
+            tasks.push(tokio::spawn(
+                async move { registry.get_or_create(&id).await },
+            ));
+        }
+        let mut runtimes = Vec::new();
+        for task in tasks {
+            runtimes.push(task.await.expect("task"));
+        }
+
+        let first = &runtimes[0];
+        assert!(
+            runtimes.iter().all(|runtime| Arc::ptr_eq(runtime, first)),
+            "concurrent first resolutions produced more than one runtime"
+        );
+        assert_eq!(registry.len().await, 1);
+    }
+
+    #[tokio::test]
     async fn an_idle_account_with_no_subscriber_is_reaped() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let registry = AccountRegistry::new(test_registry_config(directory.path().to_path_buf()));
@@ -574,7 +682,9 @@ mod tests {
     async fn an_owner_marker_starts_empty_and_keeps_the_first_claim() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("owner_account_id.txt");
-        let owner = OwnerMarker::load(path.clone()).await;
+        let owner = OwnerMarker::load(path.clone())
+            .await
+            .expect("load owner marker");
         assert_eq!(owner.get().await, None);
 
         let first = AccountId::new("listener-1");
@@ -588,14 +698,16 @@ mod tests {
             .expect("claim is a no-op");
         assert_eq!(owner.get().await, Some(first));
 
-        let reloaded = OwnerMarker::load(path).await;
+        let reloaded = OwnerMarker::load(path).await.expect("reload owner marker");
         assert_eq!(reloaded.get().await, Some(AccountId::new("listener-1")));
     }
 
     #[tokio::test]
     async fn a_missing_owner_marker_file_loads_as_no_owner() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let owner = OwnerMarker::load(directory.path().join("does-not-exist.txt")).await;
+        let owner = OwnerMarker::load(directory.path().join("does-not-exist.txt"))
+            .await
+            .expect("a missing marker file is not a read error");
         assert_eq!(owner.get().await, None);
     }
 
@@ -603,19 +715,23 @@ mod tests {
     async fn migration_is_a_no_op_when_there_is_no_legacy_token() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let accounts_root = directory.path().join("accounts");
-        let owner = OwnerMarker::load(directory.path().join("owner_account_id.txt")).await;
+        let owner = OwnerMarker::load(directory.path().join("owner_account_id.txt"))
+            .await
+            .expect("load owner marker");
+        let legacy_token_path = directory.path().join("spotify_token.json");
+        let legacy = SpotifyClient::new(SpotifyConfig {
+            client_id: "client-id".to_string(),
+            client_secret: "client-secret".to_string(),
+            redirect_uri: "http://localhost/auth/spotify/callback".to_string(),
+            token_store_path: legacy_token_path.clone(),
+        });
 
         let migrated = migrate_legacy_install(
-            &directory.path().join("spotify_token.json"),
+            &legacy,
+            &legacy_token_path,
             &directory.path().join("taste_index.json"),
             &accounts_root,
             &owner,
-            SpotifyConfig {
-                client_id: "client-id".to_string(),
-                client_secret: "client-secret".to_string(),
-                redirect_uri: "http://localhost/auth/spotify/callback".to_string(),
-                token_store_path: PathBuf::from("unused"),
-            },
         )
         .await
         .expect("migration does not fail with nothing to migrate");
@@ -626,35 +742,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_is_a_no_op_once_the_accounts_directory_already_exists() {
+    async fn migration_still_succeeds_even_if_the_accounts_directory_already_exists() {
+        // A volume mount can pre-create its mount point, and a prior
+        // migration attempt could have created this directory and then died
+        // before the rename. Either way, the legacy token is still sitting
+        // there unmoved, and migration must still pick it up rather than
+        // treating the directory's mere existence as "already done."
         let directory = tempfile::tempdir().expect("temporary directory");
         let accounts_root = directory.path().join("accounts");
         tokio::fs::create_dir_all(&accounts_root)
             .await
             .expect("seed accounts root");
-        let legacy_token = directory.path().join("spotify_token.json");
-        tokio::fs::write(&legacy_token, b"{}")
+        let legacy_token_path = directory.path().join("spotify_token.json");
+        let legacy_taste_path = directory.path().join("taste_index.json");
+        tokio::fs::write(&legacy_taste_path, b"{}")
             .await
-            .expect("seed legacy token");
-        let owner = OwnerMarker::load(directory.path().join("owner_account_id.txt")).await;
+            .expect("seed legacy taste index");
+        let owner = OwnerMarker::load(directory.path().join("owner_account_id.txt"))
+            .await
+            .expect("load owner marker");
 
-        let migrated = migrate_legacy_install(
-            &legacy_token,
-            &directory.path().join("taste_index.json"),
-            &accounts_root,
-            &owner,
+        // initialize_from_store always force-refreshes, so the mock needs a
+        // /token route too, not just /me.
+        let app = axum::Router::new()
+            .route(
+                "/me",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "id": "legacy-owner" }))
+                }),
+            )
+            .route(
+                "/token",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "access_token": "refreshed-access-token",
+                        "refresh_token": "refreshed-refresh-token",
+                        "expires_in": 3600
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Spotify");
+        let address = listener.local_addr().expect("mock Spotify address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock Spotify");
+        });
+        let legacy = SpotifyClient::with_all_test_endpoints(
             SpotifyConfig {
                 client_id: "client-id".to_string(),
                 client_secret: "client-secret".to_string(),
                 redirect_uri: "http://localhost/auth/spotify/callback".to_string(),
-                token_store_path: PathBuf::from("unused"),
+                token_store_path: legacy_token_path.clone(),
             },
+            format!("http://{address}/authorize"),
+            format!("http://{address}/token"),
+            format!("http://{address}"),
+        );
+        // Seed a real, valid token at the legacy path: adopt_tokens persists
+        // through this exact client, which is also the `legacy` handed to
+        // migrate_legacy_install below.
+        legacy
+            .adopt_tokens(crate::spotify::ExchangedTokens {
+                access_token: "access-token".to_string(),
+                refresh_token: "refresh-token".to_string(),
+                expires_at: Utc::now() + Duration::hours(1),
+            })
+            .await
+            .expect("seed a valid legacy token");
+
+        let migrated = migrate_legacy_install(
+            &legacy,
+            &legacy_token_path,
+            &legacy_taste_path,
+            &accounts_root,
+            &owner,
         )
         .await
-        .expect("migration does not fail when already migrated");
+        .expect("migration succeeds despite the pre-existing accounts directory");
 
-        assert_eq!(migrated, None);
-        // The legacy file is untouched, not moved into an already-populated tree.
-        assert!(legacy_token.exists());
+        let id = AccountId::new("legacy-owner");
+        assert_eq!(migrated, Some(id.clone()));
+        assert!(
+            !legacy_token_path.exists(),
+            "the legacy token must be moved, not left behind"
+        );
+        assert!(token_path(&accounts_root, &id).exists());
+        assert!(taste_path(&accounts_root, &id).exists());
+        assert_eq!(owner.get().await, Some(id));
     }
 }

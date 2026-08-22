@@ -21,7 +21,7 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Duration, Utc};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::{account::AccountId, error::AppError};
 
@@ -30,8 +30,14 @@ pub const COOKIE_NAME: &str = "muse_session";
 /// How long a browser stays signed in. Long, because this is a shelf device in
 /// someone's home, not a bank.
 const SESSION_DAYS: i64 = 365;
-/// Ceiling on stored sessions, so repeated logins cannot grow the file forever.
-const MAX_SESSIONS: usize = 32;
+/// Ceiling on stored sessions, so repeated logins cannot grow the file
+/// forever. Global, not per-account, and multi-tenant now: several browsers
+/// per person plus Spotify's own 25-account Development Mode ceiling can
+/// plausibly add up to a few hundred live sessions, so this needs real
+/// headroom above that — not just above one person's device count — or an
+/// unrelated account's still-valid, year-long session gets evicted for no
+/// reason anyone signed in recently would expect.
+const MAX_SESSIONS: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionRecord {
@@ -49,6 +55,16 @@ struct StoredSessions {
 pub struct SessionStore {
     path: PathBuf,
     sessions: RwLock<HashMap<String, SessionRecord>>,
+    /// Serializes the mutate-then-persist sequence in `issue`. The data lock
+    /// alone is not enough for that: it only has to be held long enough to
+    /// take a consistent snapshot, and releasing it before the disk write
+    /// (so concurrent readers are never blocked on disk I/O) is exactly what
+    /// would let two concurrent sign-ins persist out of order — the snapshot
+    /// taken first can finish writing to disk *last*, silently overwriting a
+    /// fresher one already there and dropping whichever session it was
+    /// missing. This lock makes each `issue` call's disk write complete
+    /// before the next one's snapshot is even taken.
+    persist_lock: Mutex<()>,
 }
 
 impl SessionStore {
@@ -56,6 +72,7 @@ impl SessionStore {
         Self {
             path,
             sessions: RwLock::new(HashMap::new()),
+            persist_lock: Mutex::new(()),
         }
     }
 
@@ -95,7 +112,11 @@ impl SessionStore {
         let handle = general_purpose::URL_SAFE_NO_PAD.encode(random);
         let expires_at = Utc::now() + Duration::days(SESSION_DAYS);
 
-        {
+        // Held across the mutation and the disk write below — see the field
+        // doc comment for why releasing it in between reopens the race this
+        // exists to close.
+        let _persist_guard = self.persist_lock.lock().await;
+        let stored = {
             let mut sessions = self.sessions.write().await;
             let now = Utc::now();
             sessions.retain(|_, record| record.expires_at > now);
@@ -118,8 +139,14 @@ impl SessionStore {
                     expires_at,
                 },
             );
-        }
-        self.persist().await?;
+            // Cloned while still holding the write lock, so this snapshot is
+            // exactly this call's view: nobody else's insert can land between
+            // the mutation above and the read below.
+            StoredSessions {
+                sessions: sessions.clone(),
+            }
+        };
+        self.persist(&stored).await?;
         Ok(handle)
     }
 
@@ -140,11 +167,8 @@ impl SessionStore {
         self.sessions.read().await.len()
     }
 
-    async fn persist(&self) -> Result<(), AppError> {
-        let stored = StoredSessions {
-            sessions: self.sessions.read().await.clone(),
-        };
-        let bytes = serde_json::to_vec(&stored).map_err(|error| {
+    async fn persist(&self, stored: &StoredSessions) -> Result<(), AppError> {
+        let bytes = serde_json::to_vec(stored).map_err(|error| {
             AppError::Internal(anyhow::anyhow!("failed to serialize sessions: {error}"))
         })?;
         write_atomically(&self.path, &bytes).await
@@ -198,6 +222,8 @@ pub fn set_cookie_value(handle: &str, secure: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -276,6 +302,41 @@ mod tests {
             store.issue(AccountId::new("listener")).await.unwrap();
         }
         assert_eq!(store.count().await, MAX_SESSIONS);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sign_ins_never_lose_a_session_from_disk() {
+        // Before the persist_lock fix, two issue() calls could each take a
+        // consistent in-memory snapshot but write them to disk out of order,
+        // so the snapshot taken first could finish writing *last* and
+        // silently drop whichever session it was missing. Twenty concurrent
+        // sign-ins gives that race plenty of chances to happen if it still can.
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStore::new(directory.path().join("sessions.json")));
+
+        let mut tasks = Vec::new();
+        for i in 0..20 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .issue(AccountId::new(format!("listener-{i}")))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut handles = Vec::new();
+        for task in tasks {
+            handles.push(task.await.unwrap());
+        }
+
+        let reloaded = SessionStore::new(directory.path().join("sessions.json"));
+        assert_eq!(reloaded.load().await.unwrap(), 20);
+        for handle in handles {
+            assert!(
+                reloaded.account_for(&handle).await.is_some(),
+                "a session went missing from disk after concurrent sign-ins"
+            );
+        }
     }
 
     #[tokio::test]
