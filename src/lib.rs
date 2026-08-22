@@ -4,6 +4,7 @@
 //! speak the versioned [`render::RenderDoc`]. Everything else is
 //! implementation detail. See README.md and AGENTS.md for the contract.
 
+pub mod account;
 pub mod config;
 pub mod error;
 pub mod idle;

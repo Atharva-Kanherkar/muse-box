@@ -7,7 +7,9 @@
 //!
 //! So: the Spotify authorization a person already has to complete once doubles
 //! as the browser login. Finishing it mints a session, and the cookie carries
-//! only an opaque handle. Sessions are persisted beside the token store so a
+//! only an opaque handle — the handle maps to *which account* signed in, not
+//! merely "signed in or not," so two different people's cookies resolve to two
+//! different accounts. Sessions are persisted beside the token store so a
 //! redeploy does not sign anyone out.
 
 use std::{
@@ -19,28 +21,50 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Duration, Utc};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
-use crate::error::AppError;
+use crate::{account::AccountId, error::AppError};
 
 /// Name of the session cookie.
 pub const COOKIE_NAME: &str = "muse_session";
 /// How long a browser stays signed in. Long, because this is a shelf device in
 /// someone's home, not a bank.
 const SESSION_DAYS: i64 = 365;
-/// Ceiling on stored sessions, so repeated logins cannot grow the file forever.
-const MAX_SESSIONS: usize = 32;
+/// Ceiling on stored sessions, so repeated logins cannot grow the file
+/// forever. Global, not per-account, and multi-tenant now: several browsers
+/// per person plus Spotify's own 25-account Development Mode ceiling can
+/// plausibly add up to a few hundred live sessions, so this needs real
+/// headroom above that — not just above one person's device count — or an
+/// unrelated account's still-valid, year-long session gets evicted for no
+/// reason anyone signed in recently would expect.
+const MAX_SESSIONS: usize = 256;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionRecord {
+    account_id: AccountId,
+    expires_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StoredSessions {
-    /// Session handle to its expiry.
-    sessions: HashMap<String, DateTime<Utc>>,
+    /// Session handle to the account it signs in and when that expires.
+    sessions: HashMap<String, SessionRecord>,
 }
 
 /// Issues and checks browser sessions.
 pub struct SessionStore {
     path: PathBuf,
-    sessions: RwLock<HashMap<String, DateTime<Utc>>>,
+    sessions: RwLock<HashMap<String, SessionRecord>>,
+    /// Serializes the mutate-then-persist sequence in `issue`. The data lock
+    /// alone is not enough for that: it only has to be held long enough to
+    /// take a consistent snapshot, and releasing it before the disk write
+    /// (so concurrent readers are never blocked on disk I/O) is exactly what
+    /// would let two concurrent sign-ins persist out of order — the snapshot
+    /// taken first can finish writing to disk *last*, silently overwriting a
+    /// fresher one already there and dropping whichever session it was
+    /// missing. This lock makes each `issue` call's disk write complete
+    /// before the next one's snapshot is even taken.
+    persist_lock: Mutex<()>,
 }
 
 impl SessionStore {
@@ -48,6 +72,7 @@ impl SessionStore {
         Self {
             path,
             sessions: RwLock::new(HashMap::new()),
+            persist_lock: Mutex::new(()),
         }
     }
 
@@ -73,28 +98,32 @@ impl SessionStore {
         let live: HashMap<_, _> = stored
             .sessions
             .into_iter()
-            .filter(|(_, expiry)| *expiry > now)
+            .filter(|(_, record)| record.expires_at > now)
             .collect();
         let count = live.len();
         *self.sessions.write().await = live;
         Ok(count)
     }
 
-    /// Mint a session and return the cookie value to set.
-    pub async fn issue(&self) -> Result<String, AppError> {
+    /// Mint a session for `account_id` and return the cookie value to set.
+    pub async fn issue(&self, account_id: AccountId) -> Result<String, AppError> {
         let mut random = [0_u8; 32];
         OsRng.fill_bytes(&mut random);
         let handle = general_purpose::URL_SAFE_NO_PAD.encode(random);
-        let expiry = Utc::now() + Duration::days(SESSION_DAYS);
+        let expires_at = Utc::now() + Duration::days(SESSION_DAYS);
 
-        {
+        // Held across the mutation and the disk write below — see the field
+        // doc comment for why releasing it in between reopens the race this
+        // exists to close.
+        let _persist_guard = self.persist_lock.lock().await;
+        let stored = {
             let mut sessions = self.sessions.write().await;
             let now = Utc::now();
-            sessions.retain(|_, expires| *expires > now);
+            sessions.retain(|_, record| record.expires_at > now);
             while sessions.len() >= MAX_SESSIONS {
                 let oldest = sessions
                     .iter()
-                    .min_by_key(|(_, expires)| **expires)
+                    .min_by_key(|(_, record)| record.expires_at)
                     .map(|(handle, _)| handle.clone());
                 match oldest {
                     Some(handle) => {
@@ -103,33 +132,43 @@ impl SessionStore {
                     None => break,
                 }
             }
-            sessions.insert(handle.clone(), expiry);
-        }
-        self.persist().await?;
+            sessions.insert(
+                handle.clone(),
+                SessionRecord {
+                    account_id,
+                    expires_at,
+                },
+            );
+            // Cloned while still holding the write lock, so this snapshot is
+            // exactly this call's view: nobody else's insert can land between
+            // the mutation above and the read below.
+            StoredSessions {
+                sessions: sessions.clone(),
+            }
+        };
+        self.persist(&stored).await?;
         Ok(handle)
     }
 
-    /// Whether a cookie value names a live session.
-    pub async fn is_valid(&self, handle: &str) -> bool {
+    /// The account a cookie value signs in, if the session is live.
+    pub async fn account_for(&self, handle: &str) -> Option<AccountId> {
         if handle.is_empty() {
-            return false;
+            return None;
         }
         self.sessions
             .read()
             .await
             .get(handle)
-            .is_some_and(|expiry| *expiry > Utc::now())
+            .filter(|record| record.expires_at > Utc::now())
+            .map(|record| record.account_id.clone())
     }
 
     pub async fn count(&self) -> usize {
         self.sessions.read().await.len()
     }
 
-    async fn persist(&self) -> Result<(), AppError> {
-        let stored = StoredSessions {
-            sessions: self.sessions.read().await.clone(),
-        };
-        let bytes = serde_json::to_vec(&stored).map_err(|error| {
+    async fn persist(&self, stored: &StoredSessions) -> Result<(), AppError> {
+        let bytes = serde_json::to_vec(stored).map_err(|error| {
             AppError::Internal(anyhow::anyhow!("failed to serialize sessions: {error}"))
         })?;
         write_atomically(&self.path, &bytes).await
@@ -183,6 +222,8 @@ pub fn set_cookie_value(handle: &str, secure: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -218,23 +259,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_session_survives_a_restart() {
+    async fn a_session_survives_a_restart_and_remembers_its_account() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sessions.json");
+        let account_id = AccountId::new("listener-1");
 
         let handle = {
             let store = SessionStore::new(path.clone());
-            let handle = store.issue().await.unwrap();
-            assert!(store.is_valid(&handle).await);
+            let handle = store.issue(account_id.clone()).await.unwrap();
+            assert_eq!(store.account_for(&handle).await, Some(account_id.clone()));
             handle
         };
 
         // A redeploy must not sign anyone out.
         let reloaded = SessionStore::new(path);
         assert_eq!(reloaded.load().await.unwrap(), 1);
-        assert!(reloaded.is_valid(&handle).await);
-        assert!(!reloaded.is_valid("some-other-handle").await);
-        assert!(!reloaded.is_valid("").await);
+        assert_eq!(reloaded.account_for(&handle).await, Some(account_id));
+        assert_eq!(reloaded.account_for("some-other-handle").await, None);
+        assert_eq!(reloaded.account_for("").await, None);
+    }
+
+    #[tokio::test]
+    async fn two_browsers_signing_in_as_different_accounts_stay_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(directory.path().join("sessions.json"));
+
+        let alice = store.issue(AccountId::new("alice")).await.unwrap();
+        let bob = store.issue(AccountId::new("bob")).await.unwrap();
+
+        assert_eq!(
+            store.account_for(&alice).await,
+            Some(AccountId::new("alice"))
+        );
+        assert_eq!(store.account_for(&bob).await, Some(AccountId::new("bob")));
     }
 
     #[tokio::test]
@@ -242,9 +299,44 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::new(directory.path().join("sessions.json"));
         for _ in 0..(MAX_SESSIONS * 2) {
-            store.issue().await.unwrap();
+            store.issue(AccountId::new("listener")).await.unwrap();
         }
         assert_eq!(store.count().await, MAX_SESSIONS);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sign_ins_never_lose_a_session_from_disk() {
+        // Before the persist_lock fix, two issue() calls could each take a
+        // consistent in-memory snapshot but write them to disk out of order,
+        // so the snapshot taken first could finish writing *last* and
+        // silently drop whichever session it was missing. Twenty concurrent
+        // sign-ins gives that race plenty of chances to happen if it still can.
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStore::new(directory.path().join("sessions.json")));
+
+        let mut tasks = Vec::new();
+        for i in 0..20 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .issue(AccountId::new(format!("listener-{i}")))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut handles = Vec::new();
+        for task in tasks {
+            handles.push(task.await.unwrap());
+        }
+
+        let reloaded = SessionStore::new(directory.path().join("sessions.json"));
+        assert_eq!(reloaded.load().await.unwrap(), 20);
+        for handle in handles {
+            assert!(
+                reloaded.account_for(&handle).await.is_some(),
+                "a session went missing from disk after concurrent sign-ins"
+            );
+        }
     }
 
     #[tokio::test]

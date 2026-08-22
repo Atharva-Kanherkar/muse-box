@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use muse_box::{
+    account::{self, AccountRegistry, OwnerMarker, RegistryConfig},
     config::Config,
     intent::IntentModel,
     lyrics::LyricsIndex,
@@ -9,16 +10,11 @@ use muse_box::{
     routes,
     session::SessionStore,
     spotify::{SpotifyClient, SpotifyConfig},
-    state::{StateHub, run_idle_scheduler, run_poll_loop},
-    taste::{MAX_INDEXED_TRACKS, TasteIndex},
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    // from_default_env() would default to ERROR, silencing every info! line
-    // when RUST_LOG is unset (the normal case on Railway, where there is no
-    // .env for dotenvy to load).
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::builder()
@@ -29,98 +25,92 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     let bind_addr = config.bind_addr();
-    let spotify = SpotifyClient::new(SpotifyConfig {
-        client_id: config.spotify_client_id,
-        client_secret: config.spotify_client_secret,
-        redirect_uri: config.spotify_redirect_uri.clone(),
-        token_store_path: config.spotify_token_store_path,
-    });
+    let spotify_client_id = config.spotify_client_id.clone();
+    let spotify_client_secret = config.spotify_client_secret.clone();
+    let spotify_redirect_uri = config.spotify_redirect_uri.clone();
+    let openai_api_key = config.openai_api_key.clone();
 
-    // Never fatal: a revoked token or a Spotify blip during a redeploy must not
-    // stop the server from binding, or /auth/spotify would be unreachable and
-    // the box could never be re-authorized.
-    match spotify.initialize_from_store().await {
-        Ok(true) => tracing::info!("refreshed persisted Spotify authorization"),
-        Ok(false) => tracing::info!("no persisted Spotify authorization; visit /auth/spotify"),
-        Err(error) => tracing::warn!(
-            %error,
-            "could not restore Spotify authorization; visit /auth/spotify to re-authorize"
-        ),
-    }
-
-    let lyrics = Arc::new(LyricsIndex::new(config.lyrics_cache_path.clone()));
+    // Shared across every account: the first person to play a song looks it
+    // up for everyone else too.
+    let lyrics = Arc::new(LyricsIndex::new(config.lyrics_cache_dir.clone()));
     let cached_lyrics = lyrics.load().await;
     if cached_lyrics > 0 {
         tracing::info!(tracks = cached_lyrics, "loaded cached lyrics");
     }
 
-    let state_hub = Arc::new(
-        StateHub::new()
-            .with_display_offset(config.idle_display_offset)
-            .with_lyrics(lyrics),
+    // A read failure here is fatal rather than "start unclaimed": silently
+    // treating a permissions problem or a transient volume glitch as "no
+    // owner yet" would let the very next login permanently take the hardware
+    // bearer token away from whoever the real owner already is.
+    let owner = Arc::new(
+        OwnerMarker::load(config.owner_marker_path.clone())
+            .await
+            .context("failed to load the owner marker")?,
     );
-    // Shared by the models and the embeddings used for taste search.
-    let openai_api_key = config.openai_api_key.clone();
-    // Realtime is built but currently only serves the audio path, which hardware
-    // uses; the browser sends transcripts, which go through plain HTTP.
+    let legacy_spotify = SpotifyClient::new(SpotifyConfig {
+        client_id: spotify_client_id.clone(),
+        client_secret: spotify_client_secret.clone(),
+        redirect_uri: spotify_redirect_uri.clone(),
+        token_store_path: config.legacy_token_store_path.clone(),
+    });
+    if let Err(error) = account::migrate_legacy_install(
+        &legacy_spotify,
+        &config.legacy_token_store_path,
+        &config.legacy_taste_index_path,
+        &config.accounts_root,
+        &owner,
+    )
+    .await
+    {
+        tracing::warn!(
+            %error,
+            "legacy install migration failed; the previous owner may need to sign in again at /auth/spotify"
+        );
+    }
+
+    let registry = Arc::new(AccountRegistry::new(RegistryConfig {
+        spotify_client_id: spotify_client_id.clone(),
+        spotify_client_secret: spotify_client_secret.clone(),
+        spotify_redirect_uri: spotify_redirect_uri.clone(),
+        openai_api_key: openai_api_key.clone(),
+        lyrics,
+        idle_display_offset: config.idle_display_offset,
+        accounts_root: config.accounts_root.clone(),
+    }));
+
+    // Warm the owner now, so the hardware's first poll never pays for a cold
+    // start. Every other account resolves lazily, on its own first request.
+    match owner.get().await {
+        Some(owner_id) => {
+            registry.get_or_create(&owner_id).await;
+            tracing::info!(account = %owner_id, "warmed the owner account at boot");
+        }
+        None => tracing::info!("no owner yet; visit /auth/spotify to sign in"),
+    }
+    AccountRegistry::spawn_reaper(registry.clone());
+
+    // The OAuth entry points' own client. It only ever runs the dance —
+    // `authorization_url`, `exchange_code_for_tokens` — and, deliberately,
+    // never persists a token of its own (see that method's doc comment), so
+    // this path is never read.
+    let oauth = SpotifyClient::new(SpotifyConfig {
+        client_id: spotify_client_id,
+        client_secret: spotify_client_secret,
+        redirect_uri: spotify_redirect_uri,
+        token_store_path: config.accounts_root.join(".oauth-unused"),
+    });
+
     let _realtime = Arc::new(RealtimeManager::new(
         config.openai_api_key.clone(),
         config.openai_realtime_model.clone(),
     ));
     let voice_model = Arc::new(IntentModel::new(
-        openai_api_key.clone(),
+        openai_api_key,
         config.openai_intent_model.clone(),
         config.openai_reasoning_effort.clone(),
         config.openai_speech_model.clone(),
         config.openai_speech_voice.clone(),
     ));
-    state_hub.attach_features(Arc::new(spotify.clone())).await;
-    let (_background_shutdown, poll_shutdown_rx) = tokio::sync::watch::channel(false);
-    let idle_shutdown_rx = poll_shutdown_rx.clone();
-    let poll_spotify = spotify.clone();
-    let poll_hub = state_hub.clone();
-    let _poll_task = tokio::spawn(run_poll_loop(
-        poll_hub,
-        move || {
-            let spotify = poll_spotify.clone();
-            async move { spotify.currently_playing().await }
-        },
-        poll_shutdown_rx,
-    ));
-    let _idle_task = tokio::spawn(run_idle_scheduler(state_hub.clone(), idle_shutdown_rx));
-
-    // Built in the background: embedding a whole library takes a while, and the
-    // box should be listening and rendering long before it finishes. Until it
-    // does, taste requests fall back to a plain Spotify search.
-    let taste = Arc::new(TasteIndex::new(
-        openai_api_key.clone(),
-        config.taste_index_path.clone(),
-    ));
-    state_hub.attach_taste(taste.clone()).await;
-    let taste_builder = taste.clone();
-    let taste_spotify = spotify.clone();
-    let _taste_task = tokio::spawn(async move {
-        match taste_builder.load().await {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => tracing::warn!(%error, "could not load taste index"),
-        }
-        match taste_spotify.library_tracks(MAX_INDEXED_TRACKS).await {
-            Ok(library) if library.is_empty() => {
-                tracing::info!("Spotify returned no library to index");
-            }
-            Ok(library) => {
-                tracing::info!(tracks = library.len(), "embedding music library");
-                if let Err(error) = taste_builder.rebuild(library).await {
-                    tracing::warn!(%error, "could not build taste index");
-                }
-            }
-            Err(error) => tracing::warn!(
-                %error,
-                "could not read Spotify library; re-authorize at /auth/spotify if the scopes changed"
-            ),
-        }
-    });
 
     let sessions = Arc::new(SessionStore::new(config.session_store_path.clone()));
     match sessions.load().await {
@@ -129,16 +119,14 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => tracing::warn!(%error, "could not restore browser sessions"),
     }
 
-    // A Secure cookie is dropped over plain http, which is how local
-    // development is served.
     let secure_cookies = config.spotify_redirect_uri.starts_with("https://");
 
     let app = routes::router(routes::RouterConfig {
-        spotify,
+        oauth,
         device_api_token: config.device_api_token,
-        state_hub,
+        registry,
+        owner,
         voice_model,
-        taste,
         sessions,
         secure_cookies,
         client_root: config.client_root.clone(),

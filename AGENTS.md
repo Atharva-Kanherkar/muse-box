@@ -2,7 +2,9 @@
 
 ## Project goal
 
-Build a voice-controlled Spotify decoration: terminal-aesthetic dithered display + reactive LEDs. Web app first, ESP32 hardware second. Both clients consume the same backend-rendered document. Personal project: one user, one Spotify account, one box. **Current focus: backend only.** The web client starts after the backend issues are closed.
+Build a voice-controlled Spotify decoration: terminal-aesthetic dithered display + reactive LEDs. Web app first, ESP32 hardware second. Both clients consume the same backend-rendered document.
+
+Multi-tenant as of the `multi-tenant-accounts` work: any Spotify account can sign in, up to Spotify's own 25-account Development Mode ceiling. `SpotifyClient`, `StateHub`, and `TasteIndex` are per-account (see `src/account.rs`); `LyricsIndex` and the tempo cache stay shared, since a track's lyrics do not depend on who is listening. The one piece of hardware still only ever talks to one account — the "owner," whoever completed OAuth first — via the static `DEVICE_API_TOKEN`.
 
 ## How to work in this repo
 
@@ -51,7 +53,8 @@ Railway, single service built from this repo. TLS is terminated by Railway. Secr
 ## Security
 
 - Spotify tokens and the OpenAI key never leave the backend.
-- The device holds only a `DEVICE_API_TOKEN` (static env var; revoke = rotate it).
+- The device holds only a `DEVICE_API_TOKEN` (static env var; revoke = rotate it), which always resolves to the owner account.
+- A browser instead carries an `HttpOnly` session cookie mapped to whichever account signed it in (`src/session.rs`); it never holds the device token, and page JavaScript never sees the cookie's value.
 - Spotify OAuth uses a `state` parameter, verified on callback.
 - Use TLS whenever the backend leaves localhost; local dev may use HTTP.
 

@@ -91,6 +91,14 @@ struct TokenResponse {
     refresh_token: Option<String>,
 }
 
+/// Tokens obtained from an OAuth exchange, not yet tied to any client.
+#[derive(Clone, Debug)]
+pub struct ExchangedTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: DateTime<Utc>,
+}
+
 /// Playback fields needed to decide whether clients need a new render document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaybackObservation {
@@ -341,6 +349,23 @@ impl SpotifyClient {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_all_test_endpoints(
+        config: SpotifyConfig,
+        authorize_url: String,
+        token_url: String,
+        api_base_url: String,
+    ) -> Self {
+        Self::with_endpoints(
+            config,
+            SpotifyEndpoints {
+                authorize_url,
+                token_url,
+                api_base_url,
+            },
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) async fn authorize_for_test(&self) {
         *self.token.write().await = Some(StoredToken {
             access_token: "test-access-token".to_string(),
@@ -387,11 +412,22 @@ impl SpotifyClient {
         Ok(url.into())
     }
 
-    pub async fn exchange_authorization_code(
+    /// Consume an OAuth `code`/`state` pair and return the tokens, without
+    /// touching this client's own stored token.
+    ///
+    /// The client that runs the OAuth dance is shared across every visitor
+    /// signing in concurrently (its `pending_states` map is what makes the
+    /// state round-trip work at all), so it must never be the thing that
+    /// persists a token: two people finishing login at the same moment would
+    /// race to overwrite each other's `self.token`. Callers learn whose
+    /// tokens these are via `SpotifyClient::user_for_access_token`, then
+    /// hand them to that account's own dedicated client via
+    /// [`SpotifyClient::adopt_tokens`].
+    pub async fn exchange_code_for_tokens(
         &self,
         code: &str,
         state: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<ExchangedTokens, AppError> {
         if !self.consume_state(state).await {
             return Err(AppError::BadRequest("invalid OAuth state".to_string()));
         }
@@ -417,13 +453,55 @@ impl SpotifyClient {
         let refresh_token = response.refresh_token.ok_or_else(|| {
             AppError::Spotify("authorization response omitted refresh token".to_string())
         })?;
-        let token = StoredToken {
+        Ok(ExchangedTokens {
             access_token: response.access_token,
             refresh_token,
             expires_at: Utc::now() + Duration::seconds(response.expires_in),
-        };
+        })
+    }
 
-        self.persist_and_set(token).await
+    /// Persist tokens obtained elsewhere (typically [`SpotifyClient::exchange_code_for_tokens`]
+    /// on a different, shared client) as this client's own.
+    pub async fn adopt_tokens(&self, tokens: ExchangedTokens) -> Result<(), AppError> {
+        self.persist_and_set(StoredToken {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expires_at: tokens.expires_at,
+        })
+        .await
+    }
+
+    /// The Spotify user id an access token belongs to. Read-only against
+    /// `self.http`/`self.endpoints` alone, so it is safe to call on a client
+    /// shared across concurrent sign-ins.
+    pub(crate) async fn user_for_access_token(
+        &self,
+        access_token: &str,
+    ) -> Result<String, AppError> {
+        #[derive(Deserialize)]
+        struct SpotifyUser {
+            id: String,
+        }
+        let url = format!("{}/me", self.endpoints.api_base_url.trim_end_matches('/'));
+        let user: SpotifyUser = self
+            .http
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(spotify_api_error)?
+            .error_for_status()
+            .map_err(spotify_api_error)?
+            .json()
+            .await
+            .map_err(spotify_api_error)?;
+        Ok(user.id)
+    }
+
+    /// The Spotify user id this already-authorized client belongs to.
+    pub async fn current_user_id(&self) -> Result<String, AppError> {
+        let access_token = self.access_token().await?;
+        self.user_for_access_token(&access_token).await
     }
 
     pub async fn initialize_from_store(&self) -> Result<bool, AppError> {
@@ -1201,10 +1279,14 @@ mod tests {
             .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
             .expect("state query parameter");
 
-        client
-            .exchange_authorization_code("authorization-code", &state)
+        let tokens = client
+            .exchange_code_for_tokens("authorization-code", &state)
             .await
-            .expect("exchange authorization code");
+            .expect("exchange code for tokens");
+        client
+            .adopt_tokens(tokens)
+            .await
+            .expect("adopt exchanged tokens");
         assert!(path.exists());
 
         let restarted = SpotifyClient::with_test_endpoints(

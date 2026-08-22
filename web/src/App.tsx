@@ -85,11 +85,15 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
   const [signingIn, setSigningIn] = useState(false);
+  // Not signed in at all: shown instead of the player, with context before
+  // the redirect below — a cold stranger has never heard of this box and
+  // deserves a sentence before Spotify's consent screen, not a silent bounce.
+  const [needsAuth, setNeedsAuth] = useState(false);
   const idleCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Not signed in: the Spotify authorization a person already has to complete
-  // is the login, so send them straight into it. No token, no setup screen.
-  const signIn = useCallback(() => {
+  // The Spotify authorization a person already has to complete is the login,
+  // so this is the whole sign-in flow. No token, no setup screen.
+  const connectSpotify = useCallback(() => {
     setSigningIn(true);
     window.location.href = "/auth/spotify";
   }, []);
@@ -100,11 +104,11 @@ export default function App() {
       url: stateUrl(DEFAULT_RENDER_PARAMS),
       onDocument: setDoc,
       onStatus: setStatus,
-      onUnauthorized: signIn,
+      onUnauthorized: () => setNeedsAuth(true),
       signal: controller.signal,
     });
     return () => controller.abort();
-  }, [signIn]);
+  }, []);
 
   // The album's own palette drives the whole page.
   useEffect(() => {
@@ -166,17 +170,57 @@ export default function App() {
     doc && doc.duration_ms > 0
       ? Math.min(100, (progress / doc.duration_ms) * 100)
       : 0;
+  const sceneStyle = {
+    "--beat": `${beatSeconds.toFixed(3)}s`,
+    "--energy": energy.toFixed(2),
+  } as React.CSSProperties;
+
+  if (needsAuth) {
+    return (
+      <div className="scene" style={sceneStyle}>
+        <div className="ambient" data-live={false} aria-hidden="true">
+          <span className="ambient-wash" />
+          <span className="ambient-glow" />
+          <span className="ambient-beam" />
+        </div>
+
+        <header className="rail">
+          <span className="wordmark">muse&#8209;box</span>
+        </header>
+
+        <main className="centerpiece">
+          <div className="titles pitch">
+            <h1 className="title">Your Spotify, on a shelf.</h1>
+            <p className="byline">
+              Cover art, ambient light, and a voice remote for whatever
+              you&rsquo;re playing — connect your Spotify account and
+              muse&#8209;box takes it from there.
+            </p>
+            <button
+              type="button"
+              className="connect"
+              disabled={signingIn}
+              onClick={connectSpotify}
+            >
+              {signingIn ? "Redirecting…" : "Connect Spotify"}
+            </button>
+            <p className="fineprint">
+              Uses Spotify&rsquo;s own sign-in, with access to your playback,
+              library, and playlists so it can find music you already like.
+              Voice commands and what&rsquo;s playing are sent to OpenAI to
+              understand them. Nothing here is posted publicly or shared with
+              anyone else.
+            </p>
+          </div>
+        </main>
+
+        <Mascot doc={null} />
+      </div>
+    );
+  }
 
   return (
-    <div
-      className="scene"
-      style={
-        {
-          "--beat": `${beatSeconds.toFixed(3)}s`,
-          "--energy": energy.toFixed(2),
-        } as React.CSSProperties
-      }
-    >
+    <div className="scene" style={sceneStyle}>
       <div className="ambient" data-live={playing} aria-hidden="true">
         <span className="ambient-wash" />
         <span className="ambient-halo" />
