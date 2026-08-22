@@ -33,6 +33,20 @@ pub trait VoiceModel: Send + Sync {
         context: PlaybackContext,
     ) -> VoiceFuture<'a>;
 
+    /// Interpret an already-transcribed command. Defaults to unsupported so a
+    /// model that only takes audio is not silently given text.
+    fn command_text<'a>(
+        &'a self,
+        _transcript: &'a str,
+        _context: PlaybackContext,
+    ) -> VoiceFuture<'a> {
+        Box::pin(async {
+            Err(AppError::Voice(
+                "this voice model does not accept text".to_string(),
+            ))
+        })
+    }
+
     /// Spoken confirmation of what just happened. Defaults to staying quiet so
     /// a model that cannot speak simply does not.
     fn say<'a>(&'a self, _situation: &'a str) -> Option<SpeechFuture<'a>> {
@@ -60,6 +74,14 @@ impl VoiceModel for FailingVoiceModel {
 }
 
 impl VoiceModel for RealtimeManager {
+    fn command_text<'a>(
+        &'a self,
+        transcript: &'a str,
+        context: PlaybackContext,
+    ) -> VoiceFuture<'a> {
+        Box::pin(async move { RealtimeManager::command_text(self, transcript, context).await })
+    }
+
     fn say<'a>(&'a self, situation: &'a str) -> Option<SpeechFuture<'a>> {
         Some(Box::pin(async move {
             RealtimeManager::say(self, situation).await
@@ -154,6 +176,32 @@ async fn run_voice_command(
     // something in the room tripped the wake word, and a false trigger must not
     // be able to change what is playing. Anything that does not name Muse is
     // downgraded to the tool that mutates nothing.
+    let tool = if addressed_to_muse(&intent.transcript) {
+        intent.tool.clone()
+    } else {
+        tracing::info!(
+            transcript = %intent.transcript,
+            requested = ?intent.tool,
+            "utterance did not address Muse; ignoring the request"
+        );
+        ToolCall::NowPlaying
+    };
+    finish_command(
+        state,
+        VoiceIntent {
+            transcript: intent.transcript,
+            tool,
+        },
+    )
+    .await
+}
+
+/// Everything after the model has chosen: dispatch, log, republish, describe.
+/// Shared so the audio and text paths cannot drift apart.
+async fn finish_command(
+    state: &VoiceState,
+    intent: VoiceIntent,
+) -> Result<(RenderDoc, String), AppError> {
     let tool = if addressed_to_muse(&intent.transcript) {
         intent.tool.clone()
     } else {
@@ -332,6 +380,66 @@ fn playback_error(error: PlaybackFetchError) -> AppError {
         PlaybackFetchError::Spotify(error) => error,
         other => AppError::Spotify(other.to_string()),
     }
+}
+
+/// Body of `POST /command`: a transcript the client already has.
+#[derive(Debug, serde::Deserialize)]
+pub struct CommandRequest {
+    pub transcript: String,
+}
+
+/// Interpret a transcript the client produced itself.
+///
+/// A browser has speech recognition; shipping PCM only to have it transcribed
+/// again costs latency, money, and a class of audio bugs. Hardware keeps using
+/// `POST /voice`, which takes audio.
+pub(crate) async fn post_command(
+    State(state): State<VoiceState>,
+    Json(body): Json<CommandRequest>,
+) -> Result<Json<VoiceResponse>, AppError> {
+    let transcript = body.transcript.trim().to_string();
+    if transcript.is_empty() {
+        return Err(AppError::BadRequest(
+            "transcript must not be empty".to_string(),
+        ));
+    }
+
+    let _guard = state.guard.lock().await;
+    let mut thinking = ThinkingGuard::new(state.hub.clone());
+    state.hub.publish_thinking().await;
+
+    let outcome = run_transcript_command(&state, &transcript).await;
+    if outcome.is_err() {
+        recover_document(&state.hub).await;
+    }
+    thinking.settle();
+    let (document, situation) = outcome?;
+
+    let speech = match state.model.say(&situation) {
+        Some(future) => match future.await {
+            Ok(speech) => Some(speech),
+            Err(error) => {
+                tracing::warn!(%error, "Muse could not speak its reply");
+                None
+            }
+        },
+        None => None,
+    };
+    Ok(Json(VoiceResponse { document, speech }))
+}
+
+async fn run_transcript_command(
+    state: &VoiceState,
+    transcript: &str,
+) -> Result<(RenderDoc, String), AppError> {
+    let observation = state.hub.published_observation().await;
+    let context = PlaybackContext {
+        track: observation.track.clone(),
+        artist: observation.artist.clone(),
+        state: playback_state(&observation),
+    };
+    let intent = state.model.command_text(transcript, context).await?;
+    finish_command(state, intent).await
 }
 
 /// Body of `POST /control`: one transport action from the on-screen player.
@@ -675,6 +783,83 @@ mod tests {
             .await
             .expect("body");
         serde_json::from_slice(&body).expect("json")
+    }
+
+    #[tokio::test]
+    async fn a_transcript_command_needs_no_audio() {
+        struct TextModel;
+        impl VoiceModel for TextModel {
+            fn command<'a>(
+                &'a self,
+                _samples: &'a [i16],
+                _rate: u32,
+                _context: PlaybackContext,
+            ) -> VoiceFuture<'a> {
+                Box::pin(async { panic!("the text path must not send audio") })
+            }
+
+            fn command_text<'a>(
+                &'a self,
+                transcript: &'a str,
+                _context: PlaybackContext,
+            ) -> VoiceFuture<'a> {
+                let transcript = transcript.to_string();
+                Box::pin(async move {
+                    Ok(VoiceIntent {
+                        tool: ToolCall::Pause,
+                        transcript,
+                    })
+                })
+            }
+        }
+
+        let pause_calls = Arc::new(AtomicUsize::new(0));
+        let spotify = mock_spotify(pause_calls.clone(), false).await;
+        let app = routes::test_router_with(
+            spotify,
+            "device-token",
+            Arc::new(StateHub::new()),
+            Arc::new(TextModel),
+        );
+
+        let post = |body: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/command")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, "Bearer device-token")
+                        .body(Body::from(body))
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+            }
+        };
+
+        let response = post(r#"{"transcript":"muse, pause"}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(pause_calls.load(Ordering::SeqCst), 1);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let document: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(document["state"], "paused");
+        assert_eq!(document["voice_log"][0]["transcript"], "muse, pause");
+
+        // The same wake gate applies: a transcript is no more trusted than audio.
+        let response = post(r#"{"transcript":"thunder you were only a child"}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            pause_calls.load(Ordering::SeqCst),
+            1,
+            "unaddressed text must not act either"
+        );
+
+        let response = post(r#"{"transcript":"   "}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

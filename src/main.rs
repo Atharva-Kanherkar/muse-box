@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use muse_box::{
     config::Config,
+    lyrics::LyricsIndex,
     realtime::RealtimeManager,
     routes,
     session::SessionStore,
@@ -46,7 +47,17 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
-    let state_hub = Arc::new(StateHub::new().with_display_offset(config.idle_display_offset));
+    let lyrics = Arc::new(LyricsIndex::new(config.lyrics_cache_path.clone()));
+    let cached_lyrics = lyrics.load().await;
+    if cached_lyrics > 0 {
+        tracing::info!(tracks = cached_lyrics, "loaded cached lyrics");
+    }
+
+    let state_hub = Arc::new(
+        StateHub::new()
+            .with_display_offset(config.idle_display_offset)
+            .with_lyrics(lyrics),
+    );
     // Shared by the Realtime session and the embeddings used for taste search.
     let openai_api_key = config.openai_api_key.clone();
     let realtime = Arc::new(RealtimeManager::new(

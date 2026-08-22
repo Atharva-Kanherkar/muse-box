@@ -1,184 +1,140 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  VoiceListener,
-  playSpeech,
-  sendVoiceCommand,
-  type ListenerPhase,
-  type Utterance,
-} from "../lib/voice";
+import { playSpeech, sendCommand } from "../lib/voice";
 import { WakeWordListener, wakeWordSupported } from "../lib/wake";
-
-
 
 /**
  * Muse sleeps until it hears its name.
  *
- * The microphone stays open, but nothing leaves the browser until the wake word
- * fires — otherwise music in the room reads as speech and every song becomes a
- * command. Where the browser has no speech recognition there is an explicit
- * talk button instead, which is honest about the limitation rather than
- * silently streaming the room.
+ * The browser's own speech recognition does the listening, and the command
+ * travels as text. That is deliberate: holding a microphone open for PCM while
+ * recognition also wanted it is what made this go deaf, and shipping audio only
+ * to have it transcribed again added latency, cost, and the Realtime API's
+ * minimum-buffer rejections. Hardware still sends audio; a browser need not.
  */
 export function VoiceControl() {
-  const [phase, setPhase] = useState<ListenerPhase>("stopped");
-  const [level, setLevel] = useState(0);
-  const [sending, setSending] = useState(false);
+  const [awake, setAwake] = useState(false);
+  const [heard, setHeard] = useState("");
+  const [thinking, setThinking] = useState(false);
   const [replying, setReplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [woke, setWoke] = useState(false);
+  const [typed, setTyped] = useState("");
 
-  const listenerRef = useRef<VoiceListener | null>(null);
   const wakeRef = useRef<WakeWordListener | null>(null);
   const inFlightRef = useRef(false);
   const supported = wakeWordSupported();
 
-  const handleUtterance = useCallback((utterance: Utterance) => {
+  const runCommand = useCallback((transcript: string) => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
-    setWoke(false);
-    setSending(true);
-    void sendVoiceCommand(utterance)
+    setThinking(true);
+    setError(null);
+    void sendCommand(transcript)
       .then(async (result) => {
-        setError(null);
         if (!result.speech) return;
-        // Deafen both listeners first, or Muse's own voice trips the wake word
-        // and it answers itself.
-        listenerRef.current?.setMuted(true);
+        // Deafen first, or Muse's own voice becomes the next command.
         wakeRef.current?.setMuted(true);
         setReplying(true);
         try {
           await playSpeech(result.speech);
         } finally {
           setReplying(false);
-          listenerRef.current?.setMuted(false);
           wakeRef.current?.setMuted(false);
         }
       })
       .catch((cause: unknown) =>
-        setError(cause instanceof Error ? cause.message : "Voice command failed"),
+        setError(cause instanceof Error ? cause.message : "Muse could not act"),
       )
       .finally(() => {
         inFlightRef.current = false;
-        setSending(false);
+        setThinking(false);
+        setHeard("");
       });
   }, []);
 
-  const start = useCallback(async () => {
-    if (listenerRef.current) return;
+  const start = useCallback(() => {
+    if (wakeRef.current || !supported) return;
     setError(null);
-    const listener = new VoiceListener({
-      onUtterance: handleUtterance,
-      onPhase: setPhase,
-      onLevel: setLevel,
+    const wake = new WakeWordListener({
+      onCommand: runCommand,
+      onHeard: setHeard,
       onError: setError,
     });
-    try {
-      await listener.start();
-    } catch (cause) {
-      const message =
-        cause instanceof Error ? cause.message : "Microphone unavailable";
-      setError(
-        /denied|NotAllowed/i.test(message)
-          ? "Microphone permission denied. Allow it to let Muse listen."
-          : message,
-      );
-      return;
-    }
-    listenerRef.current = listener;
-
-    if (supported) {
-      const wake = new WakeWordListener({
-        onWake: () => {
-          setWoke(true);
-          listenerRef.current?.arm();
-        },
-        onHeard: () => {},
-        onError: setError,
-      });
-      wake.start();
+    if (wake.start()) {
       wakeRef.current = wake;
+      setAwake(true);
     }
-  }, [handleUtterance, supported]);
+  }, [runCommand, supported]);
 
-  const stop = useCallback(async () => {
+  const stop = useCallback(() => {
     wakeRef.current?.stop();
     wakeRef.current = null;
-    const listener = listenerRef.current;
-    listenerRef.current = null;
-    await listener?.stop();
-    setWoke(false);
+    setAwake(false);
+    setHeard("");
   }, []);
 
   useEffect(() => {
     return () => {
       wakeRef.current?.stop();
-      void listenerRef.current?.stop();
       wakeRef.current = null;
-      listenerRef.current = null;
     };
   }, []);
 
-  const awake = phase !== "stopped";
-  const activePhase = replying
+  const phase = replying
     ? "replying"
-    : sending
+    : thinking
       ? "thinking"
-      : phase === "speaking"
+      : heard
         ? "speaking"
         : awake
           ? "listening"
           : "stopped";
-  const statusLine = replying
+  const label = replying
     ? "Muse is speaking"
-    : sending
+    : thinking
       ? "Thinking"
-      : phase === "speaking"
-        ? "Listening to you"
+      : heard
+        ? heard.slice(-46)
         : awake
-          ? supported
-            ? "Asleep — say “Muse”"
-            : "Ready"
-          : "Off";
+          ? "Say “Muse”"
+          : "Asleep";
 
   return (
     <div className="muse-strip">
-      <button
-        type="button"
-        className="controlish"
-        data-armed={awake}
-        onClick={() => void (awake ? stop() : start())}
-      >
-        {awake ? "Stop" : "Wake on “Muse”"}
-      </button>
-
-      <span className="muse-phase" data-phase={activePhase}>
-        {statusLine}
-      </span>
-
-      <span className="mini-levels" data-idle={!awake} aria-hidden="true">
-        {Array.from({ length: 12 }, (_, index) => {
-          const active = awake && index < Math.round(level * 12);
-          return (
-            <span
-              key={index}
-              data-lit={active && woke}
-              style={{ height: active ? `${20 + level * 80}%` : "12%" }}
-            />
-          );
-        })}
-      </span>
-
-      {awake && !supported ? (
-        <button
-          type="button"
-          className="controlish"
-          disabled={sending}
-          onClick={() => listenerRef.current?.arm()}
+      {supported ? (
+        <>
+          <button
+            type="button"
+            className="controlish"
+            data-armed={awake}
+            onClick={() => (awake ? stop() : start())}
+          >
+            {awake ? "Stop" : "Wake on “Muse”"}
+          </button>
+          <span className="muse-phase" data-phase={phase}>
+            {label}
+          </span>
+        </>
+      ) : (
+        <form
+          className="typed"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!typed.trim()) return;
+            runCommand(typed.trim());
+            setTyped("");
+          }}
         >
-          Talk
-        </button>
-      ) : null}
-
+          <input
+            type="text"
+            placeholder="Muse, play something calm"
+            value={typed}
+            onChange={(event) => setTyped(event.target.value)}
+          />
+          <button className="controlish" type="submit" disabled={thinking}>
+            {thinking ? "…" : "Send"}
+          </button>
+        </form>
+      )}
       {error ? <span className="alert">{error}</span> : null}
     </div>
   );

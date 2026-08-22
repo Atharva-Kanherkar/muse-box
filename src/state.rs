@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use crate::{
     error::AppError,
     idle, image,
+    lyrics::LyricsIndex,
     render::{Art, DitherMode, PlaybackState, RENDER_DOCUMENT_VERSION, RenderDoc, VoiceLogEntry},
     spotify::{MAX_RATE_LIMIT_BACKOFF, PlaybackObservation},
 };
@@ -94,6 +95,7 @@ pub struct StateHub {
     playback_activity: watch::Sender<PlaybackActivity>,
     display_offset: FixedOffset,
     keep_alive: std::time::Duration,
+    lyrics: Option<Arc<LyricsIndex>>,
     changes: broadcast::Sender<u64>,
     generation: AtomicU64,
     http: reqwest::Client,
@@ -140,10 +142,18 @@ impl StateHub {
             playback_activity,
             display_offset: Utc.fix(),
             keep_alive: DEFAULT_SSE_KEEP_ALIVE,
+            lyrics: None,
             changes,
             generation: AtomicU64::new(0),
             http,
         }
+    }
+
+    /// Attach a lyrics source. Absent in tests, which then publish no lyrics.
+    #[must_use]
+    pub fn with_lyrics(mut self, lyrics: Arc<LyricsIndex>) -> Self {
+        self.lyrics = Some(lyrics);
+        self
     }
 
     /// How often the SSE stream should send a keep-alive comment.
@@ -339,7 +349,20 @@ impl StateHub {
             .build_document_without_voice_log(observation, params)
             .await?;
         document.voice_log = self.voice_log.lock().await.iter().cloned().collect();
+        document.lyrics = self.lyrics_for(observation).await;
         Ok(document)
+    }
+
+    /// Lyrics for whatever is playing, if a source is attached and has them.
+    async fn lyrics_for(&self, observation: &PlaybackObservation) -> Option<crate::lyrics::Lyrics> {
+        let index = self.lyrics.as_ref()?;
+        let track_id = observation.track_id.as_deref()?;
+        let track = observation.track.as_deref()?;
+        let artist = observation.artist.as_deref()?;
+        let album = observation.album.as_deref().unwrap_or_default();
+        index
+            .for_track(track_id, track, artist, album, observation.duration_ms)
+            .await
     }
 
     async fn build_document_without_voice_log(
@@ -682,6 +705,7 @@ fn document_from_observation(
         progress_ms: observation.progress_ms,
         duration_ms: observation.duration_ms,
         voice_log: Vec::new(),
+        lyrics: None,
     }
 }
 

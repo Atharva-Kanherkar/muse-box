@@ -32,6 +32,17 @@ export interface VoiceLogEntry {
   timestamp: string;
 }
 
+export interface LyricLine {
+  at_ms: number;
+  text: string;
+}
+
+/** Absent when the track has none; `synced` false means show, do not follow. */
+export interface Lyrics {
+  synced: boolean;
+  lines: LyricLine[];
+}
+
 export interface RenderDoc {
   version: number;
   state: PlaybackState;
@@ -49,6 +60,7 @@ export interface RenderDoc {
   progress_ms: number;
   duration_ms: number;
   voice_log: VoiceLogEntry[];
+  lyrics?: Lyrics | null;
 }
 
 /** Per-device render parameters accepted by `GET /state`. */

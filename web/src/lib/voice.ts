@@ -330,6 +330,33 @@ export async function playSpeech(speech: Speech): Promise<void> {
   }
 }
 
+/**
+ * Sends a command the browser already transcribed.
+ *
+ * The audio path below stays for hardware, which has no speech recognition.
+ */
+export async function sendCommand(
+  transcript: string,
+): Promise<RenderDoc & { speech?: Speech }> {
+  const response = await fetch("/command", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ transcript }),
+  });
+  if (!response.ok) {
+    let message = `Muse could not act on that (${response.status})`;
+    try {
+      const body = (await response.json()) as ApiError;
+      if (body.error) message = body.error;
+    } catch {
+      // Keep the status-based message.
+    }
+    throw new Error(message);
+  }
+  return (await response.json()) as RenderDoc & { speech?: Speech };
+}
+
 /** Posts one utterance as raw PCM16 and returns the rebuilt document. */
 export async function sendVoiceCommand(
   utterance: Utterance,

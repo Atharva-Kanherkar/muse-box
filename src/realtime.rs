@@ -255,6 +255,118 @@ impl RealtimeManager {
         }
     }
 
+    /// Interpret an already-transcribed command.
+    ///
+    /// A browser has speech recognition of its own, so shipping PCM only to have
+    /// it transcribed again costs latency, money, and a whole class of audio
+    /// bugs. Hardware still uses [`Self::command`], which takes audio.
+    pub async fn command_text(
+        &self,
+        transcript: &str,
+        context: PlaybackContext,
+    ) -> Result<VoiceIntent, AppError> {
+        if transcript.trim().is_empty() {
+            return Err(AppError::Voice("transcript must not be empty".to_string()));
+        }
+        let mut session = self.session.lock().await;
+        let exchange = async {
+            if session.is_none() {
+                *session = Some(self.connect().await?);
+            }
+            let Some(socket) = session.as_mut() else {
+                return Err(AppError::Voice(
+                    "realtime session was not available".to_string(),
+                ));
+            };
+            send_json(
+                socket,
+                &json!({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": transcript }]
+                    }
+                }),
+            )
+            .await?;
+            let context_json = serde_json::to_string(&context)
+                .map_err(|_| AppError::Voice("failed to serialize playback context".to_string()))?;
+            send_json(
+                socket,
+                &json!({
+                    "type": "response.create",
+                    "response": {
+                        "output_modalities": ["text"],
+                        "tool_choice": "required",
+                        "instructions": format!(
+                            "Choose exactly one tool for this request. If it was not aimed at \
+                             Muse and is not a music request, choose now_playing so nothing \
+                             changes. Current playback context: {context_json}"
+                        )
+                    }
+                }),
+            )
+            .await?;
+            // The transcript came from the caller, so there is no transcription
+            // event to wait for; the tool call is the whole answer.
+            Self::receive_tool(socket, transcript).await
+        };
+        let result = match tokio::time::timeout(self.command_deadline, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(AppError::Voice("model timeout".to_string())),
+        };
+        if let Err(error) = &result {
+            tracing::warn!(%error, "realtime text command failed; resetting session");
+            *session = None;
+        }
+        result
+    }
+
+    async fn receive_tool(
+        socket: &mut RealtimeSocket,
+        transcript: &str,
+    ) -> Result<VoiceIntent, AppError> {
+        let mut progress = CommandProgress::default();
+        loop {
+            let message = socket
+                .next()
+                .await
+                .ok_or_else(|| AppError::Voice("realtime connection dropped".to_string()))?;
+            match message {
+                Ok(Message::Text(text)) => {
+                    progress.consume(&text)?;
+                    if let Some(tool) = progress.tool.as_ref() {
+                        return Ok(VoiceIntent {
+                            transcript: transcript.to_string(),
+                            tool: tool.clone(),
+                        });
+                    }
+                    if progress.response_done {
+                        return Err(AppError::Voice(
+                            "model returned no Spotify tool call".to_string(),
+                        ));
+                    }
+                }
+                Ok(Message::Ping(payload)) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|_| AppError::Voice("realtime connection dropped".to_string()))?;
+                }
+                Ok(Message::Close(_)) | Err(_) => {
+                    return Err(AppError::Voice("realtime connection dropped".to_string()));
+                }
+                Ok(Message::Binary(_)) => {
+                    return Err(AppError::Voice(
+                        "realtime service returned an unexpected binary event".to_string(),
+                    ));
+                }
+                Ok(Message::Pong(_) | Message::Frame(_)) => {}
+            }
+        }
+    }
+
     async fn connect(&self) -> Result<RealtimeSocket, AppError> {
         let url = format!(
             "{}?model={}",

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Lyrics } from "./components/Lyrics";
 import { VoiceControl } from "./components/VoiceControl";
 import { decodeArt, paintArt } from "./lib/art";
 import {
@@ -152,6 +153,7 @@ export default function App() {
     [busy],
   );
 
+  const hasLyrics = (doc?.lyrics?.lines.length ?? 0) > 0;
   const playing = doc?.state === "playing";
   const percent =
     doc && doc.duration_ms > 0
@@ -170,7 +172,7 @@ export default function App() {
         ) : null}
       </header>
 
-      <main className="centerpiece">
+      <main className="centerpiece" data-with-lyrics={hasLyrics}>
         <figure className="cover" data-playing={playing}>
           {doc?.art_url ? (
             <img className="cover-art" src={doc.art_url} alt="" />
@@ -235,6 +237,8 @@ export default function App() {
 
         {controlError ? <p className="alert">{controlError}</p> : null}
       </main>
+
+      <Lyrics doc={doc} progressMs={progress} />
 
       <footer className="dock">
         <VoiceControl />

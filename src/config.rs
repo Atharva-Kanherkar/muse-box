@@ -27,6 +27,9 @@ pub struct Config {
     /// Where browser sessions are persisted, so a redeploy does not sign anyone
     /// out. Belongs on the same volume as the token store.
     pub session_store_path: PathBuf,
+    /// Cached lyrics, including known misses, so a track on repeat is looked up
+    /// once. Belongs on the volume with everything else.
+    pub lyrics_cache_path: PathBuf,
     /// Directory of the built web client, served from this same origin.
     pub client_root: PathBuf,
 }
@@ -51,7 +54,7 @@ impl Config {
             openai_api_key: std::env::var("OPENAI_API_KEY")
                 .context("OPENAI_API_KEY is required")?,
             openai_realtime_model: std::env::var("OPENAI_REALTIME_MODEL")
-                .unwrap_or_else(|_| "gpt-realtime-mini".to_string()),
+                .unwrap_or_else(|_| "gpt-realtime".to_string()),
             device_api_token: std::env::var("DEVICE_API_TOKEN")
                 .unwrap_or_else(|_| "dev-token-change-me".to_string()),
             idle_display_offset: idle_display_offset()?,
@@ -61,6 +64,9 @@ impl Config {
             session_store_path: std::env::var("SESSION_STORE_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("./data/sessions.json")),
+            lyrics_cache_path: std::env::var("LYRICS_CACHE_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("./data/lyrics.json")),
             client_root: std::env::var("CLIENT_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("./web/dist")),

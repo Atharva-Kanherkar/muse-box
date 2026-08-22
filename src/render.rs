@@ -58,6 +58,10 @@ pub struct RenderDoc {
     pub duration_ms: u64,
     /// Recent voice command transcript log.
     pub voice_log: Vec<VoiceLogEntry>,
+    /// Time-synced lyrics when they exist. Clients pick the current line with
+    /// the same interpolation that drives the progress bar.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lyrics: Option<crate::lyrics::Lyrics>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +87,7 @@ impl RenderDoc {
             progress_ms: 0,
             duration_ms: 0,
             voice_log: vec![],
+            lyrics: None,
         }
     }
 }

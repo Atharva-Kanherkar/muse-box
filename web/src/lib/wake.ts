@@ -2,13 +2,17 @@
  * Wake-word detection, so Muse only listens when it is spoken to.
  *
  * Energy-based voice activity cannot tell a song from a sentence, so with music
- * in the room it fired constantly. This runs the browser's own continuous
- * speech recognition purely as a trigger — it never decides anything, it only
- * answers "did someone just say Muse". Command audio still goes to the backend
- * as PCM, because that is what interprets it.
+ * in the room it fired constantly. The browser has speech recognition of its
+ * own, so it does both jobs here: it notices the name and hands over the whole
+ * sentence as text. Nothing is sent until the name is heard.
  *
- * Recognition is Chromium and Safari only. Where it is missing the caller falls
- * back to an explicit talk button rather than silently streaming the room.
+ * Sending text rather than PCM also removes the microphone contention that made
+ * this unreliable — recognition and an AudioWorklet fighting over one
+ * microphone is why it kept going deaf — along with resampling and the Realtime
+ * API's minimum-buffer rejections.
+ *
+ * Recognition is Chromium and Safari only. Where it is missing the caller offers
+ * a typed command rather than silently streaming the room.
  */
 
 /** Minimal shape of the bits of the recognition API used here. */
@@ -17,6 +21,7 @@ interface RecognitionAlternative {
 }
 interface RecognitionResult {
   readonly length: number;
+  readonly isFinal?: boolean;
   item(index: number): RecognitionAlternative;
   [index: number]: RecognitionAlternative;
 }
@@ -45,6 +50,11 @@ interface Recognition {
 }
 type RecognitionConstructor = new () => Recognition;
 
+/** Safari has been known to omit `isFinal`; treat a missing flag as final. */
+function isFinalResult(result: RecognitionResult | undefined): boolean {
+  return result?.isFinal !== false;
+}
+
 function constructor(): RecognitionConstructor | null {
   const scope = window as unknown as {
     SpeechRecognition?: RecognitionConstructor;
@@ -72,8 +82,9 @@ export function containsWakeWord(text: string): boolean {
 }
 
 export interface WakeCallbacks {
-  onWake: () => void;
-  /** Latest heard text, for showing what it thought it heard. */
+  /** A finished utterance that named Muse: the whole command, already text. */
+  onCommand: (transcript: string) => void;
+  /** Latest interim text, for showing what it is hearing. */
   onHeard: (text: string) => void;
   onError: (message: string) => void;
 }
@@ -99,6 +110,11 @@ export class WakeWordListener {
     return true;
   }
 
+  /** Whether recognition is currently running. */
+  get active(): boolean {
+    return this.running;
+  }
+
   private spawn(Recognizer: RecognitionConstructor): void {
     const recognition = new Recognizer();
     recognition.continuous = true;
@@ -108,14 +124,18 @@ export class WakeWordListener {
     recognition.onresult = (event) => {
       if (this.muted) return;
       for (let index = event.resultIndex; index < event.results.length; index += 1) {
-        const text = event.results[index]?.[0]?.transcript ?? "";
-        if (!text.trim()) continue;
-        this.callbacks.onHeard(text.trim());
+        const result = event.results[index];
+        const text = result?.[0]?.transcript?.trim() ?? "";
+        if (!text) continue;
+        this.callbacks.onHeard(text);
         if (!containsWakeWord(text)) continue;
+        // Interim results grow as the sentence is spoken; waiting for the final
+        // one means the command arrives whole rather than truncated.
+        if (!isFinalResult(result)) continue;
         const now = Date.now();
         if (now - this.lastWake < RETRIGGER_GUARD_MS) continue;
         this.lastWake = now;
-        this.callbacks.onWake();
+        this.callbacks.onCommand(text);
       }
     };
 
@@ -131,18 +151,18 @@ export class WakeWordListener {
     };
 
     recognition.onend = () => {
-      // Recognition stops itself regularly; keeping it alive is the caller's job.
+      // Recognition ends itself after every silence gap. That is routine, not a
+      // failure: counting it pushed the restart delay to seconds and left the
+      // wake word deaf most of the time. Only a start that throws is a failure,
+      // and a fresh instance is required because Chrome refuses to restart an
+      // ended one.
       if (!this.running) return;
-      this.consecutiveFailures += 1;
-      const delay = Math.min(200 * this.consecutiveFailures, 4_000);
+      const delay = this.consecutiveFailures === 0
+        ? 0
+        : Math.min(250 * this.consecutiveFailures, 3_000);
       this.restartTimer = window.setTimeout(() => {
         if (!this.running) return;
-        try {
-          recognition.start();
-          this.consecutiveFailures = 0;
-        } catch {
-          // Already starting; the next onend will retry.
-        }
+        this.spawn(Recognizer);
       }, delay);
     };
 

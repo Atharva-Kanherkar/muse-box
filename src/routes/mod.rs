@@ -93,6 +93,7 @@ pub fn router(config: RouterConfig) -> Router {
     let voice_route = Router::new()
         .route("/voice", post(voice::post_voice))
         .route("/control", post(voice::post_control))
+        .route("/command", post(voice::post_command))
         .with_state(voice_state);
     let protected = Router::new()
         .route("/health", get(health))
