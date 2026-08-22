@@ -238,7 +238,18 @@ async fn finish_command(
 /// empty transcript never counts: silence and music both produce one, and either
 /// would otherwise be free rein to act.
 fn addressed_to_muse(transcript: &str) -> bool {
-    const NAMES: [&str; 5] = ["muse", "mews", "muze", "moose", "mus"];
+    // Speech recognition mangles a one-syllable name badly, and "news" is what
+    // it reaches for most often. Recall is deliberately loose here because
+    // precision comes from the model, which is told to choose the no-op tool for
+    // anything that is not a music request. A false wake costs a request, not a
+    // wrong action.
+    // A slice, not a sized array: the length is not information worth
+    // maintaining by hand. Apostrophes never appear because the split below
+    // breaks on them, so "muse's" needs no entry.
+    const NAMES: &[&str] = &[
+        "muse", "mews", "muze", "mooz", "moose", "moos", "mus", "muice", "news", "newz", "nous",
+        "noose", "amuse", "muser", "myuse", "meuse",
+    ];
     let lowered = transcript.to_lowercase();
     lowered
         .split(|character: char| !character.is_ascii_alphanumeric())
@@ -974,6 +985,10 @@ mod tests {
             "Muse, pause",
             "ok mews next track",
             "MOOSE turn it down",
+            // What recognition actually produces for "Muse" most of the time.
+            "hey news play something calm",
+            "nous, pause",
+            "amuse next track",
         ] {
             assert!(addressed_to_muse(said), "should wake: {said}");
         }

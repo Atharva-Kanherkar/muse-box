@@ -72,7 +72,27 @@ export function wakeWordSupported(): boolean {
  * the usual mishearings are accepted; the backend applies the same gate to the
  * real transcript, so a wrong wake here still cannot change playback.
  */
-const NAMES = ["muse", "mews", "muze", "moose", "mus"];
+const NAMES = [
+  "muse",
+  "mews",
+  "muze",
+  "mooz",
+  "moose",
+  "moos",
+  "mus",
+  "muice",
+  // "news" is what recognition reaches for most often, so it has to count.
+  // Recall is loose on purpose: the backend still refuses to act on anything
+  // that is not a music request, so a false wake costs a request, not an action.
+  "news",
+  "newz",
+  "nous",
+  "noose",
+  "amuse",
+  "muser",
+  "myuse",
+  "meuse",
+];
 
 export function containsWakeWord(text: string): boolean {
   return text

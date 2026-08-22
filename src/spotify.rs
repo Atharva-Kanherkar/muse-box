@@ -222,8 +222,26 @@ struct DevicesResponse {
 
 #[derive(Debug, Deserialize)]
 struct SpotifyDevice {
-    id: String,
+    /// Null for devices Spotify will not let you address, so this cannot be a
+    /// bare String: one such device in the list used to fail the whole parse and
+    /// take the retry down with it.
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
     is_active: bool,
+    /// A restricted device refuses Web API commands, so naming it still fails.
+    #[serde(default)]
+    is_restricted: bool,
+}
+
+impl SpotifyDevice {
+    fn usable(&self) -> Option<&str> {
+        if self.is_restricted {
+            return None;
+        }
+        self.id.as_deref()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -686,6 +704,13 @@ impl SpotifyClient {
         let response = self
             .player_request(method, path, query, Some(&device_id), body.as_ref())
             .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // Named a device and Spotify still says no: it went away between
+            // listing and using it, which happens when an app is backgrounded.
+            return Err(AppError::Spotify(
+                "the Spotify device stopped responding; open Spotify again and retry".to_string(),
+            ));
+        }
         player_response_error(response)
     }
 
@@ -741,11 +766,30 @@ impl SpotifyClient {
             .await
             .map_err(spotify_api_error)?
             .devices;
-        Ok(devices
+        // Prefer whatever Spotify already considers active; otherwise any device
+        // that will actually accept a command.
+        let chosen = devices
             .iter()
-            .find(|device| device.is_active)
-            .or_else(|| devices.first())
-            .map(|device| device.id.clone()))
+            .find(|device| device.is_active && device.usable().is_some())
+            .or_else(|| devices.iter().find(|device| device.usable().is_some()));
+
+        match chosen {
+            Some(device) => {
+                tracing::debug!(
+                    device = device.name.as_deref().unwrap_or("unnamed"),
+                    active = device.is_active,
+                    "targeting a Spotify device"
+                );
+                Ok(device.usable().map(str::to_string))
+            }
+            None => {
+                tracing::info!(
+                    listed = devices.len(),
+                    "Spotify listed no device that accepts commands"
+                );
+                Ok(None)
+            }
+        }
     }
 
     async fn consume_state(&self, state: &str) -> bool {
@@ -1278,6 +1322,94 @@ mod tests {
             requests
                 .iter()
                 .all(|request| request.2 == "Bearer test-access-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn device_choice_skips_null_ids_and_restricted_devices() {
+        // A real device list mixes these in, and either one used to break the
+        // retry: a null id failed the whole parse, a restricted device accepted
+        // being named and then refused the command.
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = seen.clone();
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |request: axum::extract::Request| {
+                let observed = observed.clone();
+                async move {
+                    let uri = request.uri().to_string();
+                    observed.lock().await.push(uri.clone());
+                    if uri.starts_with("/v1/me/player/devices") {
+                        return axum::Json(serde_json::json!({
+                            "devices": [
+                                { "id": null, "name": "Unaddressable", "is_active": true },
+                                { "id": "cast", "name": "Cast", "is_active": true,
+                                  "is_restricted": true },
+                                { "id": "phone", "name": "Phone", "is_active": false }
+                            ]
+                        }))
+                        .into_response();
+                    }
+                    if uri.contains("device_id=phone") {
+                        return StatusCode::NO_CONTENT.into_response();
+                    }
+                    StatusCode::NOT_FOUND.into_response()
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = SpotifyClient::with_test_api_url(
+            test_config(PathBuf::from("unused")),
+            format!("http://{address}/v1"),
+        );
+        client.authorize_for_test().await;
+        client.resume_playback().await.expect("the phone is usable");
+
+        let seen = seen.lock().await;
+        assert!(
+            seen.last()
+                .is_some_and(|uri| uri.contains("device_id=phone")),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_that_vanishes_mid_command_says_so() {
+        // Listed, then gone by the time it is used: the app was backgrounded.
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |request: axum::extract::Request| async move {
+                if request
+                    .uri()
+                    .to_string()
+                    .starts_with("/v1/me/player/devices")
+                {
+                    return axum::Json(serde_json::json!({
+                        "devices": [{ "id": "gone", "name": "Phone", "is_active": true }]
+                    }))
+                    .into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = SpotifyClient::with_test_api_url(
+            test_config(PathBuf::from("unused")),
+            format!("http://{address}/v1"),
+        );
+        client.authorize_for_test().await;
+        let message = client
+            .resume_playback()
+            .await
+            .expect_err("still 404")
+            .to_string();
+        assert!(
+            message.contains("stopped responding"),
+            "a bare 404 is not actionable: {message}"
         );
     }
 
