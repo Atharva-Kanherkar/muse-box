@@ -2,6 +2,8 @@
 
 A voice-controlled Spotify decoration: a dithered, terminal-aesthetic display with reactive LEDs. It sits on a shelf, looks beautiful whether or not music is playing, and does what you tell it.
 
+![muse-box showing an album cover, karaoke-style lyrics, and Bitka the pixel cat](docs/player.jpg)
+
 This is a personal project for one person, one Spotify account, one box. It is deliberately not designed to scale, multi-tenant, or monetize.
 
 The project is intentionally built in two phases:
@@ -10,6 +12,36 @@ The project is intentionally built in two phases:
 2. **Hardware second**: an ESP32-S3 with a 1-bit-ish e-paper/IPS panel and an I2S microphone. It consumes the exact same backend endpoints as the web app.
 
 Both clients are dumb renderers. The backend owns Spotify OAuth, the GPT Realtime voice session, tool execution, palette extraction, dithering, and the idle-mode art.
+
+---
+
+## Run it yourself
+
+Your own Spotify app, your own OpenAI key, running on your own machine. Nothing here talks to any server but Spotify's, OpenAI's, and the one you're about to start.
+
+**You'll need:** the [Rust toolchain](https://rustup.rs), Node 18+, a Spotify account, and an [OpenAI API key](https://platform.openai.com/api-keys).
+
+1. **Create a Spotify app** at the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) → **Create app**. Once created, open its **Settings** and:
+   - Copy the **Client ID**, and click **View client secret** to get the **Client Secret**.
+   - Add `http://localhost:3000/auth/spotify/callback` under **Redirect URIs** and save. (Skip this and Spotify will refuse the login with `INVALID_CLIENT: Invalid redirect URI` — the single most common setup mistake.)
+2. **Clone the repo and set your keys:**
+   ```bash
+   git clone https://github.com/Atharva-Kanherkar/muse-box.git
+   cd muse-box
+   cp .env.example .env
+   ```
+   Open `.env` and fill in `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, and `OPENAI_API_KEY`. Everything else already has a working default.
+3. **Start the backend:**
+   ```bash
+   cargo run
+   ```
+4. **Start the web client**, in a second terminal:
+   ```bash
+   cd web && npm install && npm run dev
+   ```
+5. Open **http://localhost:5173** — it sends you straight to Spotify's login. Approve it, and the box is live: whatever is playing on your account shows up immediately, and you can say "muse" (or type a command) to control it.
+
+No database, no separate auth server, no manual token copy-pasting. The Spotify login you just completed *is* the whole setup — the backend keeps the resulting token in `data/spotify_token.json`, so you only do this once.
 
 ---
 

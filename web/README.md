@@ -10,8 +10,10 @@ npm run dev        # http://localhost:5173
 npm run build      # static bundle in dist/
 ```
 
-Set the backend URL and `DEVICE_API_TOKEN` in the UI; both persist to
-`localStorage`. `VITE_API_BASE_URL` pre-fills the URL field.
+Nothing to configure here — see "No setup, and no token in the browser" below.
+In dev, Vite proxies `/state`, `/voice`, `/control`, `/command`, `/auth`, and
+`/healthz` to a backend on `http://127.0.0.1:3000` (`vite.config.ts`); run
+`cargo run` in the repo root alongside `npm run dev`.
 
 ## Two constraints worth knowing before you change this
 
