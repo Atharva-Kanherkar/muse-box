@@ -517,6 +517,10 @@ impl SpotifyClient {
             .request(method, url)
             .bearer_auth(access_token)
             .query(query)
+            // Spotify answers 411 Length Required for a body-less PUT/POST.
+            // reqwest omits Content-Length when there is no body, and an empty
+            // Vec body is not enough either, so set the header outright.
+            .header(reqwest::header::CONTENT_LENGTH, "0")
             .send()
             .await
             .map_err(spotify_api_error)?

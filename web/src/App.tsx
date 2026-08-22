@@ -23,7 +23,9 @@ interface Connection {
 function loadConnection(): Connection {
   const fallback: Connection = {
     baseUrl: import.meta.env.VITE_API_BASE_URL ?? "http://localhost:3000",
-    token: "",
+    // Local convenience only: put it in .env.local (gitignored) so you are not
+    // pasting the device token on every hard reload.
+    token: import.meta.env.VITE_DEVICE_TOKEN ?? "",
   };
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);

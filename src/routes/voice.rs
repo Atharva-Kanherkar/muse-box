@@ -682,7 +682,15 @@ mod tests {
             async move {
                 let method = request.method().to_string();
                 let uri = request.uri().to_string();
-                observed.lock().await.push((method, uri.clone()));
+                let content_length = request
+                    .headers()
+                    .get(axum::http::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                observed
+                    .lock()
+                    .await
+                    .push((method, uri.clone(), content_length));
                 if uri.starts_with("/v1/search?") {
                     Json(json!({ "tracks": { "items": [{ "id": "resolved-id" }] } }))
                         .into_response()
@@ -745,27 +753,39 @@ mod tests {
         assert_eq!(
             requests
                 .iter()
-                .filter(|(_, uri)| uri == "/v1/me/player/play")
+                .filter(|(_, uri, _)| uri == "/v1/me/player/play")
                 .count(),
             2
         );
         assert_eq!(
             requests
                 .iter()
-                .filter(|(_, uri)| uri == "/v1/me/player/pause")
+                .filter(|(_, uri, _)| uri == "/v1/me/player/pause")
                 .count(),
             1
         );
         assert_eq!(
             requests
                 .iter()
-                .filter(|(_, uri)| uri.starts_with("/v1/search?"))
+                .filter(|(_, uri, _)| uri.starts_with("/v1/search?"))
                 .count(),
             2
         );
-        assert!(requests.iter().any(|(_, uri)| {
+        assert!(requests.iter().any(|(_, uri, _)| {
             uri.starts_with("/v1/me/player/queue?uri=spotify%3Atrack%3Aresolved-id")
         }));
+
+        // Spotify answers 411 Length Required for a body-less PUT/POST, and
+        // reqwest omits Content-Length entirely unless a body is set. Every
+        // mutating call must therefore carry one.
+        for (method, uri, content_length) in requests.iter() {
+            if method == "PUT" || method == "POST" {
+                assert!(
+                    content_length.is_some(),
+                    "{method} {uri} has no Content-Length; Spotify would answer 411"
+                );
+            }
+        }
     }
 
     #[tokio::test]
