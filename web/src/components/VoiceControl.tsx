@@ -29,7 +29,6 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
   const [sending, setSending] = useState(false);
   const [replying, setReplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [heard, setHeard] = useState<string | null>(null);
   const [woke, setWoke] = useState(false);
 
   const listenerRef = useRef<VoiceListener | null>(null);
@@ -103,7 +102,7 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
           setWoke(true);
           listenerRef.current?.arm();
         },
-        onHeard: setHeard,
+        onHeard: () => {},
         onError: setError,
       });
       wake.start();
@@ -118,7 +117,6 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
     listenerRef.current = null;
     await listener?.stop();
     setWoke(false);
-    setHeard(null);
   }, []);
 
   useEffect(() => {
@@ -152,76 +150,47 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
             : "Ready"
           : "Off";
 
-  const bars = 24;
-  const lit = Math.round(level * bars);
-
   return (
-    <section className="block">
-      <h2 className="block-head">Muse</h2>
+    <div className="muse-strip">
+      <button
+        type="button"
+        className="controlish"
+        data-armed={awake}
+        disabled={disabled}
+        onClick={() => void (awake ? stop() : start())}
+      >
+        {awake ? "Stop" : "Wake on “Muse”"}
+      </button>
 
-      <div className="listen">
-        <div className="listen-state">
-          <span className="listen-phase" data-phase={activePhase}>
-            {statusLine}
-          </span>
-          {heard && awake && !woke ? (
-            <span className="log-when" title="What speech recognition heard">
-              “{heard.slice(-38)}”
-            </span>
-          ) : null}
-        </div>
+      <span className="muse-phase" data-phase={activePhase}>
+        {statusLine}
+      </span>
 
-        <div className="levels" data-idle={!awake} aria-hidden="true">
-          {Array.from({ length: bars }, (_, index) => {
-            const active = awake && index < lit;
-            const falloff = 1 - Math.abs(index - (bars - 1) / 2) / (bars / 2);
-            return (
-              <span
-                key={index}
-                data-lit={active && woke}
-                style={{
-                  height: active
-                    ? `${8 + level * 92 * (0.35 + falloff * 0.65)}%`
-                    : "3%",
-                }}
-              />
-            );
-          })}
-        </div>
+      <span className="mini-levels" data-idle={!awake} aria-hidden="true">
+        {Array.from({ length: 12 }, (_, index) => {
+          const active = awake && index < Math.round(level * 12);
+          return (
+            <span
+              key={index}
+              data-lit={active && woke}
+              style={{ height: active ? `${20 + level * 80}%` : "12%" }}
+            />
+          );
+        })}
+      </span>
 
-        <div className="listen-row">
-          <button
-            type="button"
-            className="control"
-            data-armed={awake}
-            disabled={disabled}
-            onClick={() => void (awake ? stop() : start())}
-          >
-            {awake ? "Stop" : "Wake on “Muse”"}
-          </button>
-          {awake && !supported ? (
-            <button
-              type="button"
-              className="control"
-              disabled={sending}
-              onClick={() => listenerRef.current?.arm()}
-            >
-              Talk
-            </button>
-          ) : null}
-        </div>
+      {awake && !supported ? (
+        <button
+          type="button"
+          className="controlish"
+          disabled={sending}
+          onClick={() => listenerRef.current?.arm()}
+        >
+          Talk
+        </button>
+      ) : null}
 
-        <p className="note">
-          {disabled
-            ? "Point this at the backend below before Muse can hear anything."
-            : !supported
-              ? "This browser has no speech recognition, so the wake word cannot be detected here. Press Talk to send one command, or use Chrome for hands-free."
-              : awake
-                ? "The microphone is open but nothing is sent until you say Muse, so music and conversation stay in the room. Try “Muse, play something calm”."
-                : "Muse keeps the microphone open and waits for its name. Nothing leaves this browser until it hears it."}
-        </p>
-        {error ? <p className="alert">{error}</p> : null}
-      </div>
-    </section>
+      {error ? <span className="alert">{error}</span> : null}
+    </div>
   );
 }

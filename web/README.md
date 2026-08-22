@@ -30,13 +30,13 @@ rate, so there is no client-side resampling; the backend resamples to 24 kHz.
 
 ## Design
 
-Dark by commitment, not by default: this sits on a shelf, often at night. The
-dithered panel is the signature of the whole device, so it leads the page rather
-than sitting in a corner, and the ground carries a halftone dot screen drawn
-from the same 1-bit world. IBM Plex Mono for anything instrument-like, Instrument
-Serif for the track and the transcripts — the one editorial note against the
-technical chrome. Every accent comes from the album'"'"'s own palette, so the surface
-shifts colour with the music the way the LEDs do.
+One scene: the cover is the interface. Transport keys and the progress needle
+live on the cover itself, the track title sits under it in Instrument Serif,
+and Muse is a single pill dock at the bottom. When nothing is playing, the
+box's own 1-bit dithered clock becomes the cover, which keeps the retro
+identity without a separate panel. The album palette drives the accent and the
+background wash; the ground carries a halftone dot screen from the same 1-bit
+world. Setup hides behind the gear until it is needed.
 
 ## What is where
 

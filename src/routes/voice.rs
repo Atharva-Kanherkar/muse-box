@@ -334,6 +334,42 @@ fn playback_error(error: PlaybackFetchError) -> AppError {
     }
 }
 
+/// Body of `POST /control`: one transport action from the on-screen player.
+#[derive(Debug, serde::Deserialize)]
+pub struct ControlRequest {
+    pub action: String,
+}
+
+/// Direct transport control for the on-screen player. Same dispatch path as a
+/// voice command, minus the model round trip and the voice log: pressing pause
+/// is not something anyone said.
+pub(crate) async fn post_control(
+    State(state): State<VoiceState>,
+    Json(body): Json<ControlRequest>,
+) -> Result<Json<RenderDoc>, AppError> {
+    let tool = match body.action.as_str() {
+        "play" => ToolCall::Play,
+        "pause" => ToolCall::Pause,
+        "next" => ToolCall::Next,
+        "previous" => ToolCall::Previous,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unknown control action: {other}"
+            )));
+        }
+    };
+    let _guard = state.guard.lock().await;
+    dispatch_tool(&state.spotify, &state.taste, &tool).await?;
+    let fresh = state
+        .spotify
+        .currently_playing()
+        .await
+        .map_err(playback_error)?;
+    state.hub.force_publish(fresh).await?;
+    let document = state.hub.current_document(RenderParams::default()).await?;
+    Ok(Json(document.as_ref().clone()))
+}
+
 /// `/voice` response: the render document plus, when Muse had something to say,
 /// its spoken reply. Flattened, so existing clients see an unchanged document
 /// with one extra optional field.
@@ -646,6 +682,57 @@ mod tests {
             .await
             .expect("body");
         serde_json::from_slice(&body).expect("json")
+    }
+
+    #[tokio::test]
+    async fn control_endpoint_drives_playback_without_the_model() {
+        let pause_calls = Arc::new(AtomicUsize::new(0));
+        let spotify = mock_spotify(pause_calls.clone(), false).await;
+        let app = routes::router(
+            spotify,
+            "device-token".to_string(),
+            Arc::new(StateHub::new()),
+            // The model must never be consulted for a button press.
+            Arc::new(FailingVoiceModel),
+            test_taste(),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/control")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer device-token")
+                    .body(Body::from(r#"{"action":"pause"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(pause_calls.load(Ordering::SeqCst), 1);
+        let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("body");
+        let document: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(document["state"], "paused");
+
+        // Unknown actions are refused, not guessed at.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/control")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer device-token")
+                    .body(Body::from(r#"{"action":"louder"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(pause_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

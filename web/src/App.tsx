@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
-import { DevicePreview } from "./components/DevicePreview";
-import { NowPlaying } from "./components/NowPlaying";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { VoiceControl } from "./components/VoiceControl";
+import { decodeArt, paintArt } from "./lib/art";
 import {
   runStateStream,
   stateUrl,
@@ -9,9 +8,11 @@ import {
 } from "./lib/stateStream";
 import {
   DEFAULT_RENDER_PARAMS,
+  formatDuration,
+  interpolatedProgressMs,
   type RenderDoc,
-  type RenderParams,
 } from "./lib/types";
+import { sendControl } from "./lib/voice";
 
 const STORAGE_KEY = "muse-box.connection";
 
@@ -23,8 +24,6 @@ interface Connection {
 function loadConnection(): Connection {
   const fallback: Connection = {
     baseUrl: import.meta.env.VITE_API_BASE_URL ?? "http://localhost:3000",
-    // Local convenience only: put it in .env.local (gitignored) so you are not
-    // pasting the device token on every hard reload.
     token: import.meta.env.VITE_DEVICE_TOKEN ?? "",
   };
   try {
@@ -45,29 +44,74 @@ function statusText(status: ConnectionStatus): string {
     case "idle":
       return "Not connected";
     case "connecting":
-      return "Connecting…";
+      return "Connecting";
     case "open":
       return "Live";
     case "retrying":
-      return `${status.reason} — retrying in ${Math.round(status.delayMs / 100) / 10}s`;
+      return "Reconnecting";
     case "failed":
       return status.reason;
   }
 }
 
+/** Stroke icons on a 24px grid; emoji never survive as UI. */
+function Icon({ shape }: { shape: "prev" | "next" | "play" | "pause" | "gear" }) {
+  const paths: Record<string, React.ReactNode> = {
+    prev: (
+      <>
+        <path d="M19 5v14L9 12z" fill="currentColor" stroke="none" />
+        <line x1="6" y1="5" x2="6" y2="19" />
+      </>
+    ),
+    next: (
+      <>
+        <path d="M5 5v14l10-7z" fill="currentColor" stroke="none" />
+        <line x1="18" y1="5" x2="18" y2="19" />
+      </>
+    ),
+    play: <path d="M7 4.5v15l13-7.5z" fill="currentColor" stroke="none" />,
+    pause: (
+      <>
+        <rect x="6" y="4.5" width="4" height="15" fill="currentColor" stroke="none" />
+        <rect x="14" y="4.5" width="4" height="15" fill="currentColor" stroke="none" />
+      </>
+    ),
+    gear: (
+      <>
+        <circle cx="12" cy="12" r="3" />
+        <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1" />
+      </>
+    ),
+  };
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="22"
+      height="22"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      aria-hidden="true"
+    >
+      {paths[shape]}
+    </svg>
+  );
+}
+
 export default function App() {
   const [connection, setConnection] = useState<Connection>(loadConnection);
   const [draft, setDraft] = useState<Connection>(connection);
-  const [params, setParams] = useState<RenderParams>(DEFAULT_RENDER_PARAMS);
   const [doc, setDoc] = useState<RenderDoc | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>({ kind: "idle" });
-  // Setup is scaffolding, not the product: once it works, get it out of the way.
   const [setupOpen, setSetupOpen] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [controlError, setControlError] = useState<string | null>(null);
+  const idleCanvasRef = useRef<HTMLCanvasElement>(null);
 
   const configured = connection.baseUrl.trim() !== "" && connection.token !== "";
 
-  // Re-subscribe whenever the connection or the requested frame size changes;
-  // the render parameters are part of the stream URL.
   useEffect(() => {
     if (!configured) {
       setStatus({ kind: "idle" });
@@ -75,12 +119,11 @@ export default function App() {
     }
     let url: string;
     try {
-      url = stateUrl(connection.baseUrl, params);
+      url = stateUrl(connection.baseUrl, DEFAULT_RENDER_PARAMS);
     } catch {
-      setStatus({ kind: "failed", reason: "Backend URL is not a valid URL" });
+      setStatus({ kind: "failed", reason: "Backend URL is not valid" });
       return;
     }
-
     const controller = new AbortController();
     void runStateStream({
       url,
@@ -90,22 +133,55 @@ export default function App() {
       signal: controller.signal,
     });
     return () => controller.abort();
-  }, [configured, connection.baseUrl, connection.token, params]);
+  }, [configured, connection.baseUrl, connection.token]);
 
-  // Let the album's own colors drive the page.
-  const palette = useMemo(
-    () => ({
-      background: doc?.palette[0] ?? "#1a1a1a",
-      accent: doc?.palette[1] ?? "#e0e0e0",
-    }),
-    [doc?.palette],
-  );
-
+  // The album's own palette drives the whole page.
   useEffect(() => {
     const root = document.documentElement;
-    root.style.setProperty("--album-bg", palette.background);
-    root.style.setProperty("--album-accent", palette.accent);
-  }, [palette]);
+    root.style.setProperty("--album-bg", doc?.palette[0] ?? "#1a1a1a");
+    root.style.setProperty("--album-accent", doc?.palette[1] ?? "#e0e0e0");
+  }, [doc?.palette]);
+
+  // Progress interpolates locally between documents.
+  useEffect(() => {
+    setProgress(interpolatedProgressMs(doc, Date.now()));
+    if (doc?.state !== "playing") return;
+    const timer = window.setInterval(
+      () => setProgress(interpolatedProgressMs(doc, Date.now())),
+      250,
+    );
+    return () => window.clearInterval(timer);
+  }, [doc]);
+
+  // With nothing playing there is no sleeve, but there is the dithered clock:
+  // the box's own idle face becomes the cover.
+  const idleArt = !doc?.art_url && doc?.art ? doc.art : null;
+  useEffect(() => {
+    const canvas = idleCanvasRef.current;
+    if (!canvas || !idleArt) return;
+    const decoded = decodeArt(idleArt);
+    if (!decoded) return;
+    paintArt(canvas, decoded, {
+      ink: doc?.palette[1] ?? "#e0e0e0",
+      background: doc?.palette[0] ?? "#1a1a1a",
+    });
+  }, [idleArt, doc?.palette]);
+
+  const control = useCallback(
+    (action: "play" | "pause" | "next" | "previous") => {
+      if (busy || !configured) return;
+      setBusy(true);
+      setControlError(null);
+      void sendControl(connection.baseUrl, connection.token, action)
+        .catch((cause: unknown) =>
+          setControlError(
+            cause instanceof Error ? cause.message : "Control failed",
+          ),
+        )
+        .finally(() => setBusy(false));
+    },
+    [busy, configured, connection.baseUrl, connection.token],
+  );
 
   function save(event: React.FormEvent) {
     event.preventDefault();
@@ -119,113 +195,152 @@ export default function App() {
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
     } catch {
-      // Private browsing: the session still works, it just will not persist.
+      // Private browsing: works, just does not persist.
     }
   }
 
-  const setupVisible = setupOpen || !configured;
+  const playing = doc?.state === "playing";
+  const percent =
+    doc && doc.duration_ms > 0
+      ? Math.min(100, (progress / doc.duration_ms) * 100)
+      : 0;
 
   return (
-    <div className="shell">
-      <header className="masthead">
-        <h1 className="wordmark">muse&#8209;box</h1>
-        <span className="masthead-rule" />
-        <span className="status-line">
+    <div className="scene">
+      <header className="rail">
+        <span className="wordmark">muse&#8209;box</span>
+        <span className="rail-status">
           <span className="beacon" data-kind={status.kind} />
           {statusText(status)}
         </span>
-        {configured ? (
-          <button
-            type="button"
-            className="link-button"
-            onClick={() => setSetupOpen((open) => !open)}
-          >
-            {setupOpen ? "Hide setup" : "Setup"}
-          </button>
-        ) : null}
+        <button
+          type="button"
+          className="ghost"
+          aria-label="Setup"
+          onClick={() => setSetupOpen(true)}
+        >
+          <Icon shape="gear" />
+        </button>
       </header>
 
-      <div className="stage">
-        <div className="column">
-          <DevicePreview doc={doc} params={params} onParamsChange={setParams} />
-        </div>
+      <main className="centerpiece">
+        <figure className="cover" data-playing={playing}>
+          {doc?.art_url ? (
+            <img className="cover-art" src={doc.art_url} alt="" />
+          ) : idleArt ? (
+            <canvas
+              ref={idleCanvasRef}
+              className="cover-art cover-art-bitmap"
+              aria-label="Idle clock"
+            />
+          ) : (
+            <div className="cover-art cover-empty">
+              {configured ? "quiet" : "connect"}
+            </div>
+          )}
 
-        <div className="column">
-          <NowPlaying doc={doc} />
-          <VoiceControl
-            baseUrl={connection.baseUrl}
-            token={connection.token}
-            disabled={!configured}
-          />
+          <figcaption className="veil">
+            <div className="transport">
+              <button
+                type="button"
+                className="key"
+                aria-label="Previous track"
+                disabled={!configured || busy}
+                onClick={() => control("previous")}
+              >
+                <Icon shape="prev" />
+              </button>
+              <button
+                type="button"
+                className="key key-main"
+                aria-label={playing ? "Pause" : "Play"}
+                disabled={!configured || busy}
+                onClick={() => control(playing ? "pause" : "play")}
+              >
+                <Icon shape={playing ? "pause" : "play"} />
+              </button>
+              <button
+                type="button"
+                className="key"
+                aria-label="Next track"
+                disabled={!configured || busy}
+                onClick={() => control("next")}
+              >
+                <Icon shape="next" />
+              </button>
+            </div>
+          </figcaption>
 
-          <section className="block">
-            <h2 className="block-head">Heard</h2>
-            {doc && doc.voice_log.length > 0 ? (
-              <ul className="log">
-                {doc.voice_log.map((entry) => (
-                  <li key={`${entry.timestamp}-${entry.action}`}>
-                    <span className="log-when">
-                      {new Date(entry.timestamp).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })}
-                    </span>
-                    <div>
-                      <p className="log-said">
-                        {entry.transcript.trim() || "(nothing intelligible)"}
-                      </p>
-                      <span className="log-did">{entry.action}</span>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="empty-note">Nothing said yet.</p>
-            )}
-          </section>
+          <div className="needle" aria-hidden="true">
+            <div className="needle-fill" style={{ width: `${percent}%` }} />
+          </div>
+        </figure>
 
-          {setupVisible ? (
-            <section className="block">
-              <h2 className="block-head">Backend</h2>
-              <form className="setup" onSubmit={save}>
-                <label className="field">
-                  Address
-                  <input
-                    type="url"
-                    placeholder="https://muse-box.up.railway.app"
-                    value={draft.baseUrl}
-                    onChange={(event) =>
-                      setDraft({ ...draft, baseUrl: event.target.value })
-                    }
-                  />
-                </label>
-                <label className="field">
-                  Device token
-                  <input
-                    type="password"
-                    placeholder="DEVICE_API_TOKEN"
-                    autoComplete="off"
-                    value={draft.token}
-                    onChange={(event) =>
-                      setDraft({ ...draft, token: event.target.value })
-                    }
-                  />
-                </label>
-                <button className="control" type="submit">
-                  Connect
-                </button>
-              </form>
-            </section>
+        <div className="titles">
+          <h1 className="title">{doc?.track ?? "Nothing playing"}</h1>
+          <p className="byline">
+            {doc?.artist ?? (configured ? "say “Muse” to begin" : "")}
+          </p>
+          {doc && doc.duration_ms > 0 ? (
+            <p className="times">
+              {formatDuration(progress)} · {formatDuration(doc.duration_ms)}
+            </p>
           ) : null}
         </div>
-      </div>
 
-      <p className="colophon">
-        render document v{doc?.version ?? 1}
-        {doc?.server_ts
-          ? ` · ${new Date(doc.server_ts).toLocaleTimeString()}`
-          : ""}
-      </p>
+        {controlError ? <p className="alert">{controlError}</p> : null}
+      </main>
+
+      <footer className="dock">
+        <VoiceControl
+          baseUrl={connection.baseUrl}
+          token={connection.token}
+          disabled={!configured}
+        />
+      </footer>
+
+      {setupOpen || !configured ? (
+        <div
+          className="veil-screen"
+          role="dialog"
+          aria-label="Backend setup"
+          onClick={(event) => {
+            if (event.target === event.currentTarget && configured) {
+              setSetupOpen(false);
+            }
+          }}
+        >
+          <form className="sheet" onSubmit={save}>
+            <h2 className="sheet-head">Backend</h2>
+            <label className="field">
+              Address
+              <input
+                type="url"
+                placeholder="https://muse-box.up.railway.app"
+                value={draft.baseUrl}
+                onChange={(event) =>
+                  setDraft({ ...draft, baseUrl: event.target.value })
+                }
+              />
+            </label>
+            <label className="field">
+              Device token
+              <input
+                type="password"
+                placeholder="DEVICE_API_TOKEN"
+                autoComplete="off"
+                value={draft.token}
+                onChange={(event) =>
+                  setDraft({ ...draft, token: event.target.value })
+                }
+              />
+            </label>
+            <button className="controlish" type="submit">
+              Connect
+            </button>
+          </form>
+        </div>
+      ) : null}
     </div>
   );
 }

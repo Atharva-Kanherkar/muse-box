@@ -364,3 +364,30 @@ export async function sendVoiceCommand(
   }
   return (await response.json()) as RenderDoc & { speech?: Speech };
 }
+
+/** One transport action from the on-screen player. The updated document
+ * arrives over the stream, so the response body is only read for errors. */
+export async function sendControl(
+  baseUrl: string,
+  token: string,
+  action: "play" | "pause" | "next" | "previous",
+): Promise<void> {
+  const response = await fetch(new URL("/control", baseUrl), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ action }),
+  });
+  if (!response.ok) {
+    let message = `Control failed (${response.status})`;
+    try {
+      const body = (await response.json()) as ApiError;
+      if (body.error) message = body.error;
+    } catch {
+      // Keep the status-based message.
+    }
+    throw new Error(message);
+  }
+}
