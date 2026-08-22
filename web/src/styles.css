@@ -55,6 +55,20 @@ body {
   isolation: isolate;
 }
 
+/* A gentle vignette so the light pools in the middle of the room. */
+.scene::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(
+    120% 95% at 50% 42%,
+    transparent 52%,
+    rgb(0 0 0 / 0.5)
+  );
+}
+
 .scene::after {
   content: "";
   position: fixed;
@@ -104,6 +118,99 @@ body {
   animation: breathe-beat var(--beat) ease-in-out infinite;
 }
 
+/* A soft halo directly behind the cover, landing on every beat. */
+.ambient-halo {
+  background: radial-gradient(
+    36% 32% at 50% 46%,
+    color-mix(in oklab, var(--album-accent) calc(10% + var(--energy) * 16%), transparent),
+    transparent 72%
+  );
+  animation: halo-beat var(--beat) ease-out infinite;
+}
+
+@keyframes halo-beat {
+  0%,
+  100% {
+    opacity: calc(0.5 + var(--energy) * 0.25);
+    scale: 1;
+  }
+  35% {
+    opacity: 1;
+    scale: calc(1 + var(--energy) * 0.05);
+  }
+}
+
+/* Two lamps behind frosted glass, wandering on their own long paths.
+   Their light is the album's; orb-b leans back toward the dominant tone. */
+.ambient-orb {
+  inset: auto;
+  width: 58vmax;
+  height: 58vmax;
+  border-radius: 50%;
+}
+
+.ambient-orb-a {
+  top: -14%;
+  left: -16%;
+  background: radial-gradient(
+    closest-side,
+    color-mix(in oklab, var(--album-accent) calc(8% + var(--energy) * 12%), transparent),
+    transparent 72%
+  );
+  animation:
+    drift-a calc(var(--beat) * 48) ease-in-out infinite alternate,
+    orb-beat calc(var(--beat) * 2) ease-in-out infinite;
+}
+
+.ambient-orb-b {
+  bottom: -18%;
+  right: -16%;
+  background: radial-gradient(
+    closest-side,
+    color-mix(
+        in oklab,
+        color-mix(in oklab, var(--album-accent) 45%, var(--album-bg))
+          calc(12% + var(--energy) * 14%),
+        transparent
+      ),
+    transparent 70%
+  );
+  animation:
+    drift-b calc(var(--beat) * 56) ease-in-out infinite alternate,
+    orb-beat calc(var(--beat) * 4) ease-in-out infinite;
+}
+
+@keyframes drift-a {
+  from {
+    translate: 0 0;
+  }
+  to {
+    translate: 12vw 7vh;
+  }
+}
+
+@keyframes drift-b {
+  from {
+    translate: 0 0;
+  }
+  to {
+    translate: -10vw -8vh;
+  }
+}
+
+/* The orbs swell a hair on the beat: felt, not seen. */
+@keyframes orb-beat {
+  0%,
+  100% {
+    scale: 1;
+    opacity: 0.8;
+  }
+  45% {
+    scale: calc(1 + var(--energy) * 0.05);
+    opacity: 1;
+  }
+}
+
 /* A long diagonal sheen that crosses every few bars. */
 .ambient-beam {
   background: linear-gradient(
@@ -115,11 +222,21 @@ body {
   animation: sweep calc(var(--beat) * 16) linear infinite;
 }
 
-/* Idle or paused: hold the light steady instead of pulsing at nothing. */
+/* Idle or paused: hold the light steady instead of pulsing at nothing.
+   The orbs keep wandering — a quiet room still has lamps — but stop beating. */
 .ambient[data-live="false"] .ambient-glow,
-.ambient[data-live="false"] .ambient-beam {
+.ambient[data-live="false"] .ambient-beam,
+.ambient[data-live="false"] .ambient-halo {
   animation-play-state: paused;
   opacity: 0.55;
+}
+
+.ambient[data-live="false"] .ambient-orb-a {
+  animation: drift-a calc(var(--beat) * 48) ease-in-out infinite alternate;
+}
+
+.ambient[data-live="false"] .ambient-orb-b {
+  animation: drift-b calc(var(--beat) * 56) ease-in-out infinite alternate;
 }
 
 @keyframes breathe-beat {
@@ -376,6 +493,24 @@ body {
   background: color-mix(in oklab, var(--album-accent) 22%, rgb(0 0 0 / 0.5));
 }
 
+/* While the record spins, the play key keeps time too. */
+.cover[data-playing="true"] .key-main {
+  animation: key-beat var(--beat) ease-in-out infinite;
+}
+
+@keyframes key-beat {
+  50% {
+    box-shadow: 0 0 16px
+      color-mix(in oklab, var(--album-accent) calc(25% + var(--energy) * 30%), transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cover[data-playing="true"] .key-main {
+    animation: none;
+  }
+}
+
 .key:disabled {
   opacity: 0.35;
   cursor: not-allowed;
@@ -403,6 +538,7 @@ input:focus-visible {
 .needle-fill {
   height: 100%;
   background: var(--album-accent);
+  box-shadow: 0 0 10px color-mix(in oklab, var(--album-accent) 65%, transparent);
 }
 
 /* ---------- titles ---------- */
@@ -511,8 +647,19 @@ input:focus-visible {
   text-shadow:
     0 0 10px color-mix(in oklab, var(--album-accent) 55%, transparent),
     0 0 42px color-mix(in oklab, var(--album-accent) 30%, transparent);
-  animation: line-in 480ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  animation:
+    line-in 480ms cubic-bezier(0.2, 0.7, 0.2, 1) both,
+    glow-beat calc(var(--beat) * 2) ease-in-out infinite;
   min-height: 2.3em;
+}
+
+/* The phosphor blooms a little wider every other beat. */
+@keyframes glow-beat {
+  50% {
+    text-shadow:
+      0 0 13px color-mix(in oklab, var(--album-accent) 70%, transparent),
+      0 0 56px color-mix(in oklab, var(--album-accent) 42%, transparent);
+  }
 }
 
 .karaoke-rest {

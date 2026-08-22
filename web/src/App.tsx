@@ -223,8 +223,11 @@ export default function App() {
     <div className="scene" style={sceneStyle}>
       <div className="ambient" data-live={playing} aria-hidden="true">
         <span className="ambient-wash" />
+        <span className="ambient-halo" />
         <span className="ambient-glow" />
         <span className="ambient-beam" />
+        <span className="ambient-orb ambient-orb-a" />
+        <span className="ambient-orb ambient-orb-b" />
       </div>
 
       <header className="rail">
