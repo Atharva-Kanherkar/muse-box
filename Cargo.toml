@@ -9,7 +9,16 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+# default-features off on purpose: reqwest's defaults pull in native-tls, and
+# therefore OpenSSL, even when rustls is requested. The project uses rustls, so
+# OpenSSL was dead weight that only surfaced when building on a distro without
+# it. charset and http2 are re-added because they are defaults worth keeping.
+reqwest = { version = "0.12", default-features = false, features = [
+    "charset",
+    "http2",
+    "json",
+    "rustls-tls",
+] }
 tower = "0.5"
 tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
