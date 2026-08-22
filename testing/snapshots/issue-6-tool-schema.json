@@ -1,104 +1,110 @@
 [
   {
-    "type": "function",
-    "name": "play",
     "description": "Resume the current Spotify playback.",
+    "name": "play",
     "parameters": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {},
-      "additionalProperties": false
-    }
+      "type": "object"
+    },
+    "type": "function"
   },
   {
-    "type": "function",
-    "name": "pause",
     "description": "Pause the current Spotify playback.",
+    "name": "pause",
     "parameters": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {},
-      "additionalProperties": false
-    }
+      "type": "object"
+    },
+    "type": "function"
   },
   {
-    "type": "function",
-    "name": "next",
     "description": "Skip to the next Spotify track.",
+    "name": "next",
     "parameters": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {},
-      "additionalProperties": false
-    }
+      "type": "object"
+    },
+    "type": "function"
   },
   {
-    "type": "function",
-    "name": "previous",
     "description": "Return to the previous Spotify track.",
+    "name": "previous",
     "parameters": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {},
-      "additionalProperties": false
-    }
+      "type": "object"
+    },
+    "type": "function"
   },
   {
-    "type": "function",
+    "description": "Search Spotify and start playing the best match right now, replacing whatever is playing. This is the default for any request to hear something, including corrections such as wanting a different version of the current track.",
     "name": "search_and_play",
-    "description": "Search Spotify and immediately play the best matching track.",
     "parameters": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {
         "query": {
-          "type": "string",
           "description": "Spotify search query including useful track and artist details.",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         }
       },
-      "required": ["query"],
-      "additionalProperties": false
-    }
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "type": "function"
   },
   {
-    "type": "function",
+    "description": "Search Spotify and add the best match to the end of the queue, without interrupting the current track. Only for requests that explicitly ask to queue something or play it later or next.",
     "name": "queue_search",
-    "description": "Search Spotify and add the best matching track to the queue.",
     "parameters": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {
         "query": {
-          "type": "string",
           "description": "Spotify search query including useful track and artist details.",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         }
       },
-      "required": ["query"],
-      "additionalProperties": false
-    }
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "type": "function"
   },
   {
-    "type": "function",
-    "name": "set_volume",
     "description": "Set Spotify playback volume to an exact percentage.",
+    "name": "set_volume",
     "parameters": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {
         "percent": {
-          "type": "integer",
           "description": "Volume percentage from 0 through 100.",
+          "maximum": 100,
           "minimum": 0,
-          "maximum": 100
+          "type": "integer"
         }
       },
-      "required": ["percent"],
-      "additionalProperties": false
-    }
+      "required": [
+        "percent"
+      ],
+      "type": "object"
+    },
+    "type": "function"
   },
   {
-    "type": "function",
-    "name": "now_playing",
     "description": "Report the current Spotify track, artist, and playback state.",
+    "name": "now_playing",
     "parameters": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {},
-      "additionalProperties": false
-    }
+      "type": "object"
+    },
+    "type": "function"
   }
 ]

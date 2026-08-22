@@ -484,23 +484,15 @@ impl SpotifyClient {
     }
 
     pub async fn play_track(&self, track_id: &str) -> Result<(), AppError> {
-        let access_token = self.access_token().await?;
-        let url = format!(
-            "{}/me/player/play",
-            self.endpoints.api_base_url.trim_end_matches('/')
-        );
-        self.http
-            .put(url)
-            .bearer_auth(access_token)
-            .json(&serde_json::json!({
+        self.send_player_command(
+            reqwest::Method::PUT,
+            "me/player/play",
+            &[],
+            Some(serde_json::json!({
                 "uris": [format!("spotify:track:{track_id}")]
-            }))
-            .send()
-            .await
-            .map_err(spotify_api_error)?
-            .error_for_status()
-            .map_err(spotify_api_error)?;
-        Ok(())
+            })),
+        )
+        .await
     }
 
     pub async fn queue_track(&self, track_id: &str) -> Result<(), AppError> {
@@ -518,8 +510,20 @@ impl SpotifyClient {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<(), AppError> {
+        self.send_player_command(method, path, query, None).await
+    }
+
+    /// Every mutating player call goes through here so they all share the
+    /// no-active-device retry below.
+    async fn send_player_command(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<serde_json::Value>,
+    ) -> Result<(), AppError> {
         let response = self
-            .player_request(method.clone(), path, query, None)
+            .player_request(method.clone(), path, query, None, body.as_ref())
             .await?;
         if response.status() != reqwest::StatusCode::NOT_FOUND {
             return player_response_error(response);
@@ -535,7 +539,7 @@ impl SpotifyClient {
             ));
         };
         let response = self
-            .player_request(method, path, query, Some(&device_id))
+            .player_request(method, path, query, Some(&device_id), body.as_ref())
             .await?;
         player_response_error(response)
     }
@@ -546,6 +550,7 @@ impl SpotifyClient {
         path: &str,
         query: &[(&str, String)],
         device_id: Option<&str>,
+        body: Option<&serde_json::Value>,
     ) -> Result<reqwest::Response, AppError> {
         let access_token = self.access_token().await?;
         let url = format!(
@@ -557,14 +562,17 @@ impl SpotifyClient {
             .http
             .request(method, url)
             .bearer_auth(access_token)
-            .query(query)
-            // Spotify answers 411 Length Required for a body-less PUT/POST.
-            // reqwest omits Content-Length when there is no body, and an empty
-            // Vec body is not enough either, so set the header outright.
-            .header(reqwest::header::CONTENT_LENGTH, "0");
+            .query(query);
         if let Some(device_id) = device_id {
             request = request.query(&[("device_id", device_id)]);
         }
+        request = match body {
+            Some(body) => request.json(body),
+            // Spotify answers 411 Length Required for a body-less PUT/POST.
+            // reqwest omits Content-Length when there is no body, and an empty
+            // Vec body is not enough either, so set the header outright.
+            None => request.header(reqwest::header::CONTENT_LENGTH, "0"),
+        };
         request.send().await.map_err(spotify_api_error)
     }
 

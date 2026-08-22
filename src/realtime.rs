@@ -475,11 +475,16 @@ pub fn spotify_tool_schema() -> Value {
         simple("previous", "Return to the previous Spotify track."),
         search(
             "search_and_play",
-            "Search Spotify and immediately play the best matching track."
+            "Search Spotify and start playing the best match right now, replacing \
+             whatever is playing. This is the default for any request to hear \
+             something, including corrections such as wanting a different version \
+             of the current track."
         ),
         search(
             "queue_search",
-            "Search Spotify and add the best matching track to the queue."
+            "Search Spotify and add the best match to the end of the queue, \
+             without interrupting the current track. Only for requests that \
+             explicitly ask to queue something or play it later or next."
         ),
         json!({
             "type": "function",
@@ -628,6 +633,10 @@ mod tests {
     }
 
     #[test]
+    /// Changing a tool name, description or parameter changes what the model is
+    /// told it can do, so the schema is pinned. To update deliberately, print
+    /// `serde_json::to_string_pretty(&spotify_tool_schema())` into the snapshot
+    /// file and say why in the commit.
     fn tool_schema_matches_committed_snapshot() {
         let expected: Value = serde_json::from_str(include_str!(
             "../testing/snapshots/issue-6-tool-schema.json"
