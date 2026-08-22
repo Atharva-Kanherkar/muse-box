@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  MIN_UTTERANCE_SECONDS,
   VoiceListener,
   playSpeech,
   sendVoiceCommand,
   type ListenerPhase,
   type Utterance,
 } from "../lib/voice";
+import { WakeWordListener, wakeWordSupported } from "../lib/wake";
 
 interface Props {
   baseUrl: string;
@@ -15,9 +15,13 @@ interface Props {
 }
 
 /**
- * Always-on listening. One click grants microphone access — browsers will not
- * open a microphone without a gesture — and after that Muse listens
- * continuously and decides for itself what was meant for it.
+ * Muse sleeps until it hears its name.
+ *
+ * The microphone stays open, but nothing leaves the browser until the wake word
+ * fires — otherwise music in the room reads as speech and every song becomes a
+ * command. Where the browser has no speech recognition there is an explicit
+ * talk button instead, which is honest about the limitation rather than
+ * silently streaming the room.
  */
 export function VoiceControl({ baseUrl, token, disabled }: Props) {
   const [phase, setPhase] = useState<ListenerPhase>("stopped");
@@ -25,38 +29,40 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
   const [sending, setSending] = useState(false);
   const [replying, setReplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [lastHeard, setLastHeard] = useState<string | null>(null);
+  const [heard, setHeard] = useState<string | null>(null);
+  const [woke, setWoke] = useState(false);
 
   const listenerRef = useRef<VoiceListener | null>(null);
-  // Read inside the utterance handler, which is created once per listener.
+  const wakeRef = useRef<WakeWordListener | null>(null);
   const connectionRef = useRef({ baseUrl, token });
   const inFlightRef = useRef(false);
+  const supported = wakeWordSupported();
 
   useEffect(() => {
     connectionRef.current = { baseUrl, token };
   }, [baseUrl, token]);
 
   const handleUtterance = useCallback((utterance: Utterance) => {
-    // The backend serialises voice commands anyway; dropping overlaps here
-    // keeps a burst of speech from queueing up behind a slow model round trip.
     if (inFlightRef.current) return;
     inFlightRef.current = true;
+    setWoke(false);
     setSending(true);
-    setLastHeard(`${utterance.durationSeconds.toFixed(1)}s of speech`);
     const { baseUrl: url, token: key } = connectionRef.current;
     void sendVoiceCommand(url, key, utterance)
       .then(async (result) => {
         setError(null);
         if (!result.speech) return;
-        // Deafen the listener first, or Muse's own voice becomes the next
-        // utterance and it answers itself.
+        // Deafen both listeners first, or Muse's own voice trips the wake word
+        // and it answers itself.
         listenerRef.current?.setMuted(true);
+        wakeRef.current?.setMuted(true);
         setReplying(true);
         try {
           await playSpeech(result.speech);
         } finally {
           setReplying(false);
           listenerRef.current?.setMuted(false);
+          wakeRef.current?.setMuted(false);
         }
       })
       .catch((cause: unknown) =>
@@ -68,7 +74,7 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
       });
   }, []);
 
-  const startListening = useCallback(async () => {
+  const start = useCallback(async () => {
     if (listenerRef.current || disabled) return;
     setError(null);
     const listener = new VoiceListener({
@@ -79,7 +85,6 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
     });
     try {
       await listener.start();
-      listenerRef.current = listener;
     } catch (cause) {
       const message =
         cause instanceof Error ? cause.message : "Microphone unavailable";
@@ -88,36 +93,67 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
           ? "Microphone permission denied. Allow it to let Muse listen."
           : message,
       );
+      return;
     }
-  }, [disabled, handleUtterance]);
+    listenerRef.current = listener;
 
-  const stopListening = useCallback(async () => {
+    if (supported) {
+      const wake = new WakeWordListener({
+        onWake: () => {
+          setWoke(true);
+          listenerRef.current?.arm();
+        },
+        onHeard: setHeard,
+        onError: setError,
+      });
+      wake.start();
+      wakeRef.current = wake;
+    }
+  }, [disabled, handleUtterance, supported]);
+
+  const stop = useCallback(async () => {
+    wakeRef.current?.stop();
+    wakeRef.current = null;
     const listener = listenerRef.current;
     listenerRef.current = null;
     await listener?.stop();
+    setWoke(false);
+    setHeard(null);
   }, []);
 
   useEffect(() => {
     return () => {
+      wakeRef.current?.stop();
       void listenerRef.current?.stop();
+      wakeRef.current = null;
       listenerRef.current = null;
     };
   }, []);
 
-  const listening = phase !== "stopped";
-  const statusLine = replying
-    ? "Muse is speaking…"
+  const awake = phase !== "stopped";
+  const activePhase = replying
+    ? "replying"
     : sending
-      ? "Thinking…"
+      ? "thinking"
       : phase === "speaking"
-        ? "Hearing you…"
-        : listening
-          ? "Listening"
-          : "Not listening";
+        ? "speaking"
+        : awake
+          ? "listening"
+          : "stopped";
+  const statusLine = replying
+    ? "Muse is speaking"
+    : sending
+      ? "Thinking"
+      : phase === "speaking"
+        ? "Listening to you"
+        : awake
+          ? supported
+            ? "Asleep — say “Muse”"
+            : "Ready"
+          : "Off";
 
   const bars = 24;
   const lit = Math.round(level * bars);
-  const activePhase = replying ? "replying" : sending ? "thinking" : phase;
 
   return (
     <section className="block">
@@ -128,21 +164,21 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
           <span className="listen-phase" data-phase={activePhase}>
             {statusLine}
           </span>
-          {lastHeard && listening ? (
-            <span className="log-when">{lastHeard}</span>
+          {heard && awake && !woke ? (
+            <span className="log-when" title="What speech recognition heard">
+              “{heard.slice(-38)}”
+            </span>
           ) : null}
         </div>
 
-        <div className="levels" data-idle={!listening} aria-hidden="true">
+        <div className="levels" data-idle={!awake} aria-hidden="true">
           {Array.from({ length: bars }, (_, index) => {
-            const active = listening && index < lit;
-            // Bars fall away from the centre, so speech reads as a waveform
-            // rather than a progress bar filling left to right.
+            const active = awake && index < lit;
             const falloff = 1 - Math.abs(index - (bars - 1) / 2) / (bars / 2);
             return (
               <span
                 key={index}
-                data-lit={active}
+                data-lit={active && woke}
                 style={{
                   height: active
                     ? `${8 + level * 92 * (0.35 + falloff * 0.65)}%`
@@ -153,22 +189,36 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
           })}
         </div>
 
-        <button
-          type="button"
-          className="control"
-          data-armed={listening}
-          disabled={disabled}
-          onClick={() => void (listening ? stopListening() : startListening())}
-        >
-          {listening ? "Stop listening" : "Start listening"}
-        </button>
+        <div className="listen-row">
+          <button
+            type="button"
+            className="control"
+            data-armed={awake}
+            disabled={disabled}
+            onClick={() => void (awake ? stop() : start())}
+          >
+            {awake ? "Stop" : "Wake on “Muse”"}
+          </button>
+          {awake && !supported ? (
+            <button
+              type="button"
+              className="control"
+              disabled={sending}
+              onClick={() => listenerRef.current?.arm()}
+            >
+              Talk
+            </button>
+          ) : null}
+        </div>
 
         <p className="note">
           {disabled
             ? "Point this at the backend below before Muse can hear anything."
-            : listening
-              ? `Talk normally. “Muse, play something calm” pulls from your own playlists and history, not a blind search. Clips under ${MIN_UTTERANCE_SECONDS}s are ignored, and anything not meant for Muse changes nothing.`
-              : "One click grants the microphone. After that it stays on — no button to hold."}
+            : !supported
+              ? "This browser has no speech recognition, so the wake word cannot be detected here. Press Talk to send one command, or use Chrome for hands-free."
+              : awake
+                ? "The microphone is open but nothing is sent until you say Muse, so music and conversation stay in the room. Try “Muse, play something calm”."
+                : "Muse keeps the microphone open and waits for its name. Nothing leaves this browser until it hears it."}
         </p>
         {error ? <p className="alert">{error}</p> : null}
       </div>

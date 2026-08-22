@@ -149,7 +149,22 @@ async fn run_voice_command(
         .model
         .command(&audio.samples, audio.rate, context)
         .await?;
-    let action = dispatch_tool(&state.spotify, &state.taste, &intent.tool).await?;
+
+    // Hard gate, not a prompt instruction: audio only reaches here because
+    // something in the room tripped the wake word, and a false trigger must not
+    // be able to change what is playing. Anything that does not name Muse is
+    // downgraded to the tool that mutates nothing.
+    let tool = if addressed_to_muse(&intent.transcript) {
+        intent.tool.clone()
+    } else {
+        tracing::info!(
+            transcript = %intent.transcript,
+            requested = ?intent.tool,
+            "utterance did not address Muse; ignoring the request"
+        );
+        ToolCall::NowPlaying
+    };
+    let action = dispatch_tool(&state.spotify, &state.taste, &tool).await?;
     state
         .hub
         .append_voice_log(VoiceLogEntry {
@@ -167,6 +182,19 @@ async fn run_voice_command(
     let document = state.hub.current_document(RenderParams::default()).await?;
     let situation = describe(&action, &document);
     Ok((document.as_ref().clone(), situation))
+}
+
+/// Whether an utterance was actually aimed at Muse.
+///
+/// Speech-to-text mangles a short name, so the common mishearings count too. An
+/// empty transcript never counts: silence and music both produce one, and either
+/// would otherwise be free rein to act.
+fn addressed_to_muse(transcript: &str) -> bool {
+    const NAMES: [&str; 5] = ["muse", "mews", "muze", "moose", "mus"];
+    let lowered = transcript.to_lowercase();
+    lowered
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| NAMES.contains(&word))
 }
 
 /// One line of ground truth for Muse to speak from, so the reply matches what
@@ -553,7 +581,7 @@ mod tests {
                 self.release.notified().await;
                 match self.result {
                     ModelResult::Pause => Ok(VoiceIntent {
-                        transcript: "pause".to_string(),
+                        transcript: "muse, pause".to_string(),
                         tool: ToolCall::Pause,
                     }),
                     ModelResult::Fail => Err(AppError::Voice("model timeout".to_string())),
@@ -575,7 +603,7 @@ mod tests {
         ) -> VoiceFuture<'a> {
             Box::pin(async {
                 Ok(VoiceIntent {
-                    transcript: "pause".to_string(),
+                    transcript: "muse, pause".to_string(),
                     tool: ToolCall::Pause,
                 })
             })
@@ -618,6 +646,90 @@ mod tests {
             .await
             .expect("body");
         serde_json::from_slice(&body).expect("json")
+    }
+
+    #[tokio::test]
+    async fn unaddressed_speech_cannot_mutate_playback() {
+        // The model heard music or bystander talk and, wrongly, chose a mutating
+        // tool. The handler must ignore the tool because nobody said "Muse".
+        struct BystanderModel;
+        impl VoiceModel for BystanderModel {
+            fn command<'a>(
+                &'a self,
+                _samples: &'a [i16],
+                _rate: u32,
+                _context: PlaybackContext,
+            ) -> VoiceFuture<'a> {
+                Box::pin(async {
+                    Ok(VoiceIntent {
+                        transcript: "thunder you were only a child".to_string(),
+                        tool: ToolCall::Pause,
+                    })
+                })
+            }
+        }
+
+        let pause_calls = Arc::new(AtomicUsize::new(0));
+        let spotify = mock_spotify(pause_calls.clone(), false).await;
+        let app = routes::router(
+            spotify,
+            "device-token".to_string(),
+            Arc::new(StateHub::new()),
+            Arc::new(BystanderModel),
+            test_taste(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/voice?rate=16000&bits=16&ch=1")
+                    .header(header::CONTENT_TYPE, "audio/pcm")
+                    .header(header::AUTHORIZATION, "Bearer device-token")
+                    .body(Body::from(vec![120, 0, 136, 255]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            pause_calls.load(Ordering::SeqCst),
+            0,
+            "song lyrics must never pause the music"
+        );
+        let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("body");
+        let document: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(document["voice_log"][0]["action"], "query:now_playing");
+    }
+
+    #[test]
+    fn only_utterances_naming_muse_may_act() {
+        for said in [
+            "hey muse play something calm",
+            "Muse, pause",
+            "ok mews next track",
+            "MOOSE turn it down",
+        ] {
+            assert!(addressed_to_muse(said), "should wake: {said}");
+        }
+
+        for ignored in [
+            "",
+            "   ",
+            // Music and background talk are the whole reason this gate exists.
+            "thunder you were only a child",
+            "can you pass me the remote",
+            // A substring must not count, or "amusement" wakes it.
+            "the amusement park was closed",
+            "museum opens at ten",
+        ] {
+            assert!(
+                !addressed_to_muse(ignored),
+                "should stay asleep: {ignored:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1015,7 +1127,7 @@ mod tests {
         assert_eq!(pause_calls.load(Ordering::SeqCst), 1);
         assert_eq!(returned["state"], "paused");
         assert_eq!(returned, published);
-        assert_eq!(returned["voice_log"][0]["transcript"], "pause");
+        assert_eq!(returned["voice_log"][0]["transcript"], "muse, pause");
         assert_eq!(returned["voice_log"][0]["action"], "spotify:pause");
     }
 

@@ -25,12 +25,18 @@ export const MIN_UTTERANCE_SECONDS = 0.45;
 
 /** Silence needed to call an utterance finished. */
 const TRAILING_SILENCE_SECONDS = 0.8;
-/** Consecutive loud frames needed to open an utterance, to reject clicks. */
-const ONSET_FRAMES = 3;
 /** Speech has to exceed the running noise floor by this factor. */
 const SPEECH_OVER_NOISE = 2.5;
 /** Absolute floor, so a silent room cannot trigger on its own hiss. */
 const MIN_SPEECH_RMS = 0.012;
+/**
+ * Audio kept before the wake word fires. Recognition reports the name a beat
+ * after it was said, and people say "Muse, play something calm" in one breath,
+ * so the command is already spoken by then. Without this pre-roll it is lost.
+ */
+const PREROLL_SECONDS = 3;
+/** Give up if a wake was not followed by speech: a false trigger, so no send. */
+const ARMED_PATIENCE_SECONDS = 2.5;
 
 const WORKLET_SOURCE = `
 class PcmCollector extends AudioWorkletProcessor {
@@ -112,11 +118,17 @@ export class VoiceListener {
   private speech: Float32Array[] = [];
   private speechSamples = 0;
   private silenceSamples = 0;
-  private loudFrames = 0;
   private noiseFloor = MIN_SPEECH_RMS;
-  private speaking = false;
   private running = false;
   private muted = false;
+
+  /** Rolling window of recent audio, kept whether or not anything is armed. */
+  private preroll: Float32Array[] = [];
+  private prerollSamples = 0;
+  /** Only true between a wake word and the end of the command that follows. */
+  private armed = false;
+  private armedSamples = 0;
+  private heardSpeech = false;
 
   constructor(private readonly callbacks: ListenerCallbacks) {}
 
@@ -159,14 +171,31 @@ export class VoiceListener {
   /** Ignore input without tearing the graph down, so Muse cannot hear itself. */
   setMuted(muted: boolean): void {
     this.muted = muted;
-    if (muted && this.speaking) {
-      this.speaking = false;
-      this.speech = [];
-      this.speechSamples = 0;
-      this.silenceSamples = 0;
-      this.loudFrames = 0;
-      this.callbacks.onPhase("listening");
-    }
+    if (muted) this.disarm();
+  }
+
+  /**
+   * Start capturing a command. Called when the wake word fires; the pre-roll is
+   * folded in so the words spoken alongside the name are not lost.
+   */
+  arm(): void {
+    if (!this.running || this.muted || this.armed) return;
+    this.armed = true;
+    this.armedSamples = 0;
+    this.heardSpeech = false;
+    this.speech = [...this.preroll];
+    this.speechSamples = this.prerollSamples;
+    this.silenceSamples = 0;
+    this.callbacks.onPhase("speaking");
+  }
+
+  private disarm(): void {
+    if (!this.armed) return;
+    this.armed = false;
+    this.speech = [];
+    this.speechSamples = 0;
+    this.silenceSamples = 0;
+    this.callbacks.onPhase("listening");
   }
 
   private consume(frame: Float32Array, sampleRate: number): void {
@@ -177,26 +206,44 @@ export class VoiceListener {
     const threshold = Math.max(this.noiseFloor * SPEECH_OVER_NOISE, MIN_SPEECH_RMS);
     const loud = level > threshold;
 
-    if (!this.speaking) {
-      // Track the room's noise floor only while nobody is talking.
+    // Always keep the rolling window, so a wake word can look backwards.
+    this.preroll.push(frame);
+    this.prerollSamples += frame.length;
+    while (this.prerollSamples > PREROLL_SECONDS * sampleRate) {
+      const dropped = this.preroll.shift();
+      if (!dropped) break;
+      this.prerollSamples -= dropped.length;
+    }
+
+    if (!this.armed) {
+      // Nothing is being captured, so this is the room: music, conversation,
+      // silence. Learn the noise floor from it and send nothing.
       this.noiseFloor = this.noiseFloor * 0.95 + level * 0.05;
-      this.loudFrames = loud ? this.loudFrames + 1 : 0;
-      if (this.loudFrames >= ONSET_FRAMES) {
-        this.speaking = true;
-        this.speech = [];
-        this.speechSamples = 0;
-        this.silenceSamples = 0;
-        this.callbacks.onPhase("speaking");
-      } else {
-        return;
-      }
+      return;
     }
 
     this.speech.push(frame);
     this.speechSamples += frame.length;
-    this.silenceSamples = loud ? 0 : this.silenceSamples + frame.length;
+    this.armedSamples += frame.length;
+    if (loud) {
+      this.heardSpeech = true;
+      this.silenceSamples = 0;
+    } else {
+      this.silenceSamples += frame.length;
+    }
 
-    const trailing = this.silenceSamples / sampleRate >= TRAILING_SILENCE_SECONDS;
+    // A wake word with nothing after it was a mishearing; drop it unsent.
+    if (
+      !this.heardSpeech &&
+      this.armedSamples / sampleRate >= ARMED_PATIENCE_SECONDS
+    ) {
+      this.disarm();
+      return;
+    }
+
+    const trailing =
+      this.heardSpeech &&
+      this.silenceSamples / sampleRate >= TRAILING_SILENCE_SECONDS;
     const tooLong = this.speechSamples / sampleRate >= MAX_UTTERANCE_SECONDS;
     if (trailing || tooLong) this.finishUtterance(sampleRate);
   }
@@ -204,8 +251,7 @@ export class VoiceListener {
   private finishUtterance(sampleRate: number): void {
     const chunks = this.speech;
     const samples = this.speechSamples;
-    this.speaking = false;
-    this.loudFrames = 0;
+    this.armed = false;
     this.speech = [];
     this.speechSamples = 0;
     this.silenceSamples = 0;
@@ -225,7 +271,7 @@ export class VoiceListener {
   async stop(): Promise<void> {
     if (!this.running) return;
     this.running = false;
-    this.speaking = false;
+    this.armed = false;
     if (this.node) {
       this.node.port.onmessage = null;
       this.node.disconnect();
@@ -236,6 +282,8 @@ export class VoiceListener {
       await this.context.close();
     }
     this.speech = [];
+    this.preroll = [];
+    this.prerollSamples = 0;
     this.node = null;
     this.source = null;
     this.stream = null;
