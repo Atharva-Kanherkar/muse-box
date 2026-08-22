@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Lyrics } from "./components/Lyrics";
+import { Mascot } from "./components/Mascot";
 import { VoiceControl } from "./components/VoiceControl";
 import { decodeArt, paintArt } from "./lib/art";
 import {
@@ -259,6 +260,7 @@ export default function App() {
       </main>
 
       <Lyrics doc={doc} progressMs={progress} />
+      <Mascot doc={doc} />
 
       <footer className="dock">
         <VoiceControl />

@@ -65,6 +65,8 @@ export interface RenderDoc {
   tempo_bpm?: number | null;
   /** 0..1, scaling how hard the ambience moves. */
   energy?: number | null;
+  /** True when the playing track is in the listener's own library. */
+  in_library?: boolean;
 }
 
 /** Per-device render parameters accepted by `GET /state`. */

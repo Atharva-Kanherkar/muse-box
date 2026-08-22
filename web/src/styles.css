@@ -644,6 +644,168 @@ input:focus-visible {
   }
 }
 
+/* ---------- Bitka ---------- */
+
+.mascot {
+  position: fixed;
+  left: clamp(14px, 3vw, 40px);
+  bottom: clamp(76px, 12vh, 110px);
+  width: clamp(84px, 9vw, 128px);
+  pointer-events: none;
+  z-index: 3;
+}
+
+.mascot-pix {
+  display: block;
+  width: 100%;
+  height: auto;
+  filter: drop-shadow(0 14px 22px rgb(0 0 0 / 0.5));
+}
+
+/* The eyes are the album's, glowing like the panel. */
+.mascot-eyes rect {
+  fill: var(--album-accent);
+}
+
+.mascot-pix {
+  --eye-glow: drop-shadow(0 0 3px color-mix(in oklab, var(--album-accent) 80%, transparent));
+}
+
+.mascot-eyes {
+  filter: var(--eye-glow);
+}
+
+/* Vibing: hard two-step bob at the track's tempo, like a sprite. */
+.mascot[data-mood="vibing"] .mascot-pix {
+  animation: pixelbob calc(var(--beat) * 2) steps(2, jump-none) infinite;
+}
+
+/* Dozing: one slow breath, nothing more. */
+.mascot[data-mood="dozing"] .mascot-pix {
+  animation: doze 5s ease-in-out infinite;
+}
+
+@keyframes doze {
+  0%,
+  100% {
+    transform: translateY(0) scale(1);
+  }
+  50% {
+    transform: translateY(2px) scale(1, 0.985);
+  }
+}
+
+/* Thinking: the visor dots pulse while Muse works. */
+.mascot[data-mood="thinking"] .mascot-eyes {
+  animation: ponder 0.9s steps(2, jump-none) infinite;
+}
+
+@keyframes ponder {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.mascot-zzz {
+  position: absolute;
+  top: -14px;
+  right: 2px;
+  font-family: var(--retro);
+  color: var(--ink-faint);
+}
+
+.mascot-zzz span {
+  position: absolute;
+  right: 0;
+  animation: zfloat 4s ease-in infinite;
+  opacity: 0;
+}
+
+.mascot-zzz span:nth-child(1) {
+  font-size: 0.9rem;
+}
+
+.mascot-zzz span:nth-child(2) {
+  font-size: 1.15rem;
+  animation-delay: 1.3s;
+}
+
+.mascot-zzz span:nth-child(3) {
+  font-size: 1.4rem;
+  animation-delay: 2.6s;
+}
+
+@keyframes zfloat {
+  0% {
+    transform: translate(0, 0);
+    opacity: 0;
+  }
+  15% {
+    opacity: 0.9;
+  }
+  100% {
+    transform: translate(14px, -30px);
+    opacity: 0;
+  }
+}
+
+.mascot-bubble {
+  position: absolute;
+  bottom: 100%;
+  left: 55%;
+  margin-bottom: 10px;
+  padding: 7px 12px;
+  border: 1px solid color-mix(in oklab, var(--album-accent) 50%, transparent);
+  border-radius: 8px 8px 8px 2px;
+  background: rgb(20 16 15 / 0.92);
+  font-family: var(--retro);
+  font-size: 1.05rem;
+  color: var(--ink);
+  white-space: nowrap;
+  animation: bubble-in 320ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes bubble-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pixelbob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mascot .mascot-pix,
+  .mascot .mascot-eyes,
+  .mascot-zzz span,
+  .mascot-bubble {
+    animation: none;
+  }
+
+  .mascot-zzz span {
+    opacity: 0.7;
+  }
+}
+
+@media (max-width: 720px) {
+  .mascot {
+    width: 72px;
+    bottom: 88px;
+  }
+}
+
 /* ---------- setup sheet ---------- */
 
 .veil-screen {

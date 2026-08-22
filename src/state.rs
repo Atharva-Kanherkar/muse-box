@@ -96,6 +96,7 @@ pub struct StateHub {
     display_offset: FixedOffset,
     keep_alive: std::time::Duration,
     lyrics: Option<Arc<LyricsIndex>>,
+    taste: RwLock<Option<Arc<crate::taste::TasteIndex>>>,
     /// Tempo and energy per track id, `None` cached for tracks Spotify will not
     /// describe (the endpoint is deprecated for newer API apps).
     beats: RwLock<HashMap<String, Option<(f32, f32)>>>,
@@ -147,6 +148,7 @@ impl StateHub {
             display_offset: Utc.fix(),
             keep_alive: DEFAULT_SSE_KEEP_ALIVE,
             lyrics: None,
+            taste: RwLock::new(None),
             beats: RwLock::new(HashMap::new()),
             spotify_features: RwLock::new(None),
             changes,
@@ -160,6 +162,12 @@ impl StateHub {
     pub fn with_lyrics(mut self, lyrics: Arc<LyricsIndex>) -> Self {
         self.lyrics = Some(lyrics);
         self
+    }
+
+    /// Attach the taste index, so documents can say whether the playing track
+    /// is the listener's own.
+    pub async fn attach_taste(&self, taste: Arc<crate::taste::TasteIndex>) {
+        *self.taste.write().await = Some(taste);
     }
 
     /// Attach the Spotify client used to ask for tempo and energy. Absent in
@@ -385,6 +393,12 @@ impl StateHub {
         if let Some((tempo, energy)) = beat {
             document.tempo_bpm = Some(tempo);
             document.energy = Some(energy);
+        }
+        if let (Some(taste), Some(track_id)) = (
+            self.taste.read().await.clone(),
+            observation.track_id.as_deref(),
+        ) {
+            document.in_library = taste.contains(track_id).await;
         }
         Ok(document)
     }
@@ -744,6 +758,7 @@ fn document_from_observation(
         lyrics: None,
         tempo_bpm: None,
         energy: None,
+        in_library: false,
     }
 }
 

@@ -82,6 +82,17 @@ impl TasteIndex {
         }
     }
 
+    /// Whether a track id is in the listener's own library. This is what lets
+    /// the mascot compliment taste honestly: it reacts to music the listener
+    /// actually chose, not to whatever happens to be on.
+    pub async fn contains(&self, track_id: &str) -> bool {
+        self.tracks
+            .read()
+            .await
+            .iter()
+            .any(|entry| entry.track.id == track_id)
+    }
+
     pub async fn is_empty(&self) -> bool {
         self.tracks.read().await.is_empty()
     }
@@ -317,6 +328,22 @@ mod tests {
         let zero = normalize(vec![0.0, 0.0, 0.0]);
         assert!(zero.iter().all(|value| value.is_finite()));
         assert_eq!(dot(&zero, &zero), 0.0);
+    }
+
+    #[tokio::test]
+    async fn contains_answers_only_for_the_listeners_own_tracks() {
+        let index = TasteIndex::new("key", PathBuf::from("unused"));
+        assert!(
+            !index.contains("anything").await,
+            "empty index owns nothing"
+        );
+        // Inject without the network: contains must read what search reads.
+        index.tracks.write().await.push(IndexedTrack {
+            track: track("owned-id", "Song", "KK", &["saved"]),
+            embedding: vec![0.0; 4],
+        });
+        assert!(index.contains("owned-id").await);
+        assert!(!index.contains("some-radio-hit").await);
     }
 
     #[tokio::test]

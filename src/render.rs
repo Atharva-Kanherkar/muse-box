@@ -70,6 +70,10 @@ pub struct RenderDoc {
     /// 0..1 energy, scaling how hard the ambience moves.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub energy: Option<f32>,
+    /// True when the playing track is in the listener's own library. The mascot
+    /// compliments taste on the strength of this, so it stays honest.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub in_library: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +102,7 @@ impl RenderDoc {
             lyrics: None,
             tempo_bpm: None,
             energy: None,
+            in_library: false,
         }
     }
 }

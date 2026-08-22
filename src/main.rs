@@ -96,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         openai_api_key.clone(),
         config.taste_index_path.clone(),
     ));
+    state_hub.attach_taste(taste.clone()).await;
     let taste_builder = taste.clone();
     let taste_spotify = spotify.clone();
     let _taste_task = tokio::spawn(async move {
