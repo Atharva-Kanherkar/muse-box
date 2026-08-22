@@ -61,6 +61,8 @@ export default function App() {
   const [params, setParams] = useState<RenderParams>(DEFAULT_RENDER_PARAMS);
   const [doc, setDoc] = useState<RenderDoc | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>({ kind: "idle" });
+  // Setup is scaffolding, not the product: once it works, get it out of the way.
+  const [setupOpen, setSetupOpen] = useState(false);
 
   const configured = connection.baseUrl.trim() !== "" && connection.token !== "";
 
@@ -101,8 +103,8 @@ export default function App() {
 
   useEffect(() => {
     const root = document.documentElement;
-    root.style.setProperty("--doc-bg", palette.background);
-    root.style.setProperty("--doc-accent", palette.accent);
+    root.style.setProperty("--album-bg", palette.background);
+    root.style.setProperty("--album-accent", palette.accent);
   }, [palette]);
 
   function save(event: React.FormEvent) {
@@ -113,6 +115,7 @@ export default function App() {
     };
     setConnection(next);
     setDoc(null);
+    setSetupOpen(false);
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
     } catch {
@@ -120,87 +123,107 @@ export default function App() {
     }
   }
 
+  const setupVisible = setupOpen || !configured;
+
   return (
-    <div className="app">
-      <header className="bar">
-        <span className="brand">muse&#8209;box</span>
-        <span className="status">
-          <span className="dot" data-kind={status.kind} />
+    <div className="shell">
+      <header className="masthead">
+        <h1 className="wordmark">muse&#8209;box</h1>
+        <span className="masthead-rule" />
+        <span className="status-line">
+          <span className="beacon" data-kind={status.kind} />
           {statusText(status)}
         </span>
+        {configured ? (
+          <button
+            type="button"
+            className="link-button"
+            onClick={() => setSetupOpen((open) => !open)}
+          >
+            {setupOpen ? "Hide setup" : "Setup"}
+          </button>
+        ) : null}
       </header>
 
-      <section className="panel">
-        <h2 className="panel-title">Connection</h2>
-        <form className="settings" onSubmit={save}>
-          <label className="field">
-            Backend URL
-            <input
-              type="url"
-              placeholder="https://muse-box.up.railway.app"
-              value={draft.baseUrl}
-              onChange={(event) =>
-                setDraft({ ...draft, baseUrl: event.target.value })
-              }
-            />
-          </label>
-          <label className="field">
-            Device token
-            <input
-              type="password"
-              placeholder="DEVICE_API_TOKEN"
-              autoComplete="off"
-              value={draft.token}
-              onChange={(event) =>
-                setDraft({ ...draft, token: event.target.value })
-              }
-            />
-          </label>
-          <button className="primary" type="submit">
-            Connect
-          </button>
-        </form>
-      </section>
+      <div className="stage">
+        <div className="column">
+          <DevicePreview doc={doc} params={params} onParamsChange={setParams} />
+        </div>
 
-      <div className="grid">
-        <div style={{ display: "grid", gap: "var(--gap)" }}>
+        <div className="column">
           <NowPlaying doc={doc} />
           <VoiceControl
             baseUrl={connection.baseUrl}
             token={connection.token}
             disabled={!configured}
           />
-        </div>
 
-        <div style={{ display: "grid", gap: "var(--gap)" }}>
-          <DevicePreview doc={doc} params={params} onParamsChange={setParams} />
-          <section className="panel">
-            <h2 className="panel-title">Voice log</h2>
+          <section className="block">
+            <h2 className="block-head">Heard</h2>
             {doc && doc.voice_log.length > 0 ? (
               <ul className="log">
                 {doc.voice_log.map((entry) => (
                   <li key={`${entry.timestamp}-${entry.action}`}>
-                    <span className="log-transcript">
-                      “{entry.transcript}”
+                    <span className="log-when">
+                      {new Date(entry.timestamp).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
                     </span>
-                    <span className="log-action">{entry.action}</span>
-                    <span className="log-time">
-                      {new Date(entry.timestamp).toLocaleTimeString()}
-                    </span>
+                    <div>
+                      <p className="log-said">
+                        {entry.transcript.trim() || "(nothing intelligible)"}
+                      </p>
+                      <span className="log-did">{entry.action}</span>
+                    </div>
                   </li>
                 ))}
               </ul>
             ) : (
-              <p className="empty">No commands yet.</p>
+              <p className="empty-note">Nothing said yet.</p>
             )}
           </section>
+
+          {setupVisible ? (
+            <section className="block">
+              <h2 className="block-head">Backend</h2>
+              <form className="setup" onSubmit={save}>
+                <label className="field">
+                  Address
+                  <input
+                    type="url"
+                    placeholder="https://muse-box.up.railway.app"
+                    value={draft.baseUrl}
+                    onChange={(event) =>
+                      setDraft({ ...draft, baseUrl: event.target.value })
+                    }
+                  />
+                </label>
+                <label className="field">
+                  Device token
+                  <input
+                    type="password"
+                    placeholder="DEVICE_API_TOKEN"
+                    autoComplete="off"
+                    value={draft.token}
+                    onChange={(event) =>
+                      setDraft({ ...draft, token: event.target.value })
+                    }
+                  />
+                </label>
+                <button className="control" type="submit">
+                  Connect
+                </button>
+              </form>
+            </section>
+          ) : null}
         </div>
       </div>
 
-      <p className="footnote">
+      <p className="colophon">
         render document v{doc?.version ?? 1}
         {doc?.server_ts
-          ? ` · updated ${new Date(doc.server_ts).toLocaleTimeString()}`
+          ? ` · ${new Date(doc.server_ts).toLocaleTimeString()}`
           : ""}
       </p>
     </div>

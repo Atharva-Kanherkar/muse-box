@@ -115,42 +115,63 @@ export function VoiceControl({ baseUrl, token, disabled }: Props) {
           ? "Listening"
           : "Not listening";
 
-  return (
-    <section className="panel">
-      <h2 className="panel-title">Muse</h2>
+  const bars = 24;
+  const lit = Math.round(level * bars);
+  const activePhase = replying ? "replying" : sending ? "thinking" : phase;
 
-      <div className="listen-row">
+  return (
+    <section className="block">
+      <h2 className="block-head">Muse</h2>
+
+      <div className="listen">
+        <div className="listen-state">
+          <span className="listen-phase" data-phase={activePhase}>
+            {statusLine}
+          </span>
+          {lastHeard && listening ? (
+            <span className="log-when">{lastHeard}</span>
+          ) : null}
+        </div>
+
+        <div className="levels" data-idle={!listening} aria-hidden="true">
+          {Array.from({ length: bars }, (_, index) => {
+            const active = listening && index < lit;
+            // Bars fall away from the centre, so speech reads as a waveform
+            // rather than a progress bar filling left to right.
+            const falloff = 1 - Math.abs(index - (bars - 1) / 2) / (bars / 2);
+            return (
+              <span
+                key={index}
+                data-lit={active}
+                style={{
+                  height: active
+                    ? `${8 + level * 92 * (0.35 + falloff * 0.65)}%`
+                    : "3%",
+                }}
+              />
+            );
+          })}
+        </div>
+
         <button
           type="button"
-          className="talk"
-          data-recording={phase === "speaking"}
+          className="control"
+          data-armed={listening}
           disabled={disabled}
           onClick={() => void (listening ? stopListening() : startListening())}
         >
           {listening ? "Stop listening" : "Start listening"}
         </button>
-      </div>
 
-      <div className="meter" aria-hidden="true">
-        <div
-          className="meter-fill"
-          data-speaking={phase === "speaking"}
-          style={{ width: `${Math.round(level * 100)}%` }}
-        />
+        <p className="note">
+          {disabled
+            ? "Point this at the backend below before Muse can hear anything."
+            : listening
+              ? `Talk normally. “Muse, play something calm” pulls from your own playlists and history, not a blind search. Clips under ${MIN_UTTERANCE_SECONDS}s are ignored, and anything not meant for Muse changes nothing.`
+              : "One click grants the microphone. After that it stays on — no button to hold."}
+        </p>
+        {error ? <p className="alert">{error}</p> : null}
       </div>
-
-      <p className="hint">
-        <strong>{statusLine}</strong>
-        {disabled
-          ? " — set the backend URL and device token first."
-          : listening
-            ? ` — just talk. Say “Muse, play something calm”. Anything under ${MIN_UTTERANCE_SECONDS}s is ignored, and speech that was not meant for Muse changes nothing.`
-            : " — one click to grant the microphone, then it stays on."}
-      </p>
-      {lastHeard && listening ? (
-        <p className="hint">Last sent: {lastHeard}</p>
-      ) : null}
-      {error ? <p className="error">{error}</p> : null}
     </section>
   );
 }

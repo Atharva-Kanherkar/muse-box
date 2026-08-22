@@ -15,13 +15,15 @@ interface Props {
 }
 
 /**
- * Renders the packed 1-bit frame the ESP32 receives, so you can see the real
- * device output next to the full-color art instead of inferring it.
+ * The 1-bit frame the ESP32 actually receives, unpacked and painted at native
+ * resolution. It is the signature of the whole device, so it leads the page —
+ * and a bit-order regression in the backend shows up here as visible noise
+ * rather than passing silently.
  */
 export function DevicePreview({ doc, params, onParamsChange }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // A set bit means ink, but whether ink is the lit pixel or the dark one
-  // depends on the panel: emissive by default, invert for e-paper.
+  // depends on the panel: emissive by default, inverted for e-paper.
   const [inkIsLit, setInkIsLit] = useState(true);
   const art = doc?.art ?? null;
 
@@ -38,42 +40,48 @@ export function DevicePreview({ doc, params, onParamsChange }: Props) {
     });
   }, [art, doc?.palette, inkIsLit]);
 
-  function clampDimension(value: string, fallback: number): number {
+  function clamp(value: string, fallback: number): number {
     const parsed = Number.parseInt(value, 10);
     if (!Number.isFinite(parsed)) return fallback;
-    return Math.min(
-      MAX_RENDER_DIMENSION,
-      Math.max(MIN_RENDER_DIMENSION, parsed),
-    );
+    return Math.min(MAX_RENDER_DIMENSION, Math.max(MIN_RENDER_DIMENSION, parsed));
   }
 
   return (
-    <section className="panel">
-      <h2 className="panel-title">Device frame</h2>
-      <div className="preview-frame">
+    <section className="block">
+      <h2 className="block-head">Panel</h2>
+
+      <div className="panel-stage">
         {art ? (
           <canvas
             ref={canvasRef}
-            className="preview-canvas"
-            style={{ width: "100%", maxWidth: `${Math.max(art.w, 160)}px` }}
+            className="panel-canvas"
             aria-label={`Dithered ${art.w} by ${art.h} device frame`}
           />
         ) : (
-          <p className="empty">No frame yet.</p>
+          <div className="panel-empty">Awaiting frame</div>
         )}
       </div>
 
       {art ? (
-        <div className="preview-meta">
-          <span>
-            {art.w}×{art.h}
-          </span>
-          <span>{art.dither}</span>
-          <span>{Math.ceil(art.w / 8) * art.h} bytes</span>
-        </div>
+        <dl className="readout">
+          <div>
+            <dt>Size</dt>
+            <dd>
+              {art.w}×{art.h}
+            </dd>
+          </div>
+          <div>
+            <dt>Dither</dt>
+            <dd>{art.dither}</dd>
+          </div>
+          <div>
+            <dt>Packed</dt>
+            <dd>{Math.ceil(art.w / 8) * art.h} B</dd>
+          </div>
+        </dl>
       ) : null}
 
-      <div className="controls">
+      <div className="dials">
         <label className="field">
           Width
           <input
@@ -83,10 +91,7 @@ export function DevicePreview({ doc, params, onParamsChange }: Props) {
             max={MAX_RENDER_DIMENSION}
             value={params.w}
             onChange={(event) =>
-              onParamsChange({
-                ...params,
-                w: clampDimension(event.target.value, params.w),
-              })
+              onParamsChange({ ...params, w: clamp(event.target.value, params.w) })
             }
           />
         </label>
@@ -99,22 +104,9 @@ export function DevicePreview({ doc, params, onParamsChange }: Props) {
             max={MAX_RENDER_DIMENSION}
             value={params.h}
             onChange={(event) =>
-              onParamsChange({
-                ...params,
-                h: clampDimension(event.target.value, params.h),
-              })
+              onParamsChange({ ...params, h: clamp(event.target.value, params.h) })
             }
           />
-        </label>
-        <label className="field">
-          Ink
-          <select
-            value={inkIsLit ? "lit" : "dark"}
-            onChange={(event) => setInkIsLit(event.target.value === "lit")}
-          >
-            <option value="lit">lit</option>
-            <option value="dark">dark</option>
-          </select>
         </label>
         <label className="field">
           Dither
@@ -129,6 +121,16 @@ export function DevicePreview({ doc, params, onParamsChange }: Props) {
           >
             <option value="bayer">bayer</option>
             <option value="atkinson">atkinson</option>
+          </select>
+        </label>
+        <label className="field">
+          Ink
+          <select
+            value={inkIsLit ? "lit" : "dark"}
+            onChange={(event) => setInkIsLit(event.target.value === "lit")}
+          >
+            <option value="lit">lit</option>
+            <option value="dark">dark</option>
           </select>
         </label>
       </div>

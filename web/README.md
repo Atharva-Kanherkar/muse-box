@@ -28,6 +28,16 @@ converted to PCM16, and posted as `audio/pcm` with the microphone's own sample
 rate in the query string (`src/lib/voice.ts`). Raw PCM accepts any positive
 rate, so there is no client-side resampling; the backend resamples to 24 kHz.
 
+## Design
+
+Dark by commitment, not by default: this sits on a shelf, often at night. The
+dithered panel is the signature of the whole device, so it leads the page rather
+than sitting in a corner, and the ground carries a halftone dot screen drawn
+from the same 1-bit world. IBM Plex Mono for anything instrument-like, Instrument
+Serif for the track and the transcripts — the one editorial note against the
+technical chrome. Every accent comes from the album'"'"'s own palette, so the surface
+shifts colour with the music the way the LEDs do.
+
 ## What is where
 
 | File | Role |

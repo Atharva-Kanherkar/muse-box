@@ -16,8 +16,8 @@ const STATE_LABEL: Record<string, string> = {
 export function NowPlaying({ doc }: { doc: RenderDoc | null }) {
   const [progress, setProgress] = useState(0);
 
-  // Progress is interpolated locally between documents: the backend sends one
-  // only on a meaningful change, so a ticking bar has to come from server_ts.
+  // The backend sends a document only on a meaningful change, so a moving
+  // progress bar has to be interpolated locally from server_ts.
   useEffect(() => {
     setProgress(interpolatedProgressMs(doc, Date.now()));
     if (doc?.state !== "playing") return;
@@ -31,33 +31,38 @@ export function NowPlaying({ doc }: { doc: RenderDoc | null }) {
     doc && doc.duration_ms > 0
       ? Math.min(100, (progress / doc.duration_ms) * 100)
       : 0;
+  const state = doc?.state ?? "idle";
 
   return (
-    <section className="panel">
-      <div className="now">
+    <section className="block">
+      <div className="marquee">
         {doc?.art_url ? (
-          <img className="cover" src={doc.art_url} alt="" />
+          <img className="sleeve" src={doc.art_url} alt="" />
         ) : (
-          <div className="cover cover-empty">NO ART</div>
+          <div className="sleeve sleeve-empty">No sleeve</div>
         )}
 
         <div>
-          <span className="state-chip" data-state={doc?.state ?? "idle"}>
-            {STATE_LABEL[doc?.state ?? "idle"] ?? doc?.state}
+          <span className="state-tag" data-state={state}>
+            {STATE_LABEL[state] ?? state}
           </span>
-          <h1 className="track">{doc?.track ?? "Nothing playing"}</h1>
-          <p className="artist">{doc?.artist ?? "—"}</p>
-          {doc?.album ? <p className="album">{doc.album}</p> : null}
+          <h2 className="title">{doc?.track ?? "Nothing playing"}</h2>
+          <p className="byline">
+            {doc?.artist ?? "Say something to Muse"}
+            {doc?.album ? (
+              <span className="byline-album">{doc.album}</span>
+            ) : null}
+          </p>
+        </div>
+      </div>
 
-          <div className="progress">
-            <div className="progress-track">
-              <div className="progress-fill" style={{ width: `${percent}%` }} />
-            </div>
-            <div className="progress-times">
-              <span>{formatDuration(progress)}</span>
-              <span>{formatDuration(doc?.duration_ms ?? 0)}</span>
-            </div>
-          </div>
+      <div className="timeline">
+        <div className="timeline-rail">
+          <div className="timeline-fill" style={{ width: `${percent}%` }} />
+        </div>
+        <div className="timeline-times">
+          <span>{formatDuration(progress)}</span>
+          <span>{formatDuration(doc?.duration_ms ?? 0)}</span>
         </div>
       </div>
     </section>
