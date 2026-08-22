@@ -53,39 +53,106 @@ body {
   isolation: isolate;
 }
 
-.scene::before,
 .scene::after {
   content: "";
   position: fixed;
   inset: 0;
   z-index: -1;
   pointer-events: none;
-}
-
-.scene::before {
-  background:
-    radial-gradient(
-      100% 80% at 50% 110%,
-      color-mix(in oklab, var(--album-bg) 85%, transparent),
-      transparent 70%
-    ),
-    radial-gradient(
-      70% 50% at 50% -10%,
-      color-mix(in oklab, var(--album-accent) 14%, transparent),
-      transparent 70%
-    );
-  transition: background 1400ms ease;
-}
-
-.scene::after {
   background-image: radial-gradient(var(--edge) 1px, transparent 1px);
   background-size: 4px 4px;
   opacity: 0.5;
 }
 
+/* ---------- ambience ----------
+   Three layers of the album's own colours, paced by the track:
+   --beat is one beat (60/bpm), --energy scales how hard everything moves. */
+
+.ambient {
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.ambient span {
+  position: absolute;
+  inset: -20%;
+  transition: opacity 1200ms ease;
+}
+
+/* Deep wash of the dominant colour, slowly wandering. */
+.ambient-wash {
+  background: radial-gradient(
+    75% 75% at 30% 70%,
+    color-mix(in oklab, var(--album-bg) 90%, transparent),
+    transparent 70%
+  );
+  animation: wander calc(var(--beat) * 32) ease-in-out infinite alternate;
+}
+
+/* The accent, breathing on the beat from below the cover. */
+.ambient-glow {
+  background: radial-gradient(
+    60% 55% at 50% 96%,
+    color-mix(in oklab, var(--album-accent) calc(14% + var(--energy) * 26%), transparent),
+    transparent 72%
+  );
+  animation: breathe-beat var(--beat) ease-in-out infinite;
+}
+
+/* A long diagonal sheen that crosses every few bars. */
+.ambient-beam {
+  background: linear-gradient(
+    115deg,
+    transparent 30%,
+    color-mix(in oklab, var(--album-accent) calc(4% + var(--energy) * 10%), transparent) 50%,
+    transparent 70%
+  );
+  animation: sweep calc(var(--beat) * 16) linear infinite;
+}
+
+/* Idle or paused: hold the light steady instead of pulsing at nothing. */
+.ambient[data-live="false"] .ambient-glow,
+.ambient[data-live="false"] .ambient-beam {
+  animation-play-state: paused;
+  opacity: 0.55;
+}
+
+@keyframes breathe-beat {
+  0%,
+  100% {
+    opacity: calc(0.55 + var(--energy) * 0.1);
+    transform: scale(1);
+  }
+  38% {
+    opacity: 1;
+    transform: scale(calc(1 + var(--energy) * 0.045));
+  }
+}
+
+@keyframes wander {
+  from {
+    transform: translate3d(-4%, -2%, 0) scale(1);
+  }
+  to {
+    transform: translate3d(4%, 3%, 0) scale(1.08);
+  }
+}
+
+@keyframes sweep {
+  from {
+    transform: translateX(-55%);
+  }
+  to {
+    transform: translateX(55%);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .scene::before {
-    transition: none;
+  .ambient span {
+    animation: none;
   }
 }
 
@@ -348,109 +415,111 @@ input:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 
-/* ---------- lyrics ---------- */
+/* ---------- karaoke ---------- */
 
-/* A column beside the cover on wide screens; below it on narrow ones, where
-   side-by-side would squeeze both. */
-.scene {
-  grid-template-areas:
-    "rail"
-    "stage"
-    "dock";
-}
-
-.lyrics {
+/* One line, sung right now, beside the cover. Nothing scrolls: each line
+   replaces the last, which is also what killed the overlapping-text bug. */
+.karaoke {
   position: fixed;
   top: 0;
   right: 0;
-  width: min(30vw, 380px);
+  width: min(34vw, 420px);
   height: 100dvh;
-  padding: 16vh 32px 16vh 0;
-  overflow: hidden;
-  /* Fades at both ends, so lines arrive and leave rather than being cut. */
-  mask-image: linear-gradient(
-    to bottom,
-    transparent,
-    #000 18%,
-    #000 82%,
-    transparent
-  );
-}
-
-.lyric-lines {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  height: 100%;
-  overflow-y: auto;
-  scrollbar-width: none;
   display: grid;
-  gap: 14px;
-  align-content: start;
+  align-content: center;
+  gap: 26px;
+  padding: 0 clamp(20px, 3vw, 44px);
+  pointer-events: none;
 }
 
-.lyric-lines::-webkit-scrollbar {
-  display: none;
-}
-
-.lyric-lines li {
+.karaoke-line {
+  margin: 0;
   font-family: var(--display);
-  font-size: 1.375rem;
-  line-height: 1.2;
-  min-height: 0.6em;
-  color: var(--ink-faint);
-  transition:
-    color 320ms ease,
-    opacity 320ms ease,
-    transform 320ms ease;
-  text-wrap: pretty;
-}
-
-.lyric-lines li[data-state="now"] {
+  font-size: clamp(1.5rem, 2.6vw, 2.25rem);
+  line-height: 1.16;
   color: var(--album-accent);
-  transform: translateX(-6px);
+  text-wrap: balance;
+  text-shadow: 0 0 34px color-mix(in oklab, var(--album-accent) 35%, transparent);
+  animation: line-in 480ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  min-height: 2.4em;
 }
 
-.lyric-lines li[data-state="past"] {
-  opacity: 0.35;
+.karaoke-rest {
+  animation: none;
 }
 
-.lyric-lines li[data-state="ahead"] {
-  opacity: 0.6;
-}
-
-/* Unsynced lyrics are text, not a performance: no highlight to mislead. */
-.lyric-lines[data-synced="false"] li {
-  color: var(--ink-muted);
+.karaoke-next {
+  margin: 0;
+  font-family: var(--display);
   font-size: 1.0625rem;
-  opacity: 1;
+  color: var(--ink-faint);
+  text-wrap: balance;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .lyric-lines li {
-    transition: none;
+@keyframes line-in {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+    filter: blur(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
   }
 }
 
-/* Give the cover room so it is not hidden behind the lyric column. */
+@media (prefers-reduced-motion: reduce) {
+  .karaoke-line {
+    animation: none;
+  }
+}
+
+/* Unsynced lyrics cannot follow the song: quiet, whole, no pretence. */
+.karaoke-plain {
+  max-height: 70dvh;
+  overflow-y: auto;
+  scrollbar-width: none;
+  pointer-events: auto;
+  mask-image: linear-gradient(to bottom, transparent, #000 8%, #000 92%, transparent);
+}
+
+.karaoke-plain::-webkit-scrollbar {
+  display: none;
+}
+
+.karaoke-plain p {
+  margin: 0 0 10px;
+  font-family: var(--display);
+  font-size: 1rem;
+  color: var(--ink-muted);
+}
+
 @media (min-width: 1100px) {
   .centerpiece[data-with-lyrics="true"] {
-    padding-right: min(32vw, 400px);
+    padding-right: min(34vw, 420px);
   }
 }
 
 @media (max-width: 1099px) {
-  .lyrics {
+  .karaoke {
     position: static;
     width: 100%;
     height: auto;
-    max-height: 34vh;
-    padding: 0 clamp(16px, 4vw, 36px) 12px;
-    mask-image: linear-gradient(to bottom, #000 70%, transparent);
+    min-height: 5.5em;
+    padding: 0 clamp(16px, 4vw, 36px) 10px;
+    text-align: center;
+    justify-items: center;
+    gap: 10px;
   }
 
-  .lyric-lines li {
-    font-size: 1.125rem;
+  .karaoke-line {
+    font-size: 1.375rem;
+    min-height: 2.2em;
+  }
+
+  .karaoke-plain {
+    max-height: 30dvh;
   }
 }
 

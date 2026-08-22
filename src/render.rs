@@ -62,6 +62,14 @@ pub struct RenderDoc {
     /// the same interpolation that drives the progress bar.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lyrics: Option<crate::lyrics::Lyrics>,
+    /// The track's tempo, when Spotify will still say. Clients pace ambient
+    /// motion with it; real beat detection is impossible for them, because the
+    /// audio plays on a Spotify device and never reaches a client.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tempo_bpm: Option<f32>,
+    /// 0..1 energy, scaling how hard the ambience moves.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub energy: Option<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +96,8 @@ impl RenderDoc {
             duration_ms: 0,
             voice_log: vec![],
             lyrics: None,
+            tempo_bpm: None,
+            energy: None,
         }
     }
 }

@@ -646,6 +646,40 @@ impl SpotifyClient {
             .map_err(spotify_api_error)
     }
 
+    /// Tempo and energy for a track, or `None`.
+    ///
+    /// Spotify deprecated audio-features for API apps created after late 2024,
+    /// so a 403 here is an expected outcome, not an error: ambience then falls
+    /// back to a slow default drift instead of a beat-paced pulse.
+    pub async fn audio_features(&self, track_id: &str) -> Option<(f32, f32)> {
+        #[derive(Deserialize)]
+        struct Features {
+            tempo: Option<f32>,
+            energy: Option<f32>,
+        }
+
+        let access_token = self.access_token().await.ok()?;
+        let url = format!(
+            "{}/audio-features/{}",
+            self.endpoints.api_base_url.trim_end_matches('/'),
+            track_id
+        );
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            tracing::debug!(status = %response.status(), "audio features unavailable");
+            return None;
+        }
+        let features: Features = response.json().await.ok()?;
+        let tempo = features.tempo.filter(|tempo| *tempo > 0.0)?;
+        Some((tempo, features.energy.unwrap_or(0.5).clamp(0.0, 1.0)))
+    }
+
     pub async fn play_track(&self, track_id: &str) -> Result<(), AppError> {
         self.send_player_command(
             reqwest::Method::PUT,
@@ -1323,6 +1357,38 @@ mod tests {
                 .iter()
                 .all(|request| request.2 == "Bearer test-access-token")
         );
+    }
+
+    #[tokio::test]
+    async fn audio_features_degrade_to_none_when_spotify_refuses() {
+        // The endpoint is deprecated for newer API apps, so 403 is a normal
+        // answer and must cost nothing, not an error.
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |request: axum::extract::Request| async move {
+                let uri = request.uri().to_string();
+                if uri.contains("/audio-features/described") {
+                    return axum::Json(serde_json::json!({
+                        "tempo": 128.0, "energy": 0.82
+                    }))
+                    .into_response();
+                }
+                StatusCode::FORBIDDEN.into_response()
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = SpotifyClient::with_test_api_url(
+            test_config(PathBuf::from("unused")),
+            format!("http://{address}/v1"),
+        );
+        client.authorize_for_test().await;
+
+        assert_eq!(
+            client.audio_features("described").await,
+            Some((128.0, 0.82))
+        );
+        assert_eq!(client.audio_features("refused").await, None);
     }
 
     #[tokio::test]

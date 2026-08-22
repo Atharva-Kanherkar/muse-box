@@ -61,6 +61,10 @@ export interface RenderDoc {
   duration_ms: number;
   voice_log: VoiceLogEntry[];
   lyrics?: Lyrics | null;
+  /** Track tempo, when Spotify will still say. Paces the ambient pulse. */
+  tempo_bpm?: number | null;
+  /** 0..1, scaling how hard the ambience moves. */
+  energy?: number | null;
 }
 
 /** Per-device render parameters accepted by `GET /state`. */

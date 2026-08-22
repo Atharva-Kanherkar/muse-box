@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         config.openai_speech_model.clone(),
         config.openai_speech_voice.clone(),
     ));
+    state_hub.attach_features(Arc::new(spotify.clone())).await;
     let (_background_shutdown, poll_shutdown_rx) = tokio::sync::watch::channel(false);
     let idle_shutdown_rx = poll_shutdown_rx.clone();
     let poll_spotify = spotify.clone();

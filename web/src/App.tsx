@@ -155,13 +155,33 @@ export default function App() {
 
   const hasLyrics = (doc?.lyrics?.lines.length ?? 0) > 0;
   const playing = doc?.state === "playing";
+  // Beat-paced ambience. True beat detection is impossible here — the audio
+  // plays on a Spotify device, never in this tab — so the pulse runs at the
+  // track's real tempo when Spotify will still say it, and drifts slowly when
+  // it will not.
+  const beatSeconds = doc?.tempo_bpm && doc.tempo_bpm > 0 ? 60 / doc.tempo_bpm : 8;
+  const energy = Math.min(1, Math.max(0, doc?.energy ?? 0.35));
   const percent =
     doc && doc.duration_ms > 0
       ? Math.min(100, (progress / doc.duration_ms) * 100)
       : 0;
 
   return (
-    <div className="scene">
+    <div
+      className="scene"
+      style={
+        {
+          "--beat": `${beatSeconds.toFixed(3)}s`,
+          "--energy": energy.toFixed(2),
+        } as React.CSSProperties
+      }
+    >
+      <div className="ambient" data-live={playing} aria-hidden="true">
+        <span className="ambient-wash" />
+        <span className="ambient-glow" />
+        <span className="ambient-beam" />
+      </div>
+
       <header className="rail">
         <span className="wordmark">muse&#8209;box</span>
         {statusText(status) ? (

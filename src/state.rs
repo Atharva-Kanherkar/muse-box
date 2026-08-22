@@ -96,6 +96,10 @@ pub struct StateHub {
     display_offset: FixedOffset,
     keep_alive: std::time::Duration,
     lyrics: Option<Arc<LyricsIndex>>,
+    /// Tempo and energy per track id, `None` cached for tracks Spotify will not
+    /// describe (the endpoint is deprecated for newer API apps).
+    beats: RwLock<HashMap<String, Option<(f32, f32)>>>,
+    spotify_features: RwLock<Option<Arc<crate::spotify::SpotifyClient>>>,
     changes: broadcast::Sender<u64>,
     generation: AtomicU64,
     http: reqwest::Client,
@@ -143,6 +147,8 @@ impl StateHub {
             display_offset: Utc.fix(),
             keep_alive: DEFAULT_SSE_KEEP_ALIVE,
             lyrics: None,
+            beats: RwLock::new(HashMap::new()),
+            spotify_features: RwLock::new(None),
             changes,
             generation: AtomicU64::new(0),
             http,
@@ -154,6 +160,30 @@ impl StateHub {
     pub fn with_lyrics(mut self, lyrics: Arc<LyricsIndex>) -> Self {
         self.lyrics = Some(lyrics);
         self
+    }
+
+    /// Attach the Spotify client used to ask for tempo and energy. Absent in
+    /// tests, which then publish documents without a beat.
+    pub async fn attach_features(&self, spotify: Arc<crate::spotify::SpotifyClient>) {
+        *self.spotify_features.write().await = Some(spotify);
+    }
+
+    /// Tempo and energy for the playing track, cached per track id, including
+    /// the misses: the endpoint is deprecated for newer API apps, and asking
+    /// again every poll would be pure waste.
+    async fn beat_for(&self, observation: &PlaybackObservation) -> Option<(f32, f32)> {
+        let track_id = observation.track_id.as_deref()?;
+        if let Some(cached) = self.beats.read().await.get(track_id) {
+            return *cached;
+        }
+        let spotify = self.spotify_features.read().await.clone()?;
+        let features = spotify.audio_features(track_id).await;
+        let mut beats = self.beats.write().await;
+        if beats.len() >= 256 {
+            beats.clear();
+        }
+        beats.insert(track_id.to_string(), features);
+        features
     }
 
     /// How often the SSE stream should send a keep-alive comment.
@@ -350,6 +380,10 @@ impl StateHub {
             .await?;
         document.voice_log = self.voice_log.lock().await.iter().cloned().collect();
         document.lyrics = self.lyrics_for(observation).await;
+        if let Some((tempo, energy)) = self.beat_for(observation).await {
+            document.tempo_bpm = Some(tempo);
+            document.energy = Some(energy);
+        }
         Ok(document)
     }
 
@@ -706,6 +740,8 @@ fn document_from_observation(
         duration_ms: observation.duration_ms,
         voice_log: Vec::new(),
         lyrics: None,
+        tempo_bpm: None,
+        energy: None,
     }
 }
 

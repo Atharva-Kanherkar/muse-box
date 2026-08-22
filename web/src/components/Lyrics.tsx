@@ -1,65 +1,70 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useMemo } from "react";
 import type { RenderDoc } from "../lib/types";
 
 interface Props {
   doc: RenderDoc | null;
-  /** Interpolated position, the same value that drives the progress bar. */
+  /** Interpolated position — the same value that drives the progress bar. */
   progressMs: number;
 }
 
 /**
- * Lyrics beside the cover, following the track.
+ * Karaoke, not a document: one line at a time, keyed so each change remounts
+ * and animates in while the old one is simply gone.
  *
- * No clock negotiation: each line carries an offset, and the caller's already
- * interpolated position picks the current one. Unsynced lyrics are shown as
- * plain text rather than scrolled, because inventing timings drifts visibly.
+ * The previous version rendered the whole track as a scrolling list and moved a
+ * highlight through it, which is where the overlapping-text bug lived — smooth
+ * scrollIntoView fighting re-renders. There is nothing to scroll now.
  */
 export function Lyrics({ doc, progressMs }: Props) {
   const lyrics = doc?.lyrics ?? null;
-  const listRef = useRef<HTMLOListElement>(null);
 
-  const currentIndex = useMemo(() => {
-    if (!lyrics?.synced) return -1;
-    // Last line whose timestamp has passed.
-    let found = -1;
+  const { current, next } = useMemo(() => {
+    if (!lyrics?.synced) return { current: -1, next: -1 };
+    let current = -1;
     for (let index = 0; index < lyrics.lines.length; index += 1) {
       const line = lyrics.lines[index];
-      if (line && line.at_ms <= progressMs) found = index;
+      if (line && line.at_ms <= progressMs) current = index;
       else break;
     }
-    return found;
+    // The next line someone will actually hear, skipping instrumental gaps.
+    let next = current + 1;
+    while (next < lyrics.lines.length && !lyrics.lines[next]?.text.trim()) {
+      next += 1;
+    }
+    return { current, next };
   }, [lyrics, progressMs]);
-
-  useEffect(() => {
-    if (currentIndex < 0) return;
-    const list = listRef.current;
-    const active = list?.children[currentIndex];
-    active?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [currentIndex]);
 
   if (!lyrics || lyrics.lines.length === 0) return null;
 
+  // Unsynced lyrics cannot follow the song; pretending would drift visibly.
+  // Shown quiet and whole instead.
+  if (!lyrics.synced) {
+    return (
+      <aside className="karaoke" aria-label="Lyrics">
+        <div className="karaoke-plain">
+          {lyrics.lines.map((line, index) => (
+            <p key={index}>{line.text}</p>
+          ))}
+        </div>
+      </aside>
+    );
+  }
+
+  const line = current >= 0 ? (lyrics.lines[current]?.text.trim() ?? "") : "";
+  const upcoming = lyrics.lines[next]?.text.trim() ?? "";
+
   return (
-    <aside className="lyrics" aria-label="Lyrics">
-      <ol className="lyric-lines" ref={listRef} data-synced={lyrics.synced}>
-        {lyrics.lines.map((line, index) => (
-          <li
-            key={`${line.at_ms}-${index}`}
-            data-state={
-              !lyrics.synced
-                ? "plain"
-                : index === currentIndex
-                  ? "now"
-                  : index < currentIndex
-                    ? "past"
-                    : "ahead"
-            }
-          >
-            {/* An empty timed line is an instrumental gap; keep its space. */}
-            {line.text || " "}
-          </li>
-        ))}
-      </ol>
+    <aside className="karaoke" aria-label="Lyrics">
+      {/* Keyed on the index: a new line replaces the old, never joins it. */}
+      {line ? (
+        <p className="karaoke-line" key={current}>
+          {line}
+        </p>
+      ) : (
+        // An instrumental gap: nothing sung, so nothing shown.
+        <p className="karaoke-line karaoke-rest" key={`rest-${current}`} />
+      )}
+      {upcoming ? <p className="karaoke-next">{upcoming}</p> : null}
     </aside>
   );
 }
