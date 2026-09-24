@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>muse-box</string>
+	<key>CFBundleExecutable</key>
+	<string>muse-box</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.atharvakanherkar.musebox</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>muse-box</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.music</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>muse-box, a decoration for your music.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>muse-box reads what Spotify is playing (title, artist, cover, position) and sends play, pause and skip. It never signs in to your Spotify account.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>muse-box listens to Spotify's sound on this Mac so the light can move with the beat. The audio is analysed live and never recorded, stored or sent anywhere.</string>
+</dict>
+</plist>
