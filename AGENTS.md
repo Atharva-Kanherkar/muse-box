@@ -72,3 +72,12 @@ Railway, single service built from this repo. TLS is terminated by Railway. Secr
 - SSE on ESP32: one TLS handshake per uptime is the target; steady-state playback must produce zero SSE traffic between track changes.
 - Spotify playback control requires Premium (the owner has it); dev-mode app on the owner's account, no quota extension needed.
 - The web UI renders a polished full-color interface from `art_url`, but its 1-bit "panel preview" toggle (rendering `art.bits` exactly) is the hardware reference renderer. Both live in the same client; neither is a throwaway.
+
+## macOS app (`macos/`)
+
+- A standalone Swift package, not a client of the backend: it reads the local Spotify app (the `com.spotify.client.PlaybackStateChanged` broadcast plus AppleScript) and must never use the Spotify Web API, so it can be given to people without a developer app.
+- Because there is no backend in the loop, it runs the pipeline itself. `MuseBoxCore` holds straight ports of `src/image.rs` (palette, dithering), `src/idle.rs` and `src/lyrics.rs`; change the Rust and the Swift together and keep the tests in `macos/Tests` in step.
+- Beat reactivity is device-local, as everywhere: a Core Audio tap feeds `BeatAnalyzer`. Audio is never recorded or sent anywhere.
+- Before pushing: `cd macos && make test && make app`. `.github/workflows/macos.yml` runs the same on PRs that touch `macos/`; a `macos-v*` tag publishes the zip to a Release.
+- Keep it cheap to leave running: the light is Core Animation (`AmbientLayer`), animated SwiftUI views go through `Pulse` (one shared `FrameClock`), and nothing should poll faster than once a second.
+- Liquid Glass only on controls, through the helpers in `Glass.swift`: never on content (cover, light, titles, lyrics), neighbours in one `GlassGroup`, nothing painted over the glass, tint only on the primary action, and no glass on glass (the menu bar panel uses system controls). Check the look with `make screenshots`: glass can't be rendered offscreen.
