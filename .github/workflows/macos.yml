@@ -1,0 +1,53 @@
+# The native macOS app in macos/. Builds and tests on every PR that touches
+# it; a `macos-v*` tag also publishes a universal .app zip to a GitHub Release,
+# which is how people without Xcode get it.
+
+name: macOS app
+
+on:
+  pull_request:
+    paths: ["macos/**", ".github/workflows/macos.yml"]
+  push:
+    branches: [master]
+    paths: ["macos/**", ".github/workflows/macos.yml"]
+    tags: ["macos-v*"]
+
+jobs:
+  app:
+    name: build, test, package
+    runs-on: macos-15
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: macos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # CFBundleVersion is the commit count
+
+      - name: Use the newest stable Xcode on the runner
+        run: |
+          xcode="$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)"
+          sudo xcode-select -s "$xcode"
+          swift --version
+
+      - run: make test
+
+      - name: Build a universal app
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/macos-v* ]]; then export VERSION="${GITHUB_REF_NAME#macos-v}"; fi
+          ARCHS="arm64 x86_64" ./scripts/build-app.sh
+
+      - run: ditto -c -k --keepParent build/muse-box.app build/muse-box-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muse-box-macos
+          path: macos/build/muse-box-macos.zip
+
+      - if: startsWith(github.ref, 'refs/tags/macos-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: macos/build/muse-box-macos.zip
+          generate_release_notes: true
