@@ -13,6 +13,8 @@ The project is intentionally built in two phases:
 
 Both clients are dumb renderers. The backend owns Spotify OAuth, the GPT Realtime voice session, tool execution, palette extraction, dithering, and the idle-mode art.
 
+**On a Mac?** [`macos/`](macos/README.md) is a native app with the same look that needs none of the setup below: no Spotify developer app, no keys, no backend. It follows the Spotify desktop app directly, hears the beat through a Core Audio tap, and can wash your whole desktop in the album's light.
+
 ---
 
 ## Run it yourself
