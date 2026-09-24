@@ -22,6 +22,23 @@ enum RoomLightMode: String, CaseIterable, Identifiable {
         }
     }
 
+    /// How the room light menu names it.
+    var menuTitle: String {
+        switch self {
+        case .off: "Off"
+        case .tint: "Tint my wallpaper"
+        case .scene: "Room as wallpaper"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .off: "lightbulb.slash"
+        case .tint: "lightbulb.max"
+        case .scene: "lightbulb.max.fill"
+        }
+    }
+
     var next: RoomLightMode {
         switch self {
         case .off: .tint
@@ -29,6 +46,9 @@ enum RoomLightMode: String, CaseIterable, Identifiable {
         case .scene: .off
         }
     }
+
+    /// Brightness steps offered by the room light menu.
+    static let strengths: [Double] = [0.35, 0.55, 0.7, 0.85, 1]
 }
 
 /// Whether the Mac can hear Spotify.
@@ -76,7 +96,13 @@ final class AppModel: ObservableObject {
     private let spotify = SpotifyBridge()
     private let artwork = ArtworkStore()
     private let lyricsService = LyricsService()
-    private let defaults = UserDefaults.standard
+    private let defaults = AppModel.store
+
+    /// Settings. `--demo` keeps its own, so trying it (or taking screenshots)
+    /// never touches the real ones.
+    static let store: UserDefaults = CommandLine.arguments.contains("--demo")
+        ? UserDefaults(suiteName: "com.atharvakanherkar.musebox.demo") ?? .standard
+        : .standard
 
     private var tap: AnyObject?
     private var analyzer: BeatAnalyzer?
@@ -94,7 +120,9 @@ final class AppModel: ObservableObject {
     private init() {
         roomLight = RoomLightMode(rawValue: defaults.string(forKey: "roomLight") ?? "") ?? .tint
         roomStrength = defaults.object(forKey: "roomStrength") as? Double ?? 0.7
-        glassWindow = defaults.object(forKey: "glassWindow") as? Bool ?? true
+        // Opaque by default: the album light is the backdrop the glass controls
+        // are made for. See-through is a choice.
+        glassWindow = defaults.object(forKey: "glassWindow") as? Bool ?? false
         showLyrics = defaults.object(forKey: "showLyrics") as? Bool ?? true
         panelFace = defaults.bool(forKey: "panelFace")
         dither = DitherMode(rawValue: defaults.string(forKey: "dither") ?? "") ?? .bayer

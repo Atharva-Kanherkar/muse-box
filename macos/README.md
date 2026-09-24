@@ -3,10 +3,10 @@
 The muse-box room as a native Mac app: the album's light fills the window
 and, if you want, your whole desktop, pulsing on the beat of whatever Spotify
 is playing. Same look as the web client (the dot screen, the swaying sleeve,
-the CRT karaoke, Bitka), rebuilt in SwiftUI and Core Animation, with real
-frosted glass (Liquid Glass on macOS 26).
+the CRT karaoke, Bitka), rebuilt in SwiftUI and Core Animation, with its
+controls floating in Liquid Glass on macOS 26.
 
-![muse-box on the Mac: the sleeve, CRT karaoke, Bitka, and the glass dock](docs/player.jpg)
+![muse-box on the Mac: the sleeve, CRT karaoke, Bitka, and the Liquid Glass controls](docs/player.jpg)
 
 **No Spotify login. No developer app. No API keys.** It follows the Spotify
 desktop app that is already on your Mac, so you can hand it to anyone.
@@ -37,7 +37,9 @@ already on the machine or public:
 - **The room.** Cover, title, times, and karaoke lyrics one line at a time,
   over the album's light: the same six layers as `web/src/styles.css` (wash,
   halo, glow, sheen, two orbs), the halftone dot screen and the vignette.
-  The window itself is frosted glass over your desktop.
+  Previous, play/pause and next float under the cover in glass, with the
+  play key stained in the album's accent. The view toggles and the room light
+  menu sit in the top corner. The window can also be see-through.
 - **Room light** puts that light on the desktop, under your icons and above
   the wallpaper, on every display and Space. **Tint** washes the album's
   colours over your own wallpaper; **Scene** makes the whole muse-box room the
@@ -61,8 +63,6 @@ already on the machine or public:
 - **Menu bar mini player** with the transport, the room-light controls and
   the rest of the switches, so the window can stay closed.
 
-  ![the menu bar panel](docs/menubar.jpg)
-
 - **1-bit panel face**: the cover as the shelf panel would show it (Bayer or
   Atkinson, in the album's two colours), and with nothing playing, the
   dithered idle clock.
@@ -72,6 +72,37 @@ already on the machine or public:
 Keys: <kbd>Space</kbd> play/pause, <kbd>⌘←</kbd>/<kbd>⌘→</kbd> previous/next,
 <kbd>L</kbd> lyrics, <kbd>B</kbd> 1-bit face, <kbd>R</kbd> cycle the room light.
 Click the needle under the cover to seek.
+
+## How it uses Liquid Glass
+
+Apple's rules for the material (the HIG's
+[Materials](https://developer.apple.com/design/human-interface-guidelines/materials)
+page, [Applying Liquid Glass to custom views](https://developer.apple.com/documentation/swiftui/applying-liquid-glass-to-custom-views),
+and the WWDC25 sessions *Meet Liquid Glass* and *Build a SwiftUI app with the
+new design*) shape the whole window:
+
+- **Glass is only for controls.** The cover, the light, the titles, the lyrics
+  and Bitka are content and never sit on glass. What you press floats above
+  them: the rail's toggles, the room light menu and the transport. The status
+  line is information, so it stays in the content layer too.
+- **Neighbours share a container.** Glass can't sample other glass, so each
+  group of controls lives in one `GlassEffectContainer`, which also lets a
+  trouble note like "Open Spotify" morph in and out of the rail.
+- **Nothing is painted over the glass.** There are no custom fills, rims or
+  strokes, and labels use hierarchical styles so the system can keep them
+  vibrant and legible. Related toggles share one capsule, and text never
+  shares a capsule with symbols.
+- **Tint means something.** Only play/pause is tinted, as coloured glass in the
+  album's accent. The rest of the colour lives in the content layer.
+- **No glass on glass.** The menu bar panel already sits on a system material,
+  so it uses standard switches, a slider and a segmented picker (their knobs
+  turn to glass as you drag) and fills rather than more glass.
+- **Accessibility settings are respected.** Reduce Transparency frosts the
+  glass and turns off the see-through window. Reduce Motion stills the light,
+  the cover's sway and Bitka's bob, leaving only colour changes. Increase
+  Contrast comes with the system material.
+
+On macOS 14 and 15 the same shapes use a frosted material instead.
 
 It is careful with power: the light is Core Animation layers moved by a
 display link (60 fps while it hears a beat, 10 at rest, nothing when no one
@@ -112,8 +143,9 @@ Needs only the Command Line Tools (`xcode-select --install`); full Xcode works t
 cd macos
 make run        # builds build/muse-box.app (ad-hoc signed) and opens it
 make test       # palette, dithering, idle clock, lyrics, broadcast and beat-tracking tests
-make stills     # renders docs/*.jpg from a staged track, no Spotify needed
 make zip        # build/muse-box-macos.zip, ready to hand to someone
+make stills     # the room light images in docs/, rendered offscreen
+make screenshots  # docs/player.jpg and docs/menubar.jpg, real captures of --demo
 open build/muse-box.app --args --demo   # the live app on a staged track and a synthetic 120 BPM groove
 ```
 
@@ -121,6 +153,11 @@ open build/muse-box.app --args --demo   # the live app on a staged track and a s
 app bundle, so use `make run` whenever Spotify or audio is involved. Ad-hoc
 signatures change on every build, so macOS may ask for the two permissions
 again after you rebuild.
+
+`--demo` keeps its own settings, so trying it never changes yours. Liquid
+Glass is composited live and can't be rendered offscreen, which is why
+`make screenshots` captures the screen: it needs Screen Recording permission
+for your terminal, and each surface floats on top for a moment.
 
 ## Shipping it to other people
 
@@ -172,6 +209,7 @@ macos/
     ├── Spotify.swift           # broadcast + Scripting Bridge, never the Web API
     ├── AudioTap.swift          # Core Audio process tap → BeatAnalyzer
     ├── AmbientLayer.swift      # the light, as Core Animation layers
+    ├── Glass.swift             # Liquid Glass (and the macOS 14/15 fallback)
     ├── RoomLight.swift         # the desktop windows
     ├── PlayerView.swift, CoverView.swift, Karaoke.swift, BitkaStage.swift
     └── MenuBarView.swift

@@ -149,8 +149,18 @@ final class AmbientLayer: CALayer {
         beam.colors = [0, 1, 0].map { CGColor(srgbRed: accent.r, green: accent.g, blue: accent.b, alpha: $0) }
     }
 
+    /// Reduce Motion is on: the light holds still and only its colour changes.
+    nonisolated(unsafe) static var calm = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+
     /// The geometry below is the web's, top-down; layers are AppKit's, bottom-up.
     private func move(_ frame: AmbientFrame, _ size: CGSize) {
+        var frame = frame
+        if Self.calm {
+            frame.beats = 8
+            frame.pulse = 0
+            frame.hit = 0
+            frame.breath = 0.5
+        }
         let w = size.width, h = size.height
         func at(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: x, y: h - y) }
         let energy = frame.energy
@@ -176,17 +186,18 @@ final class AmbientLayer: CALayer {
         halo.transform = CATransform3DMakeScale(haloScale, haloScale, 1)
         halo.opacity = Float((0.10 + energy * 0.16) * (haloLive * frame.playing + 0.55 * still) * strength)
 
-        // The accent, breathing with the bass from below.
+        // The accent, breathing with the bass from below, pooled under the cover
+        // (and the glass transport there, which refracts it).
         let glowFloor = 0.62 + energy * 0.1
         let glowScale = 1 + energy * 0.045 * frame.breath * frame.playing
-        glow.position = at(w / 2, h / 2 + (1.144 * h - h / 2) * glowScale)
+        glow.position = at(focus.x * w, h / 2 + (1.144 * h - h / 2) * glowScale)
         glow.transform = CATransform3DMakeScale(glowScale, glowScale, 1)
         glow.opacity = Float((0.18 + energy * 0.30) * ((glowFloor + (1 - glowFloor) * frame.breath) * frame.playing + 0.55 * still) * strength)
 
         // A long diagonal sheen every 16 beats, faded at the ends of its sweep.
         let sweep = frame.beats / 16 - (frame.beats / 16).rounded(.down)
         beam.position = at(w / 2 + (-0.55 + 1.1 * sweep) * 1.4 * w, h / 2)
-        beam.opacity = Float((0.06 + energy * 0.12) * sin(.pi * sweep) * (frame.playing + 0.55 * still) * strength)
+        beam.opacity = Self.calm ? 0 : Float((0.06 + energy * 0.12) * sin(.pi * sweep) * (frame.playing + 0.55 * still) * strength)
 
         // Two lamps on long paths, swelling every other beat (A) and every fourth (B).
         let d = 0.58 * max(w, h)
@@ -249,7 +260,17 @@ final class AmbientView: NSView {
         super.init(frame: frame)
         wantsLayer = true
         layerContentsRedrawPolicy = .never
+        _ = Self.followAccessibility
     }
+
+    /// Keeps `AmbientLayer.calm` in step with System Settings › Accessibility.
+    private static let followAccessibility: Void = {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+        ) { _ in
+            AmbientLayer.calm = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        }
+    }()
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
@@ -294,24 +315,14 @@ final class AmbientView: NSView {
     }
 }
 
-/// The room behind a SwiftUI view. In stills (which cannot host AppKit views)
-/// it renders the same layers to an image instead.
+/// The room behind a SwiftUI view.
 struct AmbientSurface: View {
     var driver: AmbientDriver
     var style: AmbientStyle
     var focus = UnitPoint(x: 0.5, y: 0.444)
-    @Environment(\.stillFrame) private var still
 
     var body: some View {
-        if let still {
-            GeometryReader { geometry in
-                if let image = AmbientLayer.image(still, size: geometry.size, scale: 2, style: style, focus: CGPoint(x: focus.x, y: focus.y)) {
-                    Image(decorative: image, scale: 2)
-                }
-            }
-        } else {
-            Live(driver: driver, style: style, focus: CGPoint(x: focus.x, y: focus.y))
-        }
+        Live(driver: driver, style: style, focus: CGPoint(x: focus.x, y: focus.y))
     }
 
     private struct Live: NSViewRepresentable {
@@ -331,18 +342,6 @@ struct AmbientSurface: View {
             view.ambient.look = style
             view.ambient.focus = focus
         }
-    }
-}
-
-private struct StillFrameKey: EnvironmentKey {
-    static let defaultValue: AmbientFrame? = nil
-}
-
-extension EnvironmentValues {
-    /// Set while rendering stills: every animated view shows this frame.
-    var stillFrame: AmbientFrame? {
-        get { self[StillFrameKey.self] }
-        set { self[StillFrameKey.self] = newValue }
     }
 }
 
@@ -402,8 +401,6 @@ struct Pulse<Content: View>: View {
     var driver: AmbientDriver
     @ViewBuilder var content: (AmbientFrame, Date) -> Content
     @ObservedObject private var clock = FrameClock.shared
-    @Environment(\.stillFrame) private var still
-    @Environment(\.stillDate) private var stillDate
 
     init(driver: AmbientDriver, @ViewBuilder content: @escaping (AmbientFrame, Date) -> Content) {
         self.driver = driver
@@ -411,21 +408,6 @@ struct Pulse<Content: View>: View {
     }
 
     var body: some View {
-        if let still {
-            content(still, stillDate ?? .now)
-        } else {
-            content(driver.sample(), clock.now)
-        }
-    }
-}
-
-private struct StillDateKey: EnvironmentKey {
-    static let defaultValue: Date? = nil
-}
-
-extension EnvironmentValues {
-    var stillDate: Date? {
-        get { self[StillDateKey.self] }
-        set { self[StillDateKey.self] = newValue }
+        content(driver.sample(), clock.now)
     }
 }

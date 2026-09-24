@@ -13,6 +13,7 @@ enum Ink {
     static let faint = Color(red: 0x6D / 255, green: 0x68 / 255, blue: 0x62 / 255)
     static let alert = Color(red: 0xE8 / 255, green: 0x62 / 255, blue: 0x3C / 255)
     static let live = Color(red: 0x7F / 255, green: 0xD4 / 255, blue: 0xA3 / 255)
+    static let amber = Color(red: 0xD9 / 255, green: 0xA3 / 255, blue: 0x40 / 255)
 }
 
 extension RGB {

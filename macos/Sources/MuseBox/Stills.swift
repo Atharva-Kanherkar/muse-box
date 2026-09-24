@@ -4,23 +4,17 @@ import MuseBoxCore
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// `muse-box --snapshot <dir>` renders the interface to PNGs with a staged
-/// track: no Spotify, no audio, no permissions. It is how the screenshots in
-/// the README are made, and a quick way to eyeball a design change.
+/// `muse-box --snapshot <dir>` renders the room light (what the desktop windows
+/// draw) to JPEGs, for the README. It needs no Spotify, audio or permissions.
+/// The window and menu bar panel are real screenshots instead
+/// (`scripts/screenshots.sh`), because Liquid Glass is composited live and
+/// cannot be rendered offscreen.
 @MainActor
 enum Stills {
     static func render(to directory: URL) {
         _ = NSApplication.shared
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let model = AppModel.shared
         let cover = CoverArt.make(from: Fixture.sleeve(), dither: .bayer)
-        let stamp = Date()
-        let lyrics = Lyrics(synced: true, lines: [
-            LyricLine(atMs: 70_000, text: "headlights on the water"),
-            LyricLine(atMs: 80_000, text: "and we don't need to say a word"),
-            LyricLine(atMs: 90_000, text: "just the hum of the engine, low"),
-        ])
-        model.stage(Fixture.track(at: stamp), cover: cover, lyrics: lyrics, link: .connected, hearing: .listening)
 
         var frame = AmbientFrame()
         frame.palette = cover.palette
@@ -35,40 +29,23 @@ enum Stills {
         frame.hearing = true
         frame.tempo = 118
         frame.level = 0.7
-        frame.bars = [0.9, 0.75, 0.6, 0.72, 0.5, 0.38, 0.3, 0.18]
         frame.time = 2.2
 
-        let at = stamp
-        save(PlayerView().environmentObject(model), frame: frame, date: at, size: CGSize(width: 1400, height: 860), to: directory, name: "player")
-        save(Room(frame: frame, style: .scene(0.7), size: CGSize(width: 1600, height: 1000)), frame: frame, date: at, size: CGSize(width: 1600, height: 1000), to: directory, name: "room-scene")
-
+        let size = CGSize(width: 1600, height: 1000)
         let wallpaper = ProcessInfo.processInfo.environment["MUSEBOX_WALLPAPER"]
             .flatMap { NSImage(contentsOfFile: $0) }
             .flatMap { $0.cgImage(forProposedRect: nil, context: nil, hints: nil) } ?? hills()
         save(
             ZStack {
                 Image(decorative: wallpaper, scale: 1).resizable().aspectRatio(contentMode: .fill)
-                Room(frame: frame, style: .tint(0.7), size: CGSize(width: 1600, height: 1000))
+                Room(frame: frame, style: .tint(0.7), size: size)
             },
-            frame: frame, date: at, size: CGSize(width: 1600, height: 1000), to: directory, name: "room-tint"
+            size: size, to: directory, name: "room-tint"
         )
         save(
             Image(decorative: wallpaper, scale: 1).resizable().aspectRatio(contentMode: .fill),
-            frame: frame, date: at, size: CGSize(width: 1600, height: 1000), to: directory, name: "room-off"
+            size: size, to: directory, name: "room-off"
         )
-        save(PlayerView().environmentObject(model), frame: frame, date: at, size: CGSize(width: 980, height: 680), to: directory, name: "player-compact")
-        save(MenuBarStill().environmentObject(model), frame: frame, date: at, size: CGSize(width: 332, height: 492), to: directory, name: "menubar")
-        model.panelFace = true
-        save(PlayerView().environmentObject(model), frame: frame, date: at, size: CGSize(width: 1400, height: 860), to: directory, name: "player-1bit")
-        model.panelFace = false
-
-        var idle = frame
-        idle.playing = 0
-        idle.hearing = false
-        idle.tempo = nil
-        idle.palette = .quiet
-        model.stage(nil, cover: nil, lyrics: nil, link: .connected, hearing: .off)
-        save(PlayerView().environmentObject(model), frame: idle, date: at, size: CGSize(width: 1180, height: 760), to: directory, name: "idle")
     }
 
     /// A desktop's worth of room light, as the room windows draw it.
@@ -84,12 +61,8 @@ enum Stills {
         }
     }
 
-    private static func save<V: View>(_ view: V, frame: AmbientFrame, date: Date, size: CGSize, to directory: URL, name: String) {
-        let renderer = ImageRenderer(content: view
-            .environment(\.snapshotting, true)
-            .environment(\.stillFrame, frame)
-            .environment(\.stillDate, date)
-            .frame(width: size.width, height: size.height))
+    private static func save<V: View>(_ view: V, size: CGSize, to directory: URL, name: String) {
+        let renderer = ImageRenderer(content: view.frame(width: size.width, height: size.height))
         renderer.scale = Double(ProcessInfo.processInfo.environment["MUSEBOX_STILL_SCALE"] ?? "") ?? 2
         guard let image = renderer.cgImage else {
             FileHandle.standardError.write(Data("could not render \(name)\n".utf8))
@@ -130,14 +103,5 @@ enum Stills {
             context.fillPath()
         }
         return context.makeImage()!
-    }
-}
-
-/// The menu bar panel, laid out as it appears under the menu bar.
-private struct MenuBarStill: View {
-    var body: some View {
-        MenuBarPlayer()
-            .background(Color(white: 0.12))
-            .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 }

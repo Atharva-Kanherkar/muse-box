@@ -7,6 +7,7 @@ import SwiftUI
 /// odd track.
 struct BitkaStage: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var size: CGSize
 
     @AppStorage("bitka.x") private var storedX = -1.0
@@ -40,7 +41,8 @@ struct BitkaStage: View {
             Pulse(driver: model.ambience) { frame, _ in
                 let mood = mood(frame)
                 ZStack(alignment: .topLeading) {
-                    Bitka(mood: mood, accent: frame.palette.accent.color, beatIndex: frame.beatIndex, time: frame.time)
+                    // Reduce Motion: she stops bobbing to the beat.
+                    Bitka(mood: mood, accent: frame.palette.accent.color, beatIndex: reduceMotion ? 0 : frame.beatIndex, time: frame.time)
                         .frame(width: catWidth, height: catHeight)
                     if mood == .dozing { Snores(time: frame.time).offset(x: catWidth - 16, y: -14) }
                     if mood == .petted {

@@ -56,12 +56,10 @@ final class Demo {
     private var sampleIndex = 0
     private var noise = SystemRandomNumberGenerator()
 
-    func start(_ model: AppModel) {
+    func start(_ model: AppModel, fromMs start: Double = 0) {
         let cover = CoverArt.make(from: Fixture.sleeve(), dither: model.dither)
-        let stage = {
-            model.stage(Fixture.track(at: .now, positionMs: 0), cover: cover, lyrics: Fixture.lyrics, link: .connected, hearing: .listening)
-        }
-        stage()
+        stageTrack(model, cover: cover, at: start)
+        let stage = { [weak self] in self?.stageTrack(model, cover: cover, at: 0) }
         model.listen(through: analyzer)
         let timer = Timer(timeInterval: 0.01, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
@@ -71,6 +69,10 @@ final class Demo {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+    }
+
+    private func stageTrack(_ model: AppModel, cover: CoverArt, at positionMs: Double) {
+        model.stage(Fixture.track(at: .now, positionMs: positionMs), cover: cover, lyrics: Fixture.lyrics, link: .connected, hearing: .listening)
     }
 
     private func feed() {

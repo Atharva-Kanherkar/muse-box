@@ -2,18 +2,17 @@ import AppKit
 import MuseBoxCore
 import SwiftUI
 
-/// The glass mini-player that lives in the menu bar: enough to run the room
-/// without the window.
+/// The mini player that lives in the menu bar: enough to run the room without
+/// the window. It sits on the system's own panel material, so it uses system
+/// controls (their knobs turn to Liquid Glass as you drag them) and adds no
+/// background or glass of its own: glass on glass is the one thing to avoid.
 struct MenuBarPlayer: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         content
-            .background {
-                AmbientSurface(driver: model.ambience, style: AmbientStyle(ground: 0.55), focus: UnitPoint(x: 0.2, y: 0.2))
-            }
-            .frame(width: 332)
+            .frame(width: 320)
             .preferredColorScheme(.dark)
             .background(VisibilityProbe { FrameClock.shared.show("menu", $0) })
             .onDisappear { FrameClock.shared.show("menu", false) }
@@ -21,17 +20,17 @@ struct MenuBarPlayer: View {
 
     private var content: some View {
         let accent = model.palette.accent.color
-        return VStack(alignment: .leading, spacing: 16) {
+        return VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 14) {
                 Pulse(driver: model.ambience) { frame, _ in thumbnail(frame) }
                 VStack(alignment: .leading, spacing: 3) {
                     Text(model.now?.title.nilIfEmpty ?? "Nothing playing")
                         .font(.display(22))
-                        .foregroundStyle(Ink.ink)
+                        .foregroundStyle(.primary)
                         .lineLimit(2)
                     Text(model.now?.artist.nilIfEmpty ?? "open Spotify to begin")
                         .font(.mono(12))
-                        .foregroundStyle(Ink.muted)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
@@ -43,56 +42,61 @@ struct MenuBarPlayer: View {
                 }
             }
 
-            Pulse(driver: model.ambience) { frame, _ in
-                HStack(spacing: 16) {
-                    Spacer()
-                    Key(symbol: "backward.end.fill", size: 36, frame: frame, action: model.previous)
-                    Key(symbol: model.isPlaying ? "pause.fill" : "play.fill", size: 46, frame: frame, main: true, action: model.playPause)
-                    Key(symbol: "forward.end.fill", size: 36, frame: frame, action: model.next)
-                    Spacer()
-                }
+            HStack(spacing: 18) {
+                Spacer()
+                PanelKey(symbol: "backward.fill", size: 34, label: "Previous track", action: model.previous)
+                PanelKey(symbol: model.isPlaying ? "pause.fill" : "play.fill", size: 44, tint: accent, label: model.isPlaying ? "Pause" : "Play", action: model.playPause)
+                PanelKey(symbol: "forward.fill", size: 34, label: "Next track", action: model.next)
+                Spacer()
             }
             .disabled(model.link != .connected)
             .opacity(model.link == .connected ? 1 : 0.4)
 
+            Divider()
+
             section("Room light") {
-                HStack(spacing: 6) {
+                Picker("Room light", selection: $model.roomLight) {
                     ForEach(RoomLightMode.allCases) { mode in
-                        Pill(title: mode.title, on: model.roomLight == mode, accent: accent) { model.roomLight = mode }
+                        Text(mode.title).tag(mode)
                     }
                 }
-                if model.roomLight != .off {
-                    HStack(spacing: 10) {
-                        Image(systemName: "sun.min").foregroundStyle(Ink.faint)
-                        LightSlider(value: $model.roomStrength, range: 0.2...1, accent: accent)
-                        Image(systemName: "sun.max").foregroundStyle(Ink.faint)
-                    }
-                    .font(.system(size: 11))
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                HStack(spacing: 8) {
+                    Image(systemName: "sun.min").foregroundStyle(.secondary)
+                    Slider(value: $model.roomStrength, in: 0.2...1)
+                        .labelsHidden()
+                        .controlSize(.small)
+                    Image(systemName: "sun.max").foregroundStyle(.secondary)
                 }
+                .font(.system(size: 11))
+                .disabled(model.roomLight == .off)
             }
 
             section("Room") {
-                Switch(title: "Glass window", isOn: $model.glassWindow, accent: accent)
-                Switch(title: "Lyrics", isOn: $model.showLyrics, accent: accent)
-                Switch(title: "1-bit panel face", isOn: $model.panelFace, accent: accent)
-                Switch(title: "Open at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.launchAtLogin = $0 }), accent: accent)
+                Setting(title: "Lyrics", isOn: $model.showLyrics)
+                Setting(title: "1-bit panel face", isOn: $model.panelFace)
+                Setting(title: "See-through window", isOn: $model.glassWindow)
+                Setting(title: "Open at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.launchAtLogin = $0 }))
             }
+
+            Divider()
 
             HStack {
                 Button("Open muse-box") {
                     NSApp.activate(ignoringOtherApps: true)
                     openWindow(id: "player")
                 }
-                .buttonStyle(.plain)
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }
-                    .buttonStyle(.plain)
                     .keyboardShortcut("q")
             }
+            .buttonStyle(.plain)
             .label(10.5, tracking: 0.16)
-            .foregroundStyle(Ink.muted)
+            .foregroundStyle(.secondary)
         }
-        .padding(18)
+        .tint(accent)
+        .padding(16)
     }
 
     private func progress(_ now: NowPlaying, date: Date, accent: Color) -> some View {
@@ -100,10 +104,9 @@ struct MenuBarPlayer: View {
         return VStack(spacing: 6) {
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.12))
+                    Capsule().fill(.quaternary)
                     Capsule().fill(accent)
                         .frame(width: geometry.size.width * fraction.clamped(to: 0...1))
-                        .shadow(color: accent.opacity(0.6), radius: 4)
                 }
             }
             .frame(height: 3)
@@ -114,7 +117,7 @@ struct MenuBarPlayer: View {
             }
             .font(.mono(10))
             .monospacedDigit()
-            .foregroundStyle(Ink.faint)
+            .foregroundStyle(.tertiary)
         }
     }
 
@@ -139,92 +142,56 @@ struct MenuBarPlayer: View {
 
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title).label(10, tracking: 0.24).foregroundStyle(Ink.faint)
+            Text(title).label(10, tracking: 0.24).foregroundStyle(.tertiary)
             content()
         }
-        .font(.mono(12))
-        .foregroundStyle(Ink.ink)
     }
 }
 
-// MARK: - controls in the muse-box voice (the web's `.controlish`)
-
-/// An outlined pill; lit in the accent when chosen.
-struct Pill: View {
+/// A setting row: the label in the muse-box type, a system switch on the
+/// trailing edge (the label still names it for VoiceOver).
+private struct Setting: View {
     var title: String
-    var on: Bool
-    var accent: Color
+    @Binding var isOn: Bool
+
+    var body: some View {
+        HStack {
+            Text(title).font(.mono(12))
+            Spacer()
+            Toggle(title, isOn: $isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+        }
+    }
+}
+
+/// A transport key for surfaces that are already a material: a fill and a
+/// vibrant symbol rather than more glass. The primary one takes the accent.
+private struct PanelKey: View {
+    var symbol: String
+    var size: CGFloat
+    var tint: Color? = nil
+    var label: String
     var action: () -> Void
+    @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
-            Text(title)
-                .label(10.5, tracking: 0.16)
-                .foregroundStyle(on ? Ink.ink : Ink.muted)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 7)
-                .background(Capsule().fill(accent.opacity(on ? 0.2 : 0)))
-                .overlay(Capsule().strokeBorder(on ? accent : Ink.edgeStrong, lineWidth: 1))
-                .contentShape(Capsule())
+            Image(systemName: symbol)
+                .font(.system(size: size * 0.36, weight: .semibold))
+                .contentTransition(.symbolEffect(.replace))
+                .foregroundStyle(tint == nil ? AnyShapeStyle(.primary) : AnyShapeStyle(.white))
+                .frame(width: size, height: size)
+                .background(Circle().fill(tint.map { AnyShapeStyle($0) } ?? AnyShapeStyle(.white.opacity(hovering ? 0.16 : 0.08))))
+                .brightness(tint != nil && hovering ? 0.06 : 0)
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
-    }
-}
-
-/// A thin glowing track with a glass knob.
-struct LightSlider: View {
-    @Binding var value: Double
-    var range: ClosedRange<Double>
-    var accent: Color
-
-    var body: some View {
-        GeometryReader { geometry in
-            let width = geometry.size.width
-            let fraction = ((value - range.lowerBound) / (range.upperBound - range.lowerBound)).clamped(to: 0...1)
-            ZStack(alignment: .leading) {
-                Capsule().fill(Color.white.opacity(0.12)).frame(height: 3)
-                Capsule().fill(accent).frame(width: max(3, width * fraction), height: 3)
-                    .shadow(color: accent.opacity(0.6), radius: 4)
-                Circle()
-                    .fill(Ink.ink)
-                    .frame(width: 14, height: 14)
-                    .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
-                    .overlay(Circle().strokeBorder(accent, lineWidth: 1.5))
-                    .offset(x: (width - 14) * fraction)
-            }
-            .frame(maxHeight: .infinity)
-            .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 0).onChanged { drag in
-                let fraction = (drag.location.x / max(width, 1)).clamped(to: 0...1)
-                value = range.lowerBound + fraction * (range.upperBound - range.lowerBound)
-            })
-        }
-        .frame(height: 16)
-    }
-}
-
-/// A small switch that lights up in the accent.
-struct Switch: View {
-    var title: String
-    @Binding var isOn: Bool
-    var accent: Color
-
-    var body: some View {
-        Button { isOn.toggle() } label: {
-            HStack {
-                Text(title).font(.mono(12)).foregroundStyle(Ink.ink)
-                Spacer()
-                ZStack(alignment: isOn ? .trailing : .leading) {
-                    Capsule().fill(isOn ? accent.opacity(0.55) : Color.white.opacity(0.1))
-                    Capsule().strokeBorder(isOn ? accent : Ink.edgeStrong, lineWidth: 1)
-                    Circle().fill(isOn ? Ink.ink : Ink.muted).frame(width: 12, height: 12).padding(3)
-                }
-                .frame(width: 32, height: 18)
-                .animation(.easeOut(duration: 0.16), value: isOn)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.14), value: hovering)
+        .help(label)
+        .accessibilityLabel(label)
     }
 }
 

@@ -5,6 +5,7 @@ import SwiftUI
 /// change replaces the last, glowing in the album's accent.
 struct Karaoke: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var lyrics: Lyrics
     var width: CGFloat
     var compact = false
@@ -35,7 +36,7 @@ struct Karaoke: View {
                         .shadow(color: accent.opacity(0.30 + 0.12 * phosphor), radius: 21 + 7 * phosphor)
                         .frame(minHeight: size * 2.3, alignment: compact ? .center : .bottomLeading)
                         .id(cursor.current)
-                        .transition(.lineIn)
+                        .transition(reduceMotion ? .opacity : .lineIn)
                     if !upcoming.isEmpty, !compact {
                         Text(upcoming)
                             .font(.retro(22))

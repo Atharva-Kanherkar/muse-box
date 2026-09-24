@@ -1,84 +1,123 @@
 import AppKit
 import SwiftUI
 
-/// Set while rendering stills (`--snapshot`): live materials cannot be
-/// rendered offscreen, so glass falls back to a painted look-alike.
-private struct SnapshottingKey: EnvironmentKey {
-    static let defaultValue = false
-}
-
-extension EnvironmentValues {
-    var snapshotting: Bool {
-        get { self[SnapshottingKey.self] }
-        set { self[SnapshottingKey.self] = newValue }
-    }
-}
+// Liquid Glass, used the way Apple's guidance asks (HIG › Materials, and the
+// WWDC25 sessions "Meet Liquid Glass" and "Build a SwiftUI app with the new
+// design"):
+//
+// - Glass is the functional layer only: controls float on it, while the cover,
+//   the light, the titles and the lyrics stay content.
+// - Neighbours share one GlassGroup. Glass cannot sample other glass, and a
+//   shared container also lets the shapes blend and morph.
+// - Nothing is painted over it: no fills, rims or strokes, and no fixed label
+//   colours (text on glass is made vibrant by the system).
+// - Tint is only for the one primary action, as colour in the background.
+//
+// macOS 14 and 15 get a frosted material in the same shapes.
 
 extension View {
-    /// Frosted glass in the album's tint: Liquid Glass on macOS 26, a
-    /// material with a lit rim everywhere else.
-    func glass<S: InsettableShape>(_ shape: S, tint: Color = .clear, interactive: Bool = false) -> some View {
+    /// Liquid Glass behind this view, in `shape`. Pass a tint only for the
+    /// primary action.
+    func glass<S: Shape>(_ shape: S, tint: Color? = nil, interactive: Bool = true) -> some View {
         modifier(GlassSurface(shape: shape, tint: tint, interactive: interactive))
+    }
+
+    /// Ties a glass shape to its identity inside a GlassGroup, so it morphs
+    /// (rather than fades) as it comes and goes.
+    @ViewBuilder
+    func glassIdentity(_ id: String, in namespace: Namespace.ID) -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            glassEffectID(id, in: namespace)
+        } else {
+            self
+        }
+        #else
+        self
+        #endif
     }
 }
 
-private struct GlassSurface<S: InsettableShape>: ViewModifier {
+/// Glass neighbours share one container, so they refract the same backdrop and
+/// can blend and morph into one another. Keep `spacing` equal to the layout's
+/// spacing so shapes stay apart at rest.
+struct GlassGroup<Content: View>: View {
+    var spacing: CGFloat
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer(spacing: spacing) { content }
+        } else {
+            content
+        }
+        #else
+        content
+        #endif
+    }
+}
+
+private struct GlassSurface<S: Shape>: ViewModifier {
     var shape: S
-    var tint: Color
+    var tint: Color?
     var interactive: Bool
-    @Environment(\.snapshotting) private var snapshotting
 
     func body(content: Content) -> some View {
-        if snapshotting {
-            painted(content)
-        } else {
-            live(content)
-        }
-    }
-
-    private func painted(_ content: Content) -> some View {
-        content
-            .background(shape.fill(Color.black.opacity(0.42)))
-            .background(shape.fill(tint.opacity(0.14)))
-            .overlay(rim)
-    }
-
-    #if compiler(>=6.2)
-    @ViewBuilder
-    private func live(_ content: Content) -> some View {
+        #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
-            content.glassEffect(
-                interactive ? .regular.tint(tint.opacity(0.22)).interactive() : .regular.tint(tint.opacity(0.22)),
-                in: shape
-            )
+            // Regular, not clear: Apple keeps clear for controls over photos and
+            // video, and this glass floats over the room's dark light.
+            let base = Glass.regular.tint(tint)
+            content.glassEffect(interactive ? base.interactive() : base, in: shape)
         } else {
-            material(content)
+            frosted(content)
         }
+        #else
+        frosted(content)
+        #endif
     }
-    #else
-    private func live(_ content: Content) -> some View {
-        material(content)
-    }
-    #endif
 
-    private func material(_ content: Content) -> some View {
+    /// Before Liquid Glass: a frosted material with a lit rim.
+    private func frosted(_ content: Content) -> some View {
         content
-            .background(shape.fill(tint.opacity(0.12)))
-            .background(shape.fill(Color.black.opacity(0.28)))
+            .background(tint.map { shape.fill($0.opacity(0.6)) })
             .background(.ultraThinMaterial, in: shape)
-            .overlay(rim)
+            .overlay(shape.stroke(
+                LinearGradient(
+                    colors: [.white.opacity(0.3), .white.opacity(0.06), .white.opacity(0.14)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                ),
+                lineWidth: 1
+            ))
     }
+}
 
-    /// The lit edge that makes glass read as glass.
-    private var rim: some View {
-        shape.strokeBorder(
-            LinearGradient(
-                colors: [Color.white.opacity(0.30), Color.white.opacity(0.06), Color.white.opacity(0.14)],
-                startPoint: .top,
-                endPoint: .bottom
-            ),
-            lineWidth: 1
-        )
+/// A round glass control, labelled with a symbol. The system handles the hover,
+/// press and focus response (`interactive()`), and vibrancy keeps the
+/// symbol legible over whatever the album light is doing.
+struct GlassKey: View {
+    var symbol: String
+    var size: CGFloat
+    /// Only for the primary action.
+    var tint: Color? = nil
+    var label: String
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: size * 0.36, weight: .semibold))
+                .contentTransition(.symbolEffect(.replace))
+                .foregroundStyle(tint == nil ? AnyShapeStyle(.primary) : AnyShapeStyle(.white))
+                .frame(width: size, height: size)
+                .contentShape(Circle())
+                .glass(Circle(), tint: tint)
+        }
+        .buttonStyle(.plain)
+        .help(label)
+        .accessibilityLabel(label)
     }
 }
 

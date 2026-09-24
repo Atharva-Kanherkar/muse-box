@@ -8,7 +8,7 @@ TEST_FLAGS := $(if $(findstring CommandLineTools,$(shell xcode-select -p)),\
 	-Xswiftc -F -Xswiftc $(CLT_FRAMEWORKS) -Xlinker -F -Xlinker $(CLT_FRAMEWORKS) \
 	-Xlinker -rpath -Xlinker $(CLT_FRAMEWORKS) -Xlinker -rpath -Xlinker $(CLT_LIBS))
 
-.PHONY: app run test zip stills icon clean
+.PHONY: app run test zip stills screenshots icon clean
 
 app:
 	./scripts/build-app.sh
@@ -23,10 +23,15 @@ zip: app
 	ditto -c -k --keepParent build/muse-box.app build/muse-box-macos.zip
 	@echo build/muse-box-macos.zip
 
-# Renders the interface to docs/*.png with a staged track: no Spotify needed.
+# The room light images in docs/: Core Animation, rendered offscreen.
 stills:
 	swift build
 	MUSEBOX_STILL_SCALE=1.5 .build/debug/muse-box --snapshot docs
+
+# Real screenshots of the window and the menu bar panel. Liquid Glass only
+# exists on screen, so this needs Screen Recording permission for your terminal.
+screenshots: app
+	./scripts/screenshots.sh
 
 icon:
 	swift scripts/make-icon.swift build/AppIcon.iconset
